@@ -1,0 +1,68 @@
+# --- API credential files (never commit) ---
+google-ads.yaml
+meta-ads.yaml
+microsoft-ads.yaml
+tiktok-ads.yaml
+reddit-ads.yaml
+pinterest-ads.yaml
+*-ads.yaml
+
+# --- Local configuration and favorites ---
+config.json
+customer_favorites.json
+meta_favorites.json
+ms_favorites.json
+tiktok_favorites.json
+reddit_favorites.json
+pinterest_favorites.json
+favorites.json
+
+# --- Data directories ---
+raw_reports/
+processed_reports/
+merged_reports/
+
+# --- Python environment and cache ---
+venv/
+.venv/
+env/
+.env
+.env.*
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+
+# --- Logs and runtime ---
+app_debug.log
+*.log
+
+# --- Browser / auth context (Playwright, etc.) ---
+browser_context/
+user_data/
+
+# --- OS and editor ---
+.DS_Store
+Thumbs.db
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+*.code-workspace

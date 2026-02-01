@@ -1,0 +1,4340 @@
+"""
+Ads Report Fetcher - GUI Entry Point
+Main window for the desktop application (Multi-Platform).
+"""
+
+import customtkinter as ctk
+import logging
+import threading
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Optional, Tuple, List, Dict
+import tkinter.filedialog as filedialog
+import tkinter.scrolledtext as scrolledtext
+import tkinter.messagebox as messagebox
+import json
+import yaml
+from api_fetcher import AdsApiFetcher
+from meta_fetcher import MetaAdsFetcher, MetaTokenExpiredError
+from processor import ReportProcessor
+
+# Directory containing main.py (and meta-ads.yaml) so paths work regardless of CWD
+_APP_DIR = Path(__file__).resolve().parent
+
+# Uniform width for all platform ID/account input fields (combobox)
+ID_FIELD_WIDTH = 400
+
+
+def _parse_id_from_favorite_display(display: str) -> str:
+    """Extract ID from combobox display string 'Name (ID)' or return as-is if no parens."""
+    if not display or not isinstance(display, str):
+        return (display or "").strip()
+    s = display.strip()
+    if " (" in s and s.endswith(")"):
+        return s[s.rindex(" (") + 2:-1].strip()
+    return s
+
+
+class AdsReportFetcherApp:
+    """Main GUI application class."""
+    
+    def __init__(self):
+        """Initialize the GUI application."""
+        # Setup logging first
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %I:%M:%S %p',
+            handlers=[
+                logging.FileHandler('app_debug.log'),
+                logging.StreamHandler()
+            ]
+        )
+        self.logger = logging.getLogger(__name__)
+        
+        # Configure customtkinter - load theme from settings
+        self.settings_file = Path("config.json")
+        self.settings = self._load_settings()
+        theme_mode = self.settings.get("theme_mode", "dark")
+        ctk.set_appearance_mode(theme_mode)
+        ctk.set_default_color_theme("blue")
+        
+        # Create main window
+        self.root = ctk.CTk()
+        self.root.title("Ads Report Fetcher (Multi-Platform)")
+        self.root.geometry("800x900")
+        self.root.resizable(True, True)
+        self.root.minsize(800, 850)
+        
+        # Month names for dropdowns
+        self.month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", 
+                           "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+        
+        # Variables - default to previous month
+        now = datetime.now()
+        if now.month == 1:
+            # If current month is January, previous month is December of previous year
+            prev_month = 12
+            prev_year = now.year - 1
+        else:
+            prev_month = now.month - 1
+            prev_year = now.year
+        
+        self.start_year = ctk.StringVar(value=str(prev_year))
+        self.start_month = ctk.StringVar(value=self.month_names[prev_month - 1])
+        self.end_year = ctk.StringVar(value=str(prev_year))
+        self.end_month = ctk.StringVar(value=self.month_names[prev_month - 1])
+        self.customer_id = ctk.StringVar(value="")
+        self.meta_account_id = ctk.StringVar(value="act_")
+        self.ms_customer_id = ctk.StringVar(value="")
+        self.tiktok_account_id = ctk.StringVar(value="")
+        self.reddit_account_id = ctk.StringVar(value="")
+        self.pinterest_account_id = ctk.StringVar(value="")
+        # Display vars for ID comboboxes (show "Name (ID)" or raw ID)
+        self.google_id_display = ctk.StringVar(value="")
+        self.meta_id_display = ctk.StringVar(value="")
+        self.ms_id_display = ctk.StringVar(value="")
+        self.tiktok_id_display = ctk.StringVar(value="")
+        self.reddit_id_display = ctk.StringVar(value="")
+        self.pinterest_id_display = ctk.StringVar(value="")
+        self.meta_token_input = ctk.StringVar(value="")
+        self.status_text = ctk.StringVar(value="Ready")
+        self.is_processing = False
+        self.meta_is_processing = False
+        self.batch_fetch_active = False
+        self.cancel_event = threading.Event()
+        self.meta_cancel_event = threading.Event()
+        self.google_fetch_complete = threading.Event()
+        self.meta_fetch_complete = threading.Event()
+        self.ms_fetch_complete = threading.Event()
+        self.tiktok_fetch_complete = threading.Event()
+        self.reddit_fetch_complete = threading.Event()
+        self.pinterest_fetch_complete = threading.Event()
+        self.meta_token_updated = threading.Event()
+        self.date_range_locked = False
+        self.meta_date_range_locked = False
+        self.customer_id_locked = False
+        self.meta_account_id_locked = False
+        self.ms_customer_id_locked = False
+        self.tiktok_account_id_locked = False
+        self.reddit_account_id_locked = False
+        self.pinterest_account_id_locked = False
+        # Note: output_dir is no longer used - each platform has its own directory
+        
+        # Favorites (Google Ads)
+        self.favorites_file = Path("customer_favorites.json")
+        self.favorites: List[Dict[str, str]] = []
+        self._load_favorites()
+        
+        # Meta Ads Favorites
+        self.meta_favorites_file = Path("meta_favorites.json")
+        self.meta_favorites: List[Dict[str, str]] = []
+        self._load_meta_favorites()
+        # Microsoft, TikTok, Reddit, Pinterest Favorites
+        self.ms_favorites_file = Path("ms_favorites.json")
+        self.ms_favorites: List[Dict[str, str]] = []
+        self._load_ms_favorites()
+        self.tiktok_favorites_file = Path("tiktok_favorites.json")
+        self.tiktok_favorites: List[Dict[str, str]] = []
+        self._load_tiktok_favorites()
+        self.reddit_favorites_file = Path("reddit_favorites.json")
+        self.reddit_favorites: List[Dict[str, str]] = []
+        self._load_reddit_favorites()
+        self.pinterest_favorites_file = Path("pinterest_favorites.json")
+        self.pinterest_favorites: List[Dict[str, str]] = []
+        self._load_pinterest_favorites()
+        
+        # Create widgets
+        self._create_widgets()
+        
+        # Start logging handler for GUI
+        self._setup_gui_logging()
+        
+        # Handle window close event to clear log
+        self.root.protocol("WM_DELETE_WINDOW", self._on_closing)
+    
+    def _on_closing(self) -> None:
+        """Handle window close event - clear log and destroy window."""
+        try:
+            # Clear the log textbox
+            if hasattr(self, 'log_textbox'):
+                self.log_textbox.delete("1.0", "end")
+        except Exception as e:
+            self.logger.error(f"Error clearing log on exit: {e}", exc_info=True)
+        finally:
+            # Destroy the window
+            self.root.destroy()
+    
+    def _setup_gui_logging(self) -> None:
+        """Setup logging to also output to the GUI log box."""
+        class GUILogHandler(logging.Handler):
+            def __init__(self, text_widget):
+                super().__init__()
+                self.text_widget = text_widget
+            
+            def emit(self, record):
+                msg = self.format(record)
+                def append():
+                    self.text_widget.insert("end", msg + "\n")
+                    self.text_widget.see("end")
+                self.text_widget.after(0, append)
+        
+        gui_handler = GUILogHandler(self.log_textbox)
+        gui_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %I:%M:%S %p'))
+        gui_handler.setLevel(logging.INFO)
+        logging.getLogger().addHandler(gui_handler)
+    
+    def _create_widgets(self) -> None:
+        """Create and layout all GUI widgets. Live Log pinned at bottom (grid row 1); content fills rest (grid row 0)."""
+        # Content area (will go in grid row 0, weight=1)
+        content_frame = ctk.CTkFrame(self.root, fg_color="transparent")
+        content_frame.grid(row=0, column=0, sticky="nsew")
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_columnconfigure(0, weight=1)
+        content_frame.grid_rowconfigure(2, weight=1)
+        content_frame.grid_columnconfigure(0, weight=1)
+
+        # Title
+        title_label = ctk.CTkLabel(
+            content_frame,
+            text="Ads Report Fetcher",
+            font=ctk.CTkFont(size=24, weight="bold")
+        )
+        title_label.grid(row=0, column=0, pady=15)
+
+        # Header: single horizontal bar, 4 buttons, uniform padding
+        header_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
+        header_frame.grid(row=1, column=0, pady=(0, 10), sticky="ew")
+        btn_h, btn_w = 36, 165
+        pad = 10
+        self.new_fetch_button = ctk.CTkButton(
+            header_frame, text="New Fetch", command=self._on_new_fetch_clicked,
+            font=ctk.CTkFont(size=13, weight="bold"), height=btn_h, width=btn_w,
+            fg_color="green", hover_color="darkgreen", state="disabled"
+        )
+        self.new_fetch_button.pack(side="left", padx=pad)
+        self.run_full_pipeline_button = ctk.CTkButton(
+            header_frame, text="Run Full Pipeline", command=self._on_run_all_clicked,
+            font=ctk.CTkFont(size=13, weight="bold"), height=btn_h, width=btn_w,
+            fg_color="#0066CC", hover_color="#0052A3"
+        )
+        self.run_full_pipeline_button.pack(side="left", padx=pad)
+        self.process_all_data_button = ctk.CTkButton(
+            header_frame, text="Process All Data", command=self._on_process_all_data_clicked,
+            font=ctk.CTkFont(size=13, weight="bold"), height=btn_h, width=btn_w,
+            fg_color="orange", hover_color="darkorange", border_width=2, border_color="#FF8C00", corner_radius=8
+        )
+        self.process_all_data_button.pack(side="left", padx=pad)
+        self.clear_data_button = ctk.CTkButton(
+            header_frame, text="☢ Clear All Data ☢", command=self._on_clear_data_clicked,
+            font=ctk.CTkFont(size=13, weight="bold"), height=btn_h, width=btn_w,
+            fg_color="#8B0000", hover_color="#A00000", border_width=2, border_color="#FF4500", corner_radius=8
+        )
+        self.clear_data_button.pack(side="left", padx=pad)
+
+        # Tabview: Main (control panel, sources, accounts, action bar) and Settings
+        self.tabview = ctk.CTkTabview(content_frame, width=760, height=500)
+        self.tabview.grid(row=2, column=0, pady=10, padx=20, sticky="nsew")
+        
+        self.main_tab = self.tabview.add("Main")
+        self.settings_tab = self.tabview.add("Settings")
+        
+        self._create_main_tab()
+        self._create_settings_tab()
+
+        # Checklist/Status (below tabview, inside content area)
+        self._create_checklist_section(content_frame)
+        self.checklist_frame.grid(row=3, column=0, pady=(0, 10), padx=20, sticky="ew")
+
+        # Live Log pinned at bottom (grid row 1, weight=0)
+        log_frame = self._create_shared_log_area()
+        log_frame.grid(row=1, column=0, sticky="ew")
+        self.root.grid_rowconfigure(1, weight=0)
+    
+    def _create_checklist_section(self, parent: Optional[ctk.CTkFrame] = None) -> None:
+        """Create checklist/status indicators showing readiness for each step."""
+        _parent = parent if parent is not None else self.root
+        checklist_frame = ctk.CTkFrame(_parent)
+        # Caller grids this frame (e.g. content_frame row 3)
+        
+        checklist_title = ctk.CTkLabel(
+            checklist_frame,
+            text="Pipeline Status:",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        checklist_title.pack(anchor="w", padx=10, pady=(8, 5))
+        
+        # Status indicators frame
+        status_frame = ctk.CTkFrame(checklist_frame)
+        status_frame.pack(pady=(0, 5), padx=10, fill="x")
+        
+        # Google Ads status
+        self.google_status_label = ctk.CTkLabel(
+            status_frame,
+            text="☐ Google Ads",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        )
+        self.google_status_label.pack(side="left", padx=10, pady=5)
+        
+        # Meta Ads status
+        self.meta_status_label = ctk.CTkLabel(
+            status_frame,
+            text="☐ Meta Ads",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        )
+        self.meta_status_label.pack(side="left", padx=10, pady=5)
+
+        # Microsoft Ads status
+        self.ms_status_label = ctk.CTkLabel(
+            status_frame,
+            text="☐ Microsoft Ads",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        )
+        self.ms_status_label.pack(side="left", padx=10, pady=5)
+        self.tiktok_status_label = ctk.CTkLabel(status_frame, text="☐ TikTok Ads", font=ctk.CTkFont(size=11), text_color="gray")
+        self.tiktok_status_label.pack(side="left", padx=10, pady=5)
+        self.reddit_status_label = ctk.CTkLabel(status_frame, text="☐ Reddit Ads", font=ctk.CTkFont(size=11), text_color="gray")
+        self.reddit_status_label.pack(side="left", padx=10, pady=5)
+        self.pinterest_status_label = ctk.CTkLabel(status_frame, text="☐ Pinterest Ads", font=ctk.CTkFont(size=11), text_color="gray")
+        self.pinterest_status_label.pack(side="left", padx=10, pady=5)
+
+        # Data status
+        self.data_status_label = ctk.CTkLabel(
+            status_frame,
+            text="☐ No existing data",
+            font=ctk.CTkFont(size=11),
+            text_color="gray"
+        )
+        self.data_status_label.pack(side="left", padx=10, pady=5)
+        
+        # Store reference for updates
+        self.checklist_frame = checklist_frame
+        
+        # Pipeline progress bar (initially hidden)
+        self.pipeline_progress_frame = ctk.CTkFrame(checklist_frame)
+        self.pipeline_progress_frame.pack(pady=(5, 8), padx=10, fill="x")
+        
+        self.pipeline_progress_bar = ctk.CTkProgressBar(self.pipeline_progress_frame)
+        self.pipeline_progress_bar.pack(pady=5, padx=10, fill="x")
+        self.pipeline_progress_bar.set(0)
+        self.pipeline_progress_bar.configure(progress_color="#0066CC", fg_color="#2B2B2B")
+        
+        self.pipeline_status_label = ctk.CTkLabel(
+            self.pipeline_progress_frame,
+            text="",
+            font=ctk.CTkFont(size=10),
+            text_color="#A0A0A0"
+        )
+        self.pipeline_status_label.pack(pady=(0, 5))
+        
+        # Initially hide progress bar
+        self.pipeline_progress_frame.pack_forget()
+        
+        # Update statuses
+        self._update_checklist_statuses()
+    
+    def _update_checklist_statuses(self) -> None:
+        """Update checklist status indicators."""
+        # Check Google Ads readiness (both ID and date range must be locked)
+        is_valid_google, _ = self._validate_inputs()
+        google_ready = is_valid_google and self.customer_id_locked and self.date_range_locked
+        google_text = "✓ Google Ads" if google_ready else "☐ Google Ads"
+        google_color = "#90EE90" if google_ready else "gray"
+        self.google_status_label.configure(text=google_text, text_color=google_color)
+        
+        # Check Meta Ads readiness (both ID and date range must be locked)
+        is_valid_meta, _ = self._validate_meta_inputs()
+        meta_ready = is_valid_meta and self.meta_account_id_locked and self.meta_date_range_locked
+        meta_text = "✓ Meta Ads" if meta_ready else "☐ Meta Ads"
+        meta_color = "#90EE90" if meta_ready else "gray"
+        self.meta_status_label.configure(text=meta_text, text_color=meta_color)
+
+        # Check Microsoft Ads readiness (ID and global date range locked)
+        ms_cid = (self.ms_customer_id.get() or "").strip().replace("-", "").replace(" ", "")
+        is_valid_ms = bool(ms_cid and ms_cid.isdigit())
+        ms_ready = is_valid_ms and self.ms_customer_id_locked and self.date_range_locked
+        ms_text = "✓ Microsoft Ads" if ms_ready else "☐ Microsoft Ads"
+        ms_color = "#90EE90" if ms_ready else "gray"
+        self.ms_status_label.configure(text=ms_text, text_color=ms_color)
+        tiktok_ready = self.tiktok_account_id_locked and self.date_range_locked and bool((self.tiktok_account_id.get() or "").strip())
+        self.tiktok_status_label.configure(text="✓ TikTok Ads" if tiktok_ready else "☐ TikTok Ads", text_color="#90EE90" if tiktok_ready else "gray")
+        reddit_ready = self.reddit_account_id_locked and self.date_range_locked and bool((self.reddit_account_id.get() or "").strip())
+        self.reddit_status_label.configure(text="✓ Reddit Ads" if reddit_ready else "☐ Reddit Ads", text_color="#90EE90" if reddit_ready else "gray")
+        pinterest_ready = self.pinterest_account_id_locked and self.date_range_locked and bool((self.pinterest_account_id.get() or "").strip())
+        self.pinterest_status_label.configure(text="✓ Pinterest Ads" if pinterest_ready else "☐ Pinterest Ads", text_color="#90EE90" if pinterest_ready else "gray")
+
+        # Check data status - scan output folders for CSV files
+        google_dir = Path("raw_reports/google")
+        meta_dir = Path("raw_reports/meta")
+        merged_dir = Path("merged_reports")
+        google_has_data = google_dir.exists() and any(google_dir.glob("*.csv"))
+        meta_has_data = meta_dir.exists() and any(meta_dir.glob("*.csv"))
+        merged_has_data = merged_dir.exists() and any(merged_dir.glob("*.csv"))
+        
+        if google_has_data or meta_has_data or merged_has_data:
+            data_text = "☐ Data present"
+            data_color = "#FF6B6B"  # Red
+        else:
+            data_text = "✓ No existing data"
+            data_color = "#90EE90"  # Light green
+        self.data_status_label.configure(text=data_text, text_color=data_color)
+        
+        # Update Run Full Pipeline button state: at least one selected platform ready, and no data
+        google_selected = self.source_google_var.get()
+        meta_selected = self.source_meta_var.get()
+        ms_selected = self.source_ms_var.get()
+        tiktok_selected = self.source_tiktok_var.get()
+        reddit_selected = self.source_reddit_var.get()
+        pinterest_selected = self.source_pinterest_var.get()
+        any_ready = (
+            (google_selected and google_ready)
+            or (meta_selected and meta_ready)
+            or (ms_selected and ms_ready)
+            or (tiktok_selected and tiktok_ready)
+            or (reddit_selected and reddit_ready)
+            or (pinterest_selected and pinterest_ready)
+        )
+        no_data = data_text == "✓ No existing data"
+        all_ready = any_ready and no_data
+        self.root.after(0, lambda: self.run_full_pipeline_button.configure(
+            state="normal" if all_ready else "disabled"
+        ))
+        
+        # Update Clear All Data button state
+        has_csv_files = google_has_data or meta_has_data or merged_has_data
+        self.root.after(0, lambda: self.clear_data_button.configure(
+            fg_color="#8B0000" if has_csv_files else "gray",
+            hover_color="#A00000" if has_csv_files else "darkgray",
+            state="normal" if has_csv_files else "disabled"
+        ))
+        
+        # Update platform-specific process buttons
+        self.root.after(0, lambda: self.google_process_button.configure(
+            state="normal" if google_has_data else "disabled",
+            fg_color="orange" if google_has_data else "gray",
+            hover_color="darkorange" if google_has_data else "darkgray"
+        ))
+        self.root.after(0, lambda: self.meta_process_button.configure(
+            state="normal" if meta_has_data else "disabled",
+            fg_color="orange" if meta_has_data else "gray",
+            hover_color="darkorange" if meta_has_data else "darkgray"
+        ))
+
+        # Lock All / Unlock All IDs button states
+        any_selected = (
+            google_selected or meta_selected or ms_selected
+            or tiktok_selected or reddit_selected or pinterest_selected
+        )
+        any_selected_unlocked = (
+            (google_selected and not self.customer_id_locked)
+            or (meta_selected and not self.meta_account_id_locked)
+            or (ms_selected and not self.ms_customer_id_locked)
+            or (tiktok_selected and not self.tiktok_account_id_locked)
+            or (reddit_selected and not self.reddit_account_id_locked)
+            or (pinterest_selected and not self.pinterest_account_id_locked)
+        )
+        any_locked = (
+            self.customer_id_locked or self.meta_account_id_locked or self.ms_customer_id_locked
+            or self.tiktok_account_id_locked or self.reddit_account_id_locked or self.pinterest_account_id_locked
+        )
+        if hasattr(self, "lock_all_ids_btn"):
+            self.lock_all_ids_btn.configure(
+                state="normal" if (any_selected and any_selected_unlocked) else "disabled"
+            )
+        if hasattr(self, "unlock_all_ids_btn"):
+            self.unlock_all_ids_btn.configure(
+                state="normal" if any_locked else "disabled"
+            )
+    
+    def _create_process_section(self) -> None:
+        """Create process section between tabs and log."""
+        process_section = ctk.CTkFrame(self.root)
+        process_section.pack(pady=10, padx=20, fill="x")
+        
+        self.process_button = ctk.CTkButton(
+            process_section,
+            text="Process Downloaded Files",
+            command=self._on_process_clicked,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            height=45,
+            fg_color="orange",
+            hover_color="darkorange"
+        )
+        self.process_button.pack(pady=10, padx=20, fill="x")
+        
+        # Progress frame (initially hidden)
+        self.process_progress_frame = ctk.CTkFrame(process_section)
+        
+        # Outer glow frame for visual appeal
+        progress_container = ctk.CTkFrame(self.process_progress_frame)
+        progress_container.pack(pady=10, padx=10, fill="x")
+        
+        # Animated status label
+        self.process_status_label = ctk.CTkLabel(
+            progress_container,
+            text="",
+            font=ctk.CTkFont(size=13, weight="bold"),
+            text_color="#FFA500"
+        )
+        self.process_status_label.pack(pady=(10, 5))
+        
+        # Progress bar
+        self.process_progress_bar = ctk.CTkProgressBar(progress_container)
+        self.process_progress_bar.pack(pady=10, padx=20, fill="x")
+        self.process_progress_bar.set(0)
+        self.process_progress_bar.configure(progress_color="#FF6B35", fg_color="#2B2B2B")
+        
+        # Progress info frame
+        progress_info_frame = ctk.CTkFrame(progress_container)
+        progress_info_frame.pack(pady=5, padx=20, fill="x")
+        
+        self.process_progress_percent_label = ctk.CTkLabel(
+            progress_info_frame,
+            text="0%",
+            font=ctk.CTkFont(size=14, weight="bold"),
+            text_color="#FFA500"
+        )
+        self.process_progress_percent_label.pack(side="left", padx=5)
+        
+        self.process_files_count_label = ctk.CTkLabel(
+            progress_info_frame,
+            text="",
+            font=ctk.CTkFont(size=11),
+            text_color="#A0A0A0"
+        )
+        self.process_files_count_label.pack(side="left", padx=15, expand=True)
+        
+        self.process_current_file_label = ctk.CTkLabel(
+            progress_info_frame,
+            text="",
+            font=ctk.CTkFont(size=10),
+            text_color="#808080"
+        )
+        self.process_current_file_label.pack(side="right", padx=5)
+        
+        # Spinner
+        self.process_spinner_label = ctk.CTkLabel(
+            progress_container,
+            text="",
+            font=ctk.CTkFont(size=16),
+            text_color="#FFA500"
+        )
+        self.process_spinner_label.pack(pady=(5, 10))
+        
+        # Initially hide progress frame
+        self.process_progress_frame.pack_forget()
+    
+    def _create_main_tab(self) -> None:
+        """Create Main tab: Control Panel (global date), Source Selection, Accounts, Action Bar."""
+        # --- Control Panel: global date range (one set for all platforms) ---
+        control_frame = ctk.CTkFrame(self.main_tab)
+        control_frame.pack(pady=10, padx=20, fill="x")
+        ctk.CTkLabel(control_frame, text="Control Panel — Date Range", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=10, pady=(10, 5))
+        start_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
+        start_frame.pack(pady=3, padx=10, fill="x")
+        ctk.CTkLabel(start_frame, text="Start:", font=ctk.CTkFont(size=11)).pack(side="left", padx=10)
+        current_year = datetime.now().year
+        year_list = [str(y) for y in range(current_year - 10, current_year + 1)]
+        self.start_month_menu = ctk.CTkOptionMenu(start_frame, values=self.month_names, variable=self.start_month, width=80, state="normal" if not self.date_range_locked else "disabled")
+        self.start_month_menu.pack(side="left", padx=5)
+        self.start_year_menu = ctk.CTkOptionMenu(start_frame, values=year_list, variable=self.start_year, width=80, state="normal" if not self.date_range_locked else "disabled")
+        self.start_year_menu.pack(side="left", padx=5)
+        end_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
+        end_frame.pack(pady=3, padx=10, fill="x")
+        ctk.CTkLabel(end_frame, text="End:  ", font=ctk.CTkFont(size=11)).pack(side="left", padx=10)
+        self.end_month_menu = ctk.CTkOptionMenu(end_frame, values=self.month_names, variable=self.end_month, width=80, state="normal" if not self.date_range_locked else "disabled")
+        self.end_month_menu.pack(side="left", padx=5)
+        self.end_year_menu = ctk.CTkOptionMenu(end_frame, values=year_list, variable=self.end_year, width=80, state="normal" if not self.date_range_locked else "disabled")
+        self.end_year_menu.pack(side="left", padx=5)
+        date_btn_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
+        date_btn_frame.pack(pady=8, padx=10)
+        self.confirm_date_btn = ctk.CTkButton(date_btn_frame, text="Confirm Date Range", command=self._confirm_date_range_global, font=ctk.CTkFont(size=11), width=150, height=30)
+        self.confirm_date_btn.pack(side="left", padx=5)
+        self.unlock_date_btn = ctk.CTkButton(date_btn_frame, text="Unlock", command=self._unlock_date_range_global, font=ctk.CTkFont(size=10), width=80, height=30, fg_color="gray", hover_color="darkgray", state="disabled")
+        self.unlock_date_btn.pack(side="left", padx=5)
+        
+        # --- Scrollable: Source Selection + Accounts (450px; keeps Live Log pinned and visible) ---
+        self.main_scrollable = ctk.CTkScrollableFrame(self.main_tab, height=450, fg_color="transparent")
+        self.main_scrollable.pack(pady=6, padx=20, fill="x", expand=False)
+
+        # Source Selection
+        source_frame = ctk.CTkFrame(self.main_scrollable, fg_color="transparent")
+        source_frame.pack(pady=4, padx=0, fill="x")
+        ctk.CTkLabel(source_frame, text="Source Selection", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=0, pady=(0, 3))
+        inner_src = ctk.CTkFrame(source_frame, fg_color="transparent")
+        inner_src.pack(pady=(0, 4), fill="x")
+        self.source_google_var = ctk.BooleanVar(value=True)
+        self.source_meta_var = ctk.BooleanVar(value=True)
+        self.source_ms_var = ctk.BooleanVar(value=False)
+        self.source_tiktok_var = ctk.BooleanVar(value=False)
+        self.source_reddit_var = ctk.BooleanVar(value=False)
+        self.source_pinterest_var = ctk.BooleanVar(value=False)
+        self.source_google_cb = ctk.CTkCheckBox(inner_src, text="Google Ads", variable=self.source_google_var, font=ctk.CTkFont(size=11), command=self._on_source_selection_changed)
+        self.source_google_cb.pack(side="left", padx=10)
+        self.source_meta_cb = ctk.CTkCheckBox(inner_src, text="Meta Ads", variable=self.source_meta_var, font=ctk.CTkFont(size=11), command=self._on_source_selection_changed)
+        self.source_meta_cb.pack(side="left", padx=10)
+        self.source_ms_cb = ctk.CTkCheckBox(inner_src, text="Microsoft Ads", variable=self.source_ms_var, font=ctk.CTkFont(size=11), command=self._on_source_selection_changed)
+        self.source_ms_cb.pack(side="left", padx=10)
+        self.source_tiktok_cb = ctk.CTkCheckBox(inner_src, text="TikTok Ads", variable=self.source_tiktok_var, font=ctk.CTkFont(size=11), command=self._on_source_selection_changed)
+        self.source_tiktok_cb.pack(side="left", padx=10)
+        self.source_reddit_cb = ctk.CTkCheckBox(inner_src, text="Reddit Ads", variable=self.source_reddit_var, font=ctk.CTkFont(size=11), command=self._on_source_selection_changed)
+        self.source_reddit_cb.pack(side="left", padx=10)
+        self.source_pinterest_cb = ctk.CTkCheckBox(inner_src, text="Pinterest Ads", variable=self.source_pinterest_var, font=ctk.CTkFont(size=11), command=self._on_source_selection_changed)
+        self.source_pinterest_cb.pack(side="left", padx=10)
+        
+        # --- Accounts: 2-column rows, separators, global Lock/Unlock ---
+        accounts_frame = ctk.CTkFrame(self.main_scrollable, fg_color="transparent")
+        accounts_frame.pack(pady=4, padx=0, fill="x")
+        ctk.CTkLabel(accounts_frame, text="Accounts", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=0, pady=(0, 3))
+        lock_btn_row = ctk.CTkFrame(accounts_frame, fg_color="transparent")
+        lock_btn_row.pack(pady=(0, 6), fill="x")
+        self.lock_all_ids_btn = ctk.CTkButton(lock_btn_row, text="Lock All Active IDs", command=self._lock_all_active_ids, font=ctk.CTkFont(size=11), width=160, height=30)
+        self.lock_all_ids_btn.pack(side="left", padx=(0, 8))
+        self.unlock_all_ids_btn = ctk.CTkButton(lock_btn_row, text="Unlock All IDs", command=self._unlock_all_ids, font=ctk.CTkFont(size=10), width=120, height=30, fg_color="gray", hover_color="darkgray", state="disabled")
+        self.unlock_all_ids_btn.pack(side="left", padx=0)
+
+        def _sep() -> ctk.CTkFrame:
+            s = ctk.CTkFrame(accounts_frame, height=2, fg_color=("gray70", "gray40"))
+            s.pack(fill="x", pady=(4, 0))
+            s.pack_propagate(False)
+            return s
+
+        # Google: 2-col row — single combobox (ID + favorites inline), uniform width
+        self._sep_google = _sep()
+        self.google_account_frame = ctk.CTkFrame(accounts_frame, fg_color="transparent")
+        self.google_account_frame.pack(pady=4, padx=0, fill="x")
+        self.google_account_frame.grid_columnconfigure(1, weight=1)
+        col0_google = ctk.CTkFrame(self.google_account_frame, fg_color="transparent")
+        col0_google.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ctk.CTkLabel(col0_google, text="Google Ads", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
+        col1_google = ctk.CTkFrame(self.google_account_frame, fg_color="transparent")
+        col1_google.grid(row=0, column=1, sticky="ew")
+        col1_google.grid_columnconfigure(0, weight=1)
+        google_values = [f"{f['name']} ({f['customer_id']})" for f in self.favorites] if self.favorites else []
+        self.customer_id_combobox = ctk.CTkComboBox(col1_google, variable=self.google_id_display, values=google_values, width=ID_FIELD_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_google_id_combobox_select)
+        self.customer_id_combobox.grid(row=0, column=0, padx=0, pady=2, sticky="ew")
+        self._set_google_id_display_from_id()
+        self.google_id_display.trace_add("write", lambda *a: self._sync_google_id_from_display())
+
+        # Meta: 2-col row — single combobox + token frame below
+        self._sep_meta = _sep()
+        self.meta_account_frame = ctk.CTkFrame(accounts_frame, fg_color="transparent")
+        self.meta_account_frame.pack(pady=4, padx=0, fill="x")
+        self.meta_account_frame.grid_columnconfigure(1, weight=1)
+        col0_meta = ctk.CTkFrame(self.meta_account_frame, fg_color="transparent")
+        col0_meta.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ctk.CTkLabel(col0_meta, text="Meta Ads", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
+        col1_meta = ctk.CTkFrame(self.meta_account_frame, fg_color="transparent")
+        col1_meta.grid(row=0, column=1, sticky="ew")
+        col1_meta.grid_columnconfigure(0, weight=1)
+        meta_values = [f"{f['name']} ({f['account_id']})" for f in self.meta_favorites] if self.meta_favorites else []
+        self.meta_account_id_combobox = ctk.CTkComboBox(col1_meta, variable=self.meta_id_display, values=meta_values, width=ID_FIELD_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_meta_id_combobox_select)
+        self.meta_account_id_combobox.grid(row=0, column=0, padx=0, pady=2, sticky="ew")
+        self._set_meta_id_display_from_id()
+        self.meta_id_display.trace_add("write", lambda *a: self._sync_meta_id_from_display())
+        self.meta_token_frame = ctk.CTkFrame(self.meta_account_frame, fg_color="transparent")
+        self.meta_token_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
+        self.meta_account_frame.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(self.meta_token_frame, text="Meta Access Token Expired. Enter new token:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#FF6B6B").pack(anchor="w", padx=0, pady=(4, 2))
+        token_row = ctk.CTkFrame(self.meta_token_frame, fg_color="transparent")
+        token_row.pack(pady=(0, 4), fill="x")
+        self.meta_token_entry = ctk.CTkEntry(token_row, textvariable=self.meta_token_input, placeholder_text="Paste new token", width=400, height=35)
+        self.meta_token_entry.pack(side="left", padx=(0, 8), fill="x", expand=True)
+        self.meta_token_update_btn = ctk.CTkButton(token_row, text="Update Token", command=self._on_meta_token_update_clicked, width=120, height=35, font=ctk.CTkFont(size=12, weight="bold"), fg_color="green", hover_color="darkgreen")
+        self.meta_token_update_btn.pack(side="left", padx=0)
+        self.meta_token_frame.grid_remove()
+
+        # Microsoft: 2-col row — combobox (ID + favorites inline), uniform width
+        self._sep_ms = _sep()
+        self.ms_account_frame = ctk.CTkFrame(accounts_frame, fg_color="transparent")
+        self.ms_account_frame.pack(pady=4, padx=0, fill="x")
+        self.ms_account_frame.grid_columnconfigure(1, weight=1)
+        col0_ms = ctk.CTkFrame(self.ms_account_frame, fg_color="transparent")
+        col0_ms.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ctk.CTkLabel(col0_ms, text="Microsoft Ads", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
+        ms_col1 = ctk.CTkFrame(self.ms_account_frame, fg_color="transparent")
+        ms_col1.grid(row=0, column=1, sticky="ew")
+        ms_col1.grid_columnconfigure(0, weight=1)
+        ms_values = [f"{f['name']} ({f['customer_id']})" for f in self.ms_favorites] if self.ms_favorites else []
+        self.ms_customer_id_combobox = ctk.CTkComboBox(ms_col1, variable=self.ms_id_display, values=ms_values, width=ID_FIELD_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_ms_id_combobox_select)
+        self.ms_customer_id_combobox.grid(row=0, column=0, padx=0, pady=2, sticky="ew")
+        self._set_ms_id_display_from_id()
+        self.ms_id_display.trace_add("write", lambda *a: self._sync_ms_id_from_display())
+        self.ms_account_frame.pack_forget()
+
+        # TikTok: 2-col row — combobox, uniform width
+        self._sep_tiktok = _sep()
+        self.tiktok_account_frame = ctk.CTkFrame(accounts_frame, fg_color="transparent")
+        self.tiktok_account_frame.pack(pady=4, padx=0, fill="x")
+        self.tiktok_account_frame.grid_columnconfigure(1, weight=1)
+        col0_tk = ctk.CTkFrame(self.tiktok_account_frame, fg_color="transparent")
+        col0_tk.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ctk.CTkLabel(col0_tk, text="TikTok Ads", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
+        tk_col1 = ctk.CTkFrame(self.tiktok_account_frame, fg_color="transparent")
+        tk_col1.grid(row=0, column=1, sticky="ew")
+        tk_col1.grid_columnconfigure(0, weight=1)
+        tk_values = [f"{f['name']} ({f['advertiser_id']})" for f in self.tiktok_favorites] if self.tiktok_favorites else []
+        self.tiktok_account_id_combobox = ctk.CTkComboBox(tk_col1, variable=self.tiktok_id_display, values=tk_values, width=ID_FIELD_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_tiktok_id_combobox_select)
+        self.tiktok_account_id_combobox.grid(row=0, column=0, padx=0, pady=2, sticky="ew")
+        self._set_tiktok_id_display_from_id()
+        self.tiktok_id_display.trace_add("write", lambda *a: self._sync_tiktok_id_from_display())
+        self.tiktok_account_frame.pack_forget()
+
+        # Reddit: 2-col row — combobox, uniform width
+        self._sep_reddit = _sep()
+        self.reddit_account_frame = ctk.CTkFrame(accounts_frame, fg_color="transparent")
+        self.reddit_account_frame.pack(pady=4, padx=0, fill="x")
+        self.reddit_account_frame.grid_columnconfigure(1, weight=1)
+        col0_rd = ctk.CTkFrame(self.reddit_account_frame, fg_color="transparent")
+        col0_rd.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ctk.CTkLabel(col0_rd, text="Reddit Ads", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
+        rd_col1 = ctk.CTkFrame(self.reddit_account_frame, fg_color="transparent")
+        rd_col1.grid(row=0, column=1, sticky="ew")
+        rd_col1.grid_columnconfigure(0, weight=1)
+        rd_values = [f"{f['name']} ({f['account_id']})" for f in self.reddit_favorites] if self.reddit_favorites else []
+        self.reddit_account_id_combobox = ctk.CTkComboBox(rd_col1, variable=self.reddit_id_display, values=rd_values, width=ID_FIELD_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_reddit_id_combobox_select)
+        self.reddit_account_id_combobox.grid(row=0, column=0, padx=0, pady=2, sticky="ew")
+        self._set_reddit_id_display_from_id()
+        self.reddit_id_display.trace_add("write", lambda *a: self._sync_reddit_id_from_display())
+        self.reddit_account_frame.pack_forget()
+
+        # Pinterest: 2-col row — combobox, uniform width
+        self._sep_pinterest = _sep()
+        self.pinterest_account_frame = ctk.CTkFrame(accounts_frame, fg_color="transparent")
+        self.pinterest_account_frame.pack(pady=4, padx=0, fill="x")
+        self.pinterest_account_frame.grid_columnconfigure(1, weight=1)
+        col0_pt = ctk.CTkFrame(self.pinterest_account_frame, fg_color="transparent")
+        col0_pt.grid(row=0, column=0, sticky="w", padx=(0, 12))
+        ctk.CTkLabel(col0_pt, text="Pinterest Ads", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
+        pt_col1 = ctk.CTkFrame(self.pinterest_account_frame, fg_color="transparent")
+        pt_col1.grid(row=0, column=1, sticky="ew")
+        pt_col1.grid_columnconfigure(0, weight=1)
+        pt_values = [f"{f['name']} ({f['advertiser_id']})" for f in self.pinterest_favorites] if self.pinterest_favorites else []
+        self.pinterest_account_id_combobox = ctk.CTkComboBox(pt_col1, variable=self.pinterest_id_display, values=pt_values, width=ID_FIELD_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_pinterest_id_combobox_select)
+        self.pinterest_account_id_combobox.grid(row=0, column=0, padx=0, pady=2, sticky="ew")
+        self._set_pinterest_id_display_from_id()
+        self.pinterest_id_display.trace_add("write", lambda *a: self._sync_pinterest_id_from_display())
+        self.pinterest_account_frame.pack_forget()
+
+        # Apply initial visibility (separators + frames) from source selection
+        self._on_source_selection_changed()
+
+        # --- Action Bar (centered) ---
+        action_frame = ctk.CTkFrame(self.main_tab, fg_color="transparent")
+        action_frame.pack(pady=12, padx=20, fill="x")
+        ctk.CTkLabel(action_frame, text="Actions", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=0, pady=(0, 6))
+        action_buttons = ctk.CTkFrame(action_frame, fg_color="transparent")
+        action_buttons.pack(pady=0, fill="x")
+        self.start_button = ctk.CTkButton(action_buttons, text="Start Google Fetch", command=self._on_start_clicked, font=ctk.CTkFont(size=14, weight="bold"), height=40, width=180, state="disabled")
+        self.start_button.pack(side="left", padx=8)
+        self.meta_start_button = ctk.CTkButton(action_buttons, text="Start Meta Fetch", command=self._on_meta_start_clicked, font=ctk.CTkFont(size=14, weight="bold"), height=40, width=180, state="disabled")
+        self.meta_start_button.pack(side="left", padx=8)
+        self.stop_button = ctk.CTkButton(action_buttons, text="Stop", command=self._on_stop_clicked, font=ctk.CTkFont(size=14, weight="bold"), height=40, width=100, fg_color="red", hover_color="darkred", state="disabled")
+        self.stop_button.pack(side="left", padx=8)
+        run_full_btn = ctk.CTkButton(action_buttons, text="Run Full Pipeline", command=self._on_run_all_clicked, font=ctk.CTkFont(size=14, weight="bold"), height=40, width=160, fg_color="#0066CC", hover_color="#0052A3")
+        run_full_btn.pack(side="left", padx=8)
+        
+        # --- Progress ---
+        progress_frame = ctk.CTkFrame(self.main_tab)
+        progress_frame.pack(pady=8, padx=20, fill="x")
+        progress_info_frame = ctk.CTkFrame(progress_frame, fg_color="transparent")
+        progress_info_frame.pack(pady=5, padx=10, fill="x")
+        self.progress_percent_label = ctk.CTkLabel(progress_info_frame, text="0%", font=ctk.CTkFont(size=11, weight="bold"))
+        self.progress_percent_label.pack(side="left", padx=5)
+        self.eta_label = ctk.CTkLabel(progress_info_frame, text="", font=ctk.CTkFont(size=10))
+        self.eta_label.pack(side="left", padx=10, expand=True)
+        self.completion_time_label = ctk.CTkLabel(progress_info_frame, text="", font=ctk.CTkFont(size=10))
+        self.completion_time_label.pack(side="left", padx=5)
+        self.progress_bar = ctk.CTkProgressBar(progress_frame)
+        self.progress_bar.pack(pady=5, padx=20, fill="x")
+        self.progress_bar.set(0)
+        
+        meta_progress_frame = ctk.CTkFrame(self.main_tab)
+        meta_progress_frame.pack(pady=5, padx=20, fill="x")
+        meta_progress_info_frame = ctk.CTkFrame(meta_progress_frame, fg_color="transparent")
+        meta_progress_info_frame.pack(pady=5, padx=10, fill="x")
+        self.meta_progress_percent_label = ctk.CTkLabel(meta_progress_info_frame, text="0%", font=ctk.CTkFont(size=11, weight="bold"))
+        self.meta_progress_percent_label.pack(side="left", padx=5)
+        self.meta_eta_label = ctk.CTkLabel(meta_progress_info_frame, text="", font=ctk.CTkFont(size=10))
+        self.meta_eta_label.pack(side="left", padx=10, expand=True)
+        self.meta_completion_time_label = ctk.CTkLabel(meta_progress_info_frame, text="", font=ctk.CTkFont(size=10))
+        self.meta_completion_time_label.pack(side="left", padx=5)
+        self.meta_progress_bar = ctk.CTkProgressBar(meta_progress_frame)
+        self.meta_progress_bar.pack(pady=5, padx=20, fill="x")
+        self.meta_progress_bar.set(0)
+        
+        process_row = ctk.CTkFrame(self.main_tab, fg_color="transparent")
+        process_row.pack(pady=10, padx=20, fill="x")
+        self.google_process_button = ctk.CTkButton(process_row, text="Process Google Files", command=self._on_google_process_clicked, font=ctk.CTkFont(size=12, weight="bold"), height=35, fg_color="orange", hover_color="darkorange", state="disabled")
+        self.google_process_button.pack(side="left", padx=8)
+        self.meta_process_button = ctk.CTkButton(process_row, text="Process Meta Files", command=self._on_meta_process_clicked, font=ctk.CTkFont(size=12, weight="bold"), height=35, fg_color="orange", hover_color="darkorange", state="disabled")
+        self.meta_process_button.pack(side="left", padx=8)
+        
+        self.google_process_progress_frame = ctk.CTkFrame(self.main_tab)
+        self.meta_process_progress_frame = ctk.CTkFrame(self.main_tab)
+        for pf in [self.google_process_progress_frame, self.meta_process_progress_frame]:
+            pc = ctk.CTkFrame(pf, fg_color="transparent")
+            pc.pack(pady=10, padx=10, fill="x")
+            ctk.CTkLabel(pc, text="", font=ctk.CTkFont(size=13, weight="bold"), text_color="#FFA500").pack(pady=(10, 5))
+            pb = ctk.CTkProgressBar(pc)
+            pb.pack(pady=10, padx=20, fill="x")
+            pb.set(0)
+            pb.configure(progress_color="#FF6B35", fg_color="#2B2B2B")
+            pi = ctk.CTkFrame(pc, fg_color="transparent")
+            pi.pack(pady=5, padx=20, fill="x")
+            ctk.CTkLabel(pi, text="0%", font=ctk.CTkFont(size=14, weight="bold"), text_color="#FFA500").pack(side="left", padx=5)
+            ctk.CTkLabel(pi, text="", font=ctk.CTkFont(size=11), text_color="#A0A0A0").pack(side="left", padx=15, expand=True)
+            ctk.CTkLabel(pi, text="", font=ctk.CTkFont(size=10), text_color="#808080").pack(side="right", padx=5)
+            ctk.CTkLabel(pc, text="", font=ctk.CTkFont(size=16), text_color="#FFA500").pack(pady=(5, 10))
+            pf.pack_forget()
+        self.google_process_status_label = self.google_process_progress_frame.winfo_children()[0].winfo_children()[0]
+        self.google_process_progress_bar = self.google_process_progress_frame.winfo_children()[0].winfo_children()[1]
+        self.google_process_percent_label = self.google_process_progress_frame.winfo_children()[0].winfo_children()[2].winfo_children()[0]
+        self.google_process_files_label = self.google_process_progress_frame.winfo_children()[0].winfo_children()[2].winfo_children()[1]
+        self.google_process_current_label = self.google_process_progress_frame.winfo_children()[0].winfo_children()[2].winfo_children()[2]
+        self.google_process_spinner_label = self.google_process_progress_frame.winfo_children()[0].winfo_children()[3]
+        self.meta_process_status_label = self.meta_process_progress_frame.winfo_children()[0].winfo_children()[0]
+        self.meta_process_progress_bar = self.meta_process_progress_frame.winfo_children()[0].winfo_children()[1]
+        self.meta_process_percent_label = self.meta_process_progress_frame.winfo_children()[0].winfo_children()[2].winfo_children()[0]
+        self.meta_process_files_label = self.meta_process_progress_frame.winfo_children()[0].winfo_children()[2].winfo_children()[1]
+        self.meta_process_current_label = self.meta_process_progress_frame.winfo_children()[0].winfo_children()[2].winfo_children()[2]
+        self.meta_process_spinner_label = self.meta_process_progress_frame.winfo_children()[0].winfo_children()[3]
+    
+    def _on_source_selection_changed(self) -> None:
+        """Show/hide account blocks and separators; apply smart defaulting when a platform is shown."""
+        platform_blocks = [
+            (self.source_google_var, self._sep_google, self.google_account_frame, "google"),
+            (self.source_meta_var, self._sep_meta, self.meta_account_frame, "meta"),
+            (self.source_ms_var, self._sep_ms, self.ms_account_frame, "ms"),
+            (self.source_tiktok_var, self._sep_tiktok, self.tiktok_account_frame, "tiktok"),
+            (self.source_reddit_var, self._sep_reddit, self.reddit_account_frame, "reddit"),
+            (self.source_pinterest_var, self._sep_pinterest, self.pinterest_account_frame, "pinterest"),
+        ]
+        for var, sep, frame, key in platform_blocks:
+            if var.get():
+                sep.pack(fill="x", pady=(4, 0))
+                sep.pack_propagate(False)
+                frame.pack(pady=4, padx=0, fill="x")
+                self._apply_smart_default_for_platform(key)
+            else:
+                sep.pack_forget()
+                frame.pack_forget()
+
+    def _apply_smart_default_for_platform(self, platform_key: str) -> None:
+        """When a platform is first shown, fill empty ID from last_*_id or primary favorite."""
+        last_key = f"last_{platform_key}_id"
+        last_id = self.settings.get(last_key, "").strip()
+        if platform_key == "google":
+            if not self.customer_id.get().strip() and last_id:
+                self.customer_id.set(last_id)
+            elif not self.customer_id.get().strip():
+                default_fav = self.settings.get("default_google_favorite")
+                if default_fav and self.favorites:
+                    for f in self.favorites:
+                        if f.get("name") == default_fav and f.get("customer_id"):
+                            self.customer_id.set(f["customer_id"].strip())
+                            break
+        elif platform_key == "meta":
+            current = self.meta_account_id.get().strip()
+            if (not current or current == "act_") and last_id:
+                self.meta_account_id.set(last_id)
+            elif (not current or current == "act_"):
+                default_fav = self.settings.get("default_meta_favorite")
+                if default_fav and self.meta_favorites:
+                    for f in self.meta_favorites:
+                        if f.get("name") == default_fav and f.get("account_id"):
+                            self.meta_account_id.set(f["account_id"].strip())
+                            break
+        elif platform_key == "ms":
+            if not self.ms_customer_id.get().strip() and last_id:
+                self.ms_customer_id.set(last_id)
+            elif not self.ms_customer_id.get().strip():
+                default_fav = self.settings.get("default_ms_favorite")
+                if default_fav and self.ms_favorites:
+                    for f in self.ms_favorites:
+                        if f.get("name") == default_fav and f.get("customer_id"):
+                            self.ms_customer_id.set(f["customer_id"].strip())
+                            break
+        elif platform_key == "tiktok":
+            if not self.tiktok_account_id.get().strip() and last_id:
+                self.tiktok_account_id.set(last_id)
+            elif not self.tiktok_account_id.get().strip():
+                default_fav = self.settings.get("default_tiktok_favorite")
+                if default_fav and self.tiktok_favorites:
+                    for f in self.tiktok_favorites:
+                        if f.get("name") == default_fav and f.get("advertiser_id"):
+                            self.tiktok_account_id.set(f["advertiser_id"].strip())
+                            break
+        elif platform_key == "reddit":
+            if not self.reddit_account_id.get().strip() and last_id:
+                self.reddit_account_id.set(last_id)
+            elif not self.reddit_account_id.get().strip():
+                default_fav = self.settings.get("default_reddit_favorite")
+                if default_fav and self.reddit_favorites:
+                    for f in self.reddit_favorites:
+                        if f.get("name") == default_fav and f.get("account_id"):
+                            self.reddit_account_id.set(f["account_id"].strip())
+                            break
+        elif platform_key == "pinterest":
+            if not self.pinterest_account_id.get().strip() and last_id:
+                self.pinterest_account_id.set(last_id)
+            elif not self.pinterest_account_id.get().strip():
+                default_fav = self.settings.get("default_pinterest_favorite")
+                if default_fav and self.pinterest_favorites:
+                    for f in self.pinterest_favorites:
+                        if f.get("name") == default_fav and f.get("advertiser_id"):
+                            self.pinterest_account_id.set(f["advertiser_id"].strip())
+                            break
+        # Sync combobox display to current ID for this platform
+        if platform_key == "google":
+            self._set_google_id_display_from_id()
+        elif platform_key == "meta":
+            self._set_meta_id_display_from_id()
+        elif platform_key == "ms":
+            self._set_ms_id_display_from_id()
+        elif platform_key == "tiktok":
+            self._set_tiktok_id_display_from_id()
+        elif platform_key == "reddit":
+            self._set_reddit_id_display_from_id()
+        elif platform_key == "pinterest":
+            self._set_pinterest_id_display_from_id()
+
+    def _set_google_id_display_from_id(self) -> None:
+        cid = self.customer_id.get().strip()
+        for f in self.favorites:
+            if (f.get("customer_id") or "").strip() == cid:
+                self.google_id_display.set(f"{f['name']} ({f['customer_id']})")
+                return
+        self.google_id_display.set(cid if cid else "")
+
+    def _sync_google_id_from_display(self) -> None:
+        self.customer_id.set(_parse_id_from_favorite_display(self.google_id_display.get()))
+
+    def _on_google_id_combobox_select(self, choice: str) -> None:
+        self.customer_id.set(_parse_id_from_favorite_display(choice))
+
+    def _set_meta_id_display_from_id(self) -> None:
+        aid = self.meta_account_id.get().strip()
+        for f in self.meta_favorites:
+            if (f.get("account_id") or "").strip() == aid:
+                self.meta_id_display.set(f"{f['name']} ({f['account_id']})")
+                return
+        self.meta_id_display.set(aid if aid else "")
+
+    def _sync_meta_id_from_display(self) -> None:
+        self.meta_account_id.set(_parse_id_from_favorite_display(self.meta_id_display.get()))
+
+    def _on_meta_id_combobox_select(self, choice: str) -> None:
+        self.meta_account_id.set(_parse_id_from_favorite_display(choice))
+
+    def _set_ms_id_display_from_id(self) -> None:
+        cid = self.ms_customer_id.get().strip()
+        for f in self.ms_favorites:
+            if (f.get("customer_id") or "").strip() == cid:
+                self.ms_id_display.set(f"{f['name']} ({f['customer_id']})")
+                return
+        self.ms_id_display.set(cid if cid else "")
+
+    def _sync_ms_id_from_display(self) -> None:
+        self.ms_customer_id.set(_parse_id_from_favorite_display(self.ms_id_display.get()))
+
+    def _on_ms_id_combobox_select(self, choice: str) -> None:
+        self.ms_customer_id.set(_parse_id_from_favorite_display(choice))
+
+    def _set_tiktok_id_display_from_id(self) -> None:
+        tid = self.tiktok_account_id.get().strip()
+        for f in self.tiktok_favorites:
+            if (f.get("advertiser_id") or "").strip() == tid:
+                self.tiktok_id_display.set(f"{f['name']} ({f['advertiser_id']})")
+                return
+        self.tiktok_id_display.set(tid if tid else "")
+
+    def _sync_tiktok_id_from_display(self) -> None:
+        self.tiktok_account_id.set(_parse_id_from_favorite_display(self.tiktok_id_display.get()))
+
+    def _on_tiktok_id_combobox_select(self, choice: str) -> None:
+        self.tiktok_account_id.set(_parse_id_from_favorite_display(choice))
+
+    def _set_reddit_id_display_from_id(self) -> None:
+        rid = self.reddit_account_id.get().strip()
+        for f in self.reddit_favorites:
+            if (f.get("account_id") or "").strip() == rid:
+                self.reddit_id_display.set(f"{f['name']} ({f['account_id']})")
+                return
+        self.reddit_id_display.set(rid if rid else "")
+
+    def _sync_reddit_id_from_display(self) -> None:
+        self.reddit_account_id.set(_parse_id_from_favorite_display(self.reddit_id_display.get()))
+
+    def _on_reddit_id_combobox_select(self, choice: str) -> None:
+        self.reddit_account_id.set(_parse_id_from_favorite_display(choice))
+
+    def _set_pinterest_id_display_from_id(self) -> None:
+        pid = self.pinterest_account_id.get().strip()
+        for f in self.pinterest_favorites:
+            if (f.get("advertiser_id") or "").strip() == pid:
+                self.pinterest_id_display.set(f"{f['name']} ({f['advertiser_id']})")
+                return
+        self.pinterest_id_display.set(pid if pid else "")
+
+    def _sync_pinterest_id_from_display(self) -> None:
+        self.pinterest_account_id.set(_parse_id_from_favorite_display(self.pinterest_id_display.get()))
+
+    def _on_pinterest_id_combobox_select(self, choice: str) -> None:
+        self.pinterest_account_id.set(_parse_id_from_favorite_display(choice))
+
+    def _create_settings_tab(self) -> None:
+        """Create Settings tab with configuration options."""
+        # Meta Token section
+        token_frame = ctk.CTkFrame(self.settings_tab)
+        token_frame.pack(pady=10, padx=20, fill="x")
+        
+        token_label = ctk.CTkLabel(
+            token_frame,
+            text="Meta Ads Access Token:",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        token_label.pack(anchor="w", padx=10, pady=(10, 5))
+        
+        token_input_frame = ctk.CTkFrame(token_frame)
+        token_input_frame.pack(pady=(0, 10), padx=10, fill="x")
+        
+        self.settings_token_entry = ctk.CTkEntry(
+            token_input_frame,
+            placeholder_text="Enter Meta Ads access token",
+            width=440,
+            show="*"
+        )
+        self.settings_token_entry.pack(side="left", padx=(0, 5), fill="x", expand=True)
+        
+        save_token_btn = ctk.CTkButton(
+            token_input_frame,
+            text="Save Token",
+            command=self._on_save_meta_token_settings,
+            width=120,
+            font=ctk.CTkFont(size=11)
+        )
+        save_token_btn.pack(side="left", padx=5)
+        
+        # Favourites Editor section
+        favorites_editor_frame = ctk.CTkFrame(self.settings_tab)
+        favorites_editor_frame.pack(pady=10, padx=20, fill="x")
+        
+        favorites_editor_label = ctk.CTkLabel(
+            favorites_editor_frame,
+            text="Favourites Editor:",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        favorites_editor_label.pack(anchor="w", padx=10, pady=(10, 5))
+        
+        # Google Ads Favorites Editor
+        google_fav_editor_frame = ctk.CTkFrame(favorites_editor_frame)
+        google_fav_editor_frame.pack(pady=10, padx=10, fill="x")
+        
+        google_fav_editor_title = ctk.CTkLabel(
+            google_fav_editor_frame,
+            text="Google Ads Favorites:",
+            font=ctk.CTkFont(size=11, weight="bold")
+        )
+        google_fav_editor_title.pack(anchor="w", padx=10, pady=(5, 10))
+        
+        # Google favorites dropdown for selection (to edit/delete)
+        google_fav_select_frame = ctk.CTkFrame(google_fav_editor_frame)
+        google_fav_select_frame.pack(pady=5, padx=10, fill="x")
+        
+        self.settings_google_favorites_menu = ctk.CTkOptionMenu(
+            google_fav_select_frame,
+            values=["Select a favorite..."],
+            width=350,
+            font=ctk.CTkFont(size=11)
+        )
+        self._update_settings_google_favorites_menu()
+        self.settings_google_favorites_menu.pack(side="left", padx=(0, 10), fill="x", expand=True)
+        
+        google_add_btn = ctk.CTkButton(
+            google_fav_select_frame,
+            text="Add",
+            command=self._on_settings_add_google_favorite,
+            width=80,
+            font=ctk.CTkFont(size=11)
+        )
+        google_add_btn.pack(side="left", padx=5)
+        
+        google_edit_btn = ctk.CTkButton(
+            google_fav_select_frame,
+            text="Edit",
+            command=self._on_settings_edit_google_favorite,
+            width=80,
+            font=ctk.CTkFont(size=11)
+        )
+        google_edit_btn.pack(side="left", padx=5)
+        
+        google_delete_btn = ctk.CTkButton(
+            google_fav_select_frame,
+            text="Delete",
+            command=self._on_settings_delete_google_favorite,
+            width=80,
+            font=ctk.CTkFont(size=11),
+            fg_color="red",
+            hover_color="darkred"
+        )
+        google_delete_btn.pack(side="left", padx=5)
+        
+        # Meta Ads Favorites Editor
+        meta_fav_editor_frame = ctk.CTkFrame(favorites_editor_frame)
+        meta_fav_editor_frame.pack(pady=10, padx=10, fill="x")
+        
+        meta_fav_editor_title = ctk.CTkLabel(
+            meta_fav_editor_frame,
+            text="Meta Ads Favorites:",
+            font=ctk.CTkFont(size=11, weight="bold")
+        )
+        meta_fav_editor_title.pack(anchor="w", padx=10, pady=(5, 10))
+        
+        # Meta favorites dropdown for selection (to edit/delete)
+        meta_fav_select_frame = ctk.CTkFrame(meta_fav_editor_frame)
+        meta_fav_select_frame.pack(pady=5, padx=10, fill="x")
+        
+        self.settings_meta_favorites_menu = ctk.CTkOptionMenu(
+            meta_fav_select_frame,
+            values=["Select a favorite..."],
+            width=350,
+            font=ctk.CTkFont(size=11)
+        )
+        self._update_settings_meta_favorites_menu()
+        self.settings_meta_favorites_menu.pack(side="left", padx=(0, 10), fill="x", expand=True)
+        
+        meta_add_btn = ctk.CTkButton(
+            meta_fav_select_frame,
+            text="Add",
+            command=self._on_settings_add_meta_favorite,
+            width=80,
+            font=ctk.CTkFont(size=11)
+        )
+        meta_add_btn.pack(side="left", padx=5)
+        
+        meta_edit_btn = ctk.CTkButton(
+            meta_fav_select_frame,
+            text="Edit",
+            command=self._on_settings_edit_meta_favorite,
+            width=80,
+            font=ctk.CTkFont(size=11)
+        )
+        meta_edit_btn.pack(side="left", padx=5)
+        
+        meta_delete_btn = ctk.CTkButton(
+            meta_fav_select_frame,
+            text="Delete",
+            command=self._on_settings_delete_meta_favorite,
+            width=80,
+            font=ctk.CTkFont(size=11),
+            fg_color="red",
+            hover_color="darkred"
+        )
+        meta_delete_btn.pack(side="left", padx=5)
+        
+        # Microsoft Ads Favorites Editor
+        ms_fav_editor_frame = ctk.CTkFrame(favorites_editor_frame)
+        ms_fav_editor_frame.pack(pady=10, padx=10, fill="x")
+        ctk.CTkLabel(ms_fav_editor_frame, text="Microsoft Ads Favorites:", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=10, pady=(5, 10))
+        ms_fav_select_frame = ctk.CTkFrame(ms_fav_editor_frame)
+        ms_fav_select_frame.pack(pady=5, padx=10, fill="x")
+        self.settings_ms_favorites_menu = ctk.CTkOptionMenu(ms_fav_select_frame, values=["Select a favorite..."], width=350, font=ctk.CTkFont(size=11))
+        self._update_settings_ms_favorites_menu()
+        self.settings_ms_favorites_menu.pack(side="left", padx=(0, 10), fill="x", expand=True)
+        ctk.CTkButton(ms_fav_select_frame, text="Add", command=self._on_settings_add_ms_favorite, width=80, font=ctk.CTkFont(size=11)).pack(side="left", padx=5)
+        ctk.CTkButton(ms_fav_select_frame, text="Edit", command=self._on_settings_edit_ms_favorite, width=80, font=ctk.CTkFont(size=11)).pack(side="left", padx=5)
+        ctk.CTkButton(ms_fav_select_frame, text="Delete", command=self._on_settings_delete_ms_favorite, width=80, font=ctk.CTkFont(size=11), fg_color="red", hover_color="darkred").pack(side="left", padx=5)
+        
+        # TikTok Ads Favorites Editor
+        tiktok_fav_editor_frame = ctk.CTkFrame(favorites_editor_frame)
+        tiktok_fav_editor_frame.pack(pady=10, padx=10, fill="x")
+        ctk.CTkLabel(tiktok_fav_editor_frame, text="TikTok Ads Favorites:", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=10, pady=(5, 10))
+        tiktok_fav_select_frame = ctk.CTkFrame(tiktok_fav_editor_frame)
+        tiktok_fav_select_frame.pack(pady=5, padx=10, fill="x")
+        self.settings_tiktok_favorites_menu = ctk.CTkOptionMenu(tiktok_fav_select_frame, values=["Select a favorite..."], width=350, font=ctk.CTkFont(size=11))
+        self._update_settings_tiktok_favorites_menu()
+        self.settings_tiktok_favorites_menu.pack(side="left", padx=(0, 10), fill="x", expand=True)
+        ctk.CTkButton(tiktok_fav_select_frame, text="Add", command=self._on_settings_add_tiktok_favorite, width=80, font=ctk.CTkFont(size=11)).pack(side="left", padx=5)
+        ctk.CTkButton(tiktok_fav_select_frame, text="Edit", command=self._on_settings_edit_tiktok_favorite, width=80, font=ctk.CTkFont(size=11)).pack(side="left", padx=5)
+        ctk.CTkButton(tiktok_fav_select_frame, text="Delete", command=self._on_settings_delete_tiktok_favorite, width=80, font=ctk.CTkFont(size=11), fg_color="red", hover_color="darkred").pack(side="left", padx=5)
+        
+        # Reddit Ads Favorites Editor
+        reddit_fav_editor_frame = ctk.CTkFrame(favorites_editor_frame)
+        reddit_fav_editor_frame.pack(pady=10, padx=10, fill="x")
+        ctk.CTkLabel(reddit_fav_editor_frame, text="Reddit Ads Favorites:", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=10, pady=(5, 10))
+        reddit_fav_select_frame = ctk.CTkFrame(reddit_fav_editor_frame)
+        reddit_fav_select_frame.pack(pady=5, padx=10, fill="x")
+        self.settings_reddit_favorites_menu = ctk.CTkOptionMenu(reddit_fav_select_frame, values=["Select a favorite..."], width=350, font=ctk.CTkFont(size=11))
+        self._update_settings_reddit_favorites_menu()
+        self.settings_reddit_favorites_menu.pack(side="left", padx=(0, 10), fill="x", expand=True)
+        ctk.CTkButton(reddit_fav_select_frame, text="Add", command=self._on_settings_add_reddit_favorite, width=80, font=ctk.CTkFont(size=11)).pack(side="left", padx=5)
+        ctk.CTkButton(reddit_fav_select_frame, text="Edit", command=self._on_settings_edit_reddit_favorite, width=80, font=ctk.CTkFont(size=11)).pack(side="left", padx=5)
+        ctk.CTkButton(reddit_fav_select_frame, text="Delete", command=self._on_settings_delete_reddit_favorite, width=80, font=ctk.CTkFont(size=11), fg_color="red", hover_color="darkred").pack(side="left", padx=5)
+        
+        # Pinterest Ads Favorites Editor
+        pinterest_fav_editor_frame = ctk.CTkFrame(favorites_editor_frame)
+        pinterest_fav_editor_frame.pack(pady=10, padx=10, fill="x")
+        ctk.CTkLabel(pinterest_fav_editor_frame, text="Pinterest Ads Favorites:", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w", padx=10, pady=(5, 10))
+        pinterest_fav_select_frame = ctk.CTkFrame(pinterest_fav_editor_frame)
+        pinterest_fav_select_frame.pack(pady=5, padx=10, fill="x")
+        self.settings_pinterest_favorites_menu = ctk.CTkOptionMenu(pinterest_fav_select_frame, values=["Select a favorite..."], width=350, font=ctk.CTkFont(size=11))
+        self._update_settings_pinterest_favorites_menu()
+        self.settings_pinterest_favorites_menu.pack(side="left", padx=(0, 10), fill="x", expand=True)
+        ctk.CTkButton(pinterest_fav_select_frame, text="Add", command=self._on_settings_add_pinterest_favorite, width=80, font=ctk.CTkFont(size=11)).pack(side="left", padx=5)
+        ctk.CTkButton(pinterest_fav_select_frame, text="Edit", command=self._on_settings_edit_pinterest_favorite, width=80, font=ctk.CTkFont(size=11)).pack(side="left", padx=5)
+        ctk.CTkButton(pinterest_fav_select_frame, text="Delete", command=self._on_settings_delete_pinterest_favorite, width=80, font=ctk.CTkFont(size=11), fg_color="red", hover_color="darkred").pack(side="left", padx=5)
+        
+        # Default Favorite section
+        default_favorite_frame = ctk.CTkFrame(self.settings_tab)
+        default_favorite_frame.pack(pady=10, padx=20, fill="x")
+        
+        default_favorite_label = ctk.CTkLabel(
+            default_favorite_frame,
+            text="Default Favorites:",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        default_favorite_label.pack(anchor="w", padx=10, pady=(10, 5))
+        
+        # Google Ads default favorite
+        google_fav_frame = ctk.CTkFrame(default_favorite_frame)
+        google_fav_frame.pack(pady=5, padx=10, fill="x")
+        
+        google_fav_label = ctk.CTkLabel(
+            google_fav_frame,
+            text="Google Ads:",
+            font=ctk.CTkFont(size=11)
+        )
+        google_fav_label.pack(side="left", padx=10)
+        
+        google_favorite_names = [fav["name"] for fav in self.favorites] if self.favorites else []
+        self.settings_google_favorite_menu = ctk.CTkOptionMenu(
+            google_fav_frame,
+            values=["None"] + google_favorite_names if google_favorite_names else ["None"],
+            command=self._on_google_default_favorite_changed,
+            width=200,
+            font=ctk.CTkFont(size=11)
+        )
+        default_google_fav = self.settings.get("default_google_favorite", "ML" if "ML" in google_favorite_names else "None")
+        if default_google_fav not in google_favorite_names:
+            default_google_fav = "None"
+        self.settings_google_favorite_menu.set(default_google_fav)
+        self.settings_google_favorite_menu.pack(side="left", padx=5)
+        
+        # Meta Ads default favorite
+        meta_fav_frame = ctk.CTkFrame(default_favorite_frame)
+        meta_fav_frame.pack(pady=5, padx=10, fill="x")
+        
+        meta_fav_label = ctk.CTkLabel(
+            meta_fav_frame,
+            text="Meta Ads:",
+            font=ctk.CTkFont(size=11)
+        )
+        meta_fav_label.pack(side="left", padx=10)
+        
+        meta_favorite_names = [fav["name"] for fav in self.meta_favorites] if self.meta_favorites else []
+        self.settings_meta_favorite_menu = ctk.CTkOptionMenu(
+            meta_fav_frame,
+            values=["None"] + meta_favorite_names if meta_favorite_names else ["None"],
+            command=self._on_meta_default_favorite_changed,
+            width=200,
+            font=ctk.CTkFont(size=11)
+        )
+        default_meta_fav = self.settings.get("default_meta_favorite", "ML" if "ML" in meta_favorite_names else "None")
+        if default_meta_fav not in meta_favorite_names:
+            default_meta_fav = "None"
+        self.settings_meta_favorite_menu.set(default_meta_fav)
+        self.settings_meta_favorite_menu.pack(side="left", padx=5)
+        
+        # Microsoft Ads default favorite
+        ms_fav_frame = ctk.CTkFrame(default_favorite_frame)
+        ms_fav_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(ms_fav_frame, text="Microsoft Ads:", font=ctk.CTkFont(size=11)).pack(side="left", padx=10)
+        ms_favorite_names = [fav["name"] for fav in self.ms_favorites] if self.ms_favorites else []
+        self.settings_ms_favorite_menu = ctk.CTkOptionMenu(ms_fav_frame, values=["None"] + ms_favorite_names if ms_favorite_names else ["None"], command=self._on_ms_default_favorite_changed, width=200, font=ctk.CTkFont(size=11))
+        default_ms_fav = self.settings.get("default_ms_favorite", "None")
+        if default_ms_fav not in ms_favorite_names:
+            default_ms_fav = "None"
+        self.settings_ms_favorite_menu.set(default_ms_fav)
+        self.settings_ms_favorite_menu.pack(side="left", padx=5)
+        
+        # TikTok Ads default favorite
+        tiktok_fav_frame = ctk.CTkFrame(default_favorite_frame)
+        tiktok_fav_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(tiktok_fav_frame, text="TikTok Ads:", font=ctk.CTkFont(size=11)).pack(side="left", padx=10)
+        tiktok_favorite_names = [fav["name"] for fav in self.tiktok_favorites] if self.tiktok_favorites else []
+        self.settings_tiktok_favorite_menu = ctk.CTkOptionMenu(tiktok_fav_frame, values=["None"] + tiktok_favorite_names if tiktok_favorite_names else ["None"], command=self._on_tiktok_default_favorite_changed, width=200, font=ctk.CTkFont(size=11))
+        default_tiktok_fav = self.settings.get("default_tiktok_favorite", "None")
+        if default_tiktok_fav not in tiktok_favorite_names:
+            default_tiktok_fav = "None"
+        self.settings_tiktok_favorite_menu.set(default_tiktok_fav)
+        self.settings_tiktok_favorite_menu.pack(side="left", padx=5)
+        
+        # Reddit Ads default favorite
+        reddit_fav_frame = ctk.CTkFrame(default_favorite_frame)
+        reddit_fav_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(reddit_fav_frame, text="Reddit Ads:", font=ctk.CTkFont(size=11)).pack(side="left", padx=10)
+        reddit_favorite_names = [fav["name"] for fav in self.reddit_favorites] if self.reddit_favorites else []
+        self.settings_reddit_favorite_menu = ctk.CTkOptionMenu(reddit_fav_frame, values=["None"] + reddit_favorite_names if reddit_favorite_names else ["None"], command=self._on_reddit_default_favorite_changed, width=200, font=ctk.CTkFont(size=11))
+        default_reddit_fav = self.settings.get("default_reddit_favorite", "None")
+        if default_reddit_fav not in reddit_favorite_names:
+            default_reddit_fav = "None"
+        self.settings_reddit_favorite_menu.set(default_reddit_fav)
+        self.settings_reddit_favorite_menu.pack(side="left", padx=5)
+        
+        # Pinterest Ads default favorite
+        pinterest_fav_frame = ctk.CTkFrame(default_favorite_frame)
+        pinterest_fav_frame.pack(pady=5, padx=10, fill="x")
+        ctk.CTkLabel(pinterest_fav_frame, text="Pinterest Ads:", font=ctk.CTkFont(size=11)).pack(side="left", padx=10)
+        pinterest_favorite_names = [fav["name"] for fav in self.pinterest_favorites] if self.pinterest_favorites else []
+        self.settings_pinterest_favorite_menu = ctk.CTkOptionMenu(pinterest_fav_frame, values=["None"] + pinterest_favorite_names if pinterest_favorite_names else ["None"], command=self._on_pinterest_default_favorite_changed, width=200, font=ctk.CTkFont(size=11))
+        default_pinterest_fav = self.settings.get("default_pinterest_favorite", "None")
+        if default_pinterest_fav not in pinterest_favorite_names:
+            default_pinterest_fav = "None"
+        self.settings_pinterest_favorite_menu.set(default_pinterest_fav)
+        self.settings_pinterest_favorite_menu.pack(side="left", padx=5)
+        
+        # Theme mode section
+        theme_frame = ctk.CTkFrame(self.settings_tab)
+        theme_frame.pack(pady=10, padx=20, fill="x")
+        
+        theme_label = ctk.CTkLabel(
+            theme_frame,
+            text="Appearance Mode:",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        theme_label.pack(anchor="w", padx=10, pady=(10, 5))
+        
+        theme_input_frame = ctk.CTkFrame(theme_frame)
+        theme_input_frame.pack(pady=(0, 10), padx=10, fill="x")
+        
+        self.settings_theme_menu = ctk.CTkOptionMenu(
+            theme_input_frame,
+            values=["dark", "light"],
+            command=self._on_theme_mode_changed,
+            width=200,
+            font=ctk.CTkFont(size=11)
+        )
+        current_theme = self.settings.get("theme_mode", "dark")
+        self.settings_theme_menu.set(current_theme)
+        self.settings_theme_menu.pack(side="left", padx=10)
+        
+        # Folder settings section
+        folder_frame = ctk.CTkFrame(self.settings_tab)
+        folder_frame.pack(pady=10, padx=20, fill="x")
+        
+        folder_label = ctk.CTkLabel(
+            folder_frame,
+            text="Default Folders:",
+            font=ctk.CTkFont(size=12, weight="bold")
+        )
+        folder_label.pack(anchor="w", padx=10, pady=(10, 5))
+        
+        # Download folder
+        download_folder_frame = ctk.CTkFrame(folder_frame)
+        download_folder_frame.pack(pady=5, padx=10, fill="x")
+        
+        download_folder_label = ctk.CTkLabel(
+            download_folder_frame,
+            text="Download Folder:",
+            font=ctk.CTkFont(size=11)
+        )
+        download_folder_label.pack(side="left", padx=10)
+        
+        self.settings_download_folder_entry = ctk.CTkEntry(
+            download_folder_frame,
+            width=300,
+            font=ctk.CTkFont(size=11)
+        )
+        self.settings_download_folder_entry.insert(0, self.settings.get("default_download_folder", "raw_reports"))
+        self.settings_download_folder_entry.pack(side="left", padx=5, fill="x", expand=True)
+        
+        browse_download_btn = ctk.CTkButton(
+            download_folder_frame,
+            text="Browse",
+            command=self._on_browse_download_folder,
+            width=100,
+            font=ctk.CTkFont(size=11)
+        )
+        browse_download_btn.pack(side="left", padx=5)
+        
+        # Output folder
+        output_folder_frame = ctk.CTkFrame(folder_frame)
+        output_folder_frame.pack(pady=5, padx=10, fill="x")
+        
+        output_folder_label = ctk.CTkLabel(
+            output_folder_frame,
+            text="Output Folder:",
+            font=ctk.CTkFont(size=11)
+        )
+        output_folder_label.pack(side="left", padx=10)
+        
+        self.settings_output_folder_entry = ctk.CTkEntry(
+            output_folder_frame,
+            width=300,
+            font=ctk.CTkFont(size=11)
+        )
+        self.settings_output_folder_entry.insert(0, self.settings.get("default_output_folder", "processed_reports"))
+        self.settings_output_folder_entry.pack(side="left", padx=5, fill="x", expand=True)
+        
+        browse_output_btn = ctk.CTkButton(
+            output_folder_frame,
+            text="Browse",
+            command=self._on_browse_output_folder,
+            width=100,
+            font=ctk.CTkFont(size=11)
+        )
+        browse_output_btn.pack(side="left", padx=5)
+        
+        # Save settings button
+        save_settings_frame = ctk.CTkFrame(self.settings_tab)
+        save_settings_frame.pack(pady=20, padx=20, fill="x")
+        
+        save_settings_btn = ctk.CTkButton(
+            save_settings_frame,
+            text="Save All Settings",
+            command=self._on_save_all_settings,
+            font=ctk.CTkFont(size=14, weight="bold"),
+            height=40,
+            fg_color="green",
+            hover_color="darkgreen"
+        )
+        save_settings_btn.pack(pady=10, padx=20, fill="x")
+    
+    def _save_settings(self) -> None:
+        """Save settings to config.json file."""
+        try:
+            with open(self.settings_file, 'w', encoding='utf-8') as f:
+                json.dump(self.settings, f, indent=2, ensure_ascii=False)
+            self.logger.info("Settings saved successfully")
+        except Exception as e:
+            self.logger.error(f"Error saving settings: {e}", exc_info=True)
+    
+    def _on_save_meta_token_settings(self) -> None:
+        """Save Meta token from settings tab."""
+        token = self.settings_token_entry.get().strip()
+        if not token:
+            self.status_text.set("Error: Please enter a token")
+            return
+
+        ok, err = self._update_meta_token(token)
+        if ok:
+            self.status_text.set("Meta token saved successfully")
+            self.logger.info("Meta token saved from Settings tab")
+            self.settings_token_entry.delete(0, "end")
+        else:
+            self.status_text.set(f"Error: {err or 'Failed to update token file'}")
+    
+    def _on_google_default_favorite_changed(self, choice: str) -> None:
+        """Handle Google default favorite change in settings."""
+        if choice == "None":
+            self.settings["default_google_favorite"] = None
+        else:
+            self.settings["default_google_favorite"] = choice
+        self._save_settings()
+        self.logger.info(f"Google Ads default favorite set to: {choice}")
+    
+    def _on_meta_default_favorite_changed(self, choice: str) -> None:
+        """Handle Meta default favorite change in settings."""
+        if choice == "None":
+            self.settings["default_meta_favorite"] = None
+        else:
+            self.settings["default_meta_favorite"] = choice
+        self._save_settings()
+        self.logger.info(f"Meta Ads default favorite set to: {choice}")
+    
+    def _on_theme_mode_changed(self, choice: str) -> None:
+        """Handle theme mode change in settings."""
+        self.settings["theme_mode"] = choice
+        ctk.set_appearance_mode(choice)
+        self._save_settings()
+        self.logger.info(f"Theme mode changed to: {choice}")
+        self.status_text.set(f"Theme changed to {choice} mode")
+    
+    def _on_browse_download_folder(self) -> None:
+        """Browse for download folder."""
+        folder = filedialog.askdirectory(title="Select Download Folder")
+        if folder:
+            self.settings_download_folder_entry.delete(0, "end")
+            self.settings_download_folder_entry.insert(0, folder)
+    
+    def _on_browse_output_folder(self) -> None:
+        """Browse for output folder."""
+        folder = filedialog.askdirectory(title="Select Output Folder")
+        if folder:
+            self.settings_output_folder_entry.delete(0, "end")
+            self.settings_output_folder_entry.insert(0, folder)
+    
+    def _on_save_all_settings(self) -> None:
+        """Save all settings including folders."""
+        self.settings["default_download_folder"] = self.settings_download_folder_entry.get().strip()
+        self.settings["default_output_folder"] = self.settings_output_folder_entry.get().strip()
+        self._save_settings()
+        self.status_text.set("All settings saved successfully")
+        self.logger.info("All settings saved")
+    
+    def _animate_process_spinner(self) -> None:
+        """Animate the spinner dots during processing."""
+        if not hasattr(self, 'process_spinner_active') or not self.process_spinner_active:
+            return
+        
+        spinner_chars = ["●", "○", "◐", "◑", "◒", "◓"]
+        if not hasattr(self, 'process_spinner_index'):
+            self.process_spinner_index = 0
+        
+        self.process_spinner_label.configure(text=spinner_chars[self.process_spinner_index % len(spinner_chars)])
+        self.process_spinner_index += 1
+        self.root.after(150, self._animate_process_spinner)
+    
+    def _create_shared_log_area(self) -> ctk.CTkFrame:
+        """Create Live Log frame (caller grids it at bottom with sticky=ew). Returns the log frame."""
+        log_frame = ctk.CTkFrame(self.root)
+
+        # Header with label and Export button
+        log_header_frame = ctk.CTkFrame(log_frame, fg_color="transparent")
+        log_header_frame.pack(pady=(6, 2), padx=10, fill="x")
+        
+        log_label = ctk.CTkLabel(
+            log_header_frame,
+            text="Live Log:",
+            font=ctk.CTkFont(size=11, weight="bold")
+        )
+        log_label.pack(side="left", padx=10)
+        
+        self.log_export_button = ctk.CTkButton(
+            log_header_frame,
+            text="Export to .txt",
+            command=self._on_export_log_clicked,
+            font=ctk.CTkFont(size=11),
+            height=25,
+            width=100,
+            fg_color="#4CAF50",
+            hover_color="#45a049"
+        )
+        self.log_export_button.pack(side="right", padx=10)
+        
+        # Fixed height (8 lines) so log stays compact and always visible
+        self.log_textbox = scrolledtext.ScrolledText(
+            log_frame,
+            height=8,
+            wrap="word",
+            font=("Consolas", 9),
+            bg="#212121",
+            fg="#FFFFFF",
+            insertbackground="#FFFFFF"
+        )
+        self.log_textbox.pack(pady=(0, 6), padx=10, fill="x")
+        return log_frame
+
+    def _on_export_log_clicked(self) -> None:
+        """Export log content to a text file."""
+        try:
+            log_content = self.log_textbox.get("1.0", "end-1c")
+            if not log_content.strip():
+                self.status_text.set("Log is empty, nothing to export")
+                return
+            
+            # Ask user for save location
+            filename = filedialog.asksaveasfilename(
+                defaultextension=".txt",
+                filetypes=[("Text files", "*.txt"), ("All files", "*.*")],
+                title="Export Log to Text File"
+            )
+            
+            if filename:
+                with open(filename, 'w', encoding='utf-8') as f:
+                    f.write(log_content)
+                self.status_text.set(f"Log exported to: {filename}")
+                self.logger.info(f"Log exported to: {filename}")
+        except Exception as e:
+            error_msg = f"Error exporting log: {str(e)}"
+            self.status_text.set(error_msg)
+            self.logger.error(error_msg, exc_info=True)
+    
+    def _month_name_to_number(self, month_name: str) -> int:
+        """Convert month name to number (1-12)."""
+        try:
+            return self.month_names.index(month_name) + 1
+        except ValueError:
+            return 1
+    
+    def _lock_all_active_ids(self) -> None:
+        """Validate and lock Account/Customer IDs for all currently selected platforms."""
+        errors = []
+        if self.source_google_var.get():
+            cid = self.customer_id.get().strip()
+            if not cid:
+                errors.append("Google Ads: Please enter a Customer ID")
+            else:
+                clean = cid.replace("-", "")
+                if not clean.isdigit() or len(clean) != 10:
+                    errors.append("Google Ads: Customer ID must be a 10-digit number")
+        if self.source_meta_var.get():
+            aid = self.meta_account_id.get().strip()
+            if not aid or aid == "act_":
+                errors.append("Meta Ads: Please enter a valid Ad Account ID")
+            elif not aid.startswith("act_"):
+                errors.append("Meta Ads: Ad Account ID must start with 'act_'")
+        if self.source_ms_var.get():
+            cid = self.ms_customer_id.get().strip().replace("-", "").replace(" ", "")
+            if not cid or not cid.isdigit():
+                errors.append("Microsoft Ads: Please enter a valid Customer ID (digits)")
+        if self.source_tiktok_var.get():
+            if not (self.tiktok_account_id.get() or "").strip():
+                errors.append("TikTok Ads: Please enter an Advertiser ID")
+        if self.source_reddit_var.get():
+            if not (self.reddit_account_id.get() or "").strip():
+                errors.append("Reddit Ads: Please enter an Account ID")
+        if self.source_pinterest_var.get():
+            if not (self.pinterest_account_id.get() or "").strip():
+                errors.append("Pinterest Ads: Please enter an Advertiser ID")
+        if errors:
+            self.status_text.set(errors[0])
+            return
+        # Lock all selected platforms and persist last_*_id
+        if self.source_google_var.get():
+            self.customer_id_locked = True
+            self.customer_id_combobox.configure(state="disabled")
+            self.settings["last_google_id"] = self.customer_id.get().strip()
+        if self.source_meta_var.get():
+            self.meta_account_id_locked = True
+            self.meta_account_id_combobox.configure(state="disabled")
+            self.settings["last_meta_id"] = self.meta_account_id.get().strip()
+        if self.source_ms_var.get():
+            self.ms_customer_id_locked = True
+            self.ms_customer_id_combobox.configure(state="disabled")
+            self.settings["last_ms_id"] = self.ms_customer_id.get().strip()
+        if self.source_tiktok_var.get():
+            self.tiktok_account_id_locked = True
+            self.tiktok_account_id_combobox.configure(state="disabled")
+            self.settings["last_tiktok_id"] = (self.tiktok_account_id.get() or "").strip()
+        if self.source_reddit_var.get():
+            self.reddit_account_id_locked = True
+            self.reddit_account_id_combobox.configure(state="disabled")
+            self.settings["last_reddit_id"] = (self.reddit_account_id.get() or "").strip()
+        if self.source_pinterest_var.get():
+            self.pinterest_account_id_locked = True
+            self.pinterest_account_id_combobox.configure(state="disabled")
+            self.settings["last_pinterest_id"] = (self.pinterest_account_id.get() or "").strip()
+        self._save_settings()
+        self.lock_all_ids_btn.configure(state="disabled")
+        self.unlock_all_ids_btn.configure(state="normal")
+        self.status_text.set("All active IDs locked")
+        self.logger.info("All active Account/Customer IDs locked")
+        self._update_checklist_statuses()
+
+    def _unlock_all_ids(self) -> None:
+        """Unlock all Account/Customer ID fields for editing."""
+        self.customer_id_locked = False
+        self.meta_account_id_locked = False
+        self.ms_customer_id_locked = False
+        self.tiktok_account_id_locked = False
+        self.reddit_account_id_locked = False
+        self.pinterest_account_id_locked = False
+        self.customer_id_combobox.configure(state="normal")
+        self.meta_account_id_combobox.configure(state="normal")
+        self.ms_customer_id_combobox.configure(state="normal")
+        self.tiktok_account_id_combobox.configure(state="normal")
+        self.reddit_account_id_combobox.configure(state="normal")
+        self.pinterest_account_id_combobox.configure(state="normal")
+        if self.date_range_locked or self.meta_date_range_locked:
+            self._unlock_date_range_global()
+        self.lock_all_ids_btn.configure(state="normal")
+        self.unlock_all_ids_btn.configure(state="disabled")
+        self.status_text.set("All IDs unlocked for editing")
+        self.logger.info("All Account/Customer IDs unlocked")
+        self._update_checklist_statuses()
+
+    def _validate_date_only(self) -> Tuple[bool, Optional[str]]:
+        """Validate date range only (no account ID)."""
+        try:
+            start_year = int(self.start_year.get())
+            start_month_num = self._month_name_to_number(self.start_month.get())
+            end_year = int(self.end_year.get())
+            end_month_num = self._month_name_to_number(self.end_month.get())
+            start_date = datetime(start_year, start_month_num, 1)
+            end_date = datetime(end_year, end_month_num, 1)
+            if start_date > end_date:
+                return False, "Start date must be before or equal to end date"
+            return True, None
+        except (ValueError, TypeError) as e:
+            return False, f"Invalid date values: {e}"
+    
+    def _confirm_date_range_global(self) -> None:
+        """Lock the global date range for all platforms."""
+        is_valid, error_msg = self._validate_date_only()
+        if not is_valid:
+            self.status_text.set(f"Error: {error_msg}")
+            return
+        self.date_range_locked = True
+        self.meta_date_range_locked = True
+        self.start_month_menu.configure(state="disabled")
+        self.start_year_menu.configure(state="disabled")
+        self.end_month_menu.configure(state="disabled")
+        self.end_year_menu.configure(state="disabled")
+        self.confirm_date_btn.configure(text="Date Range Locked", state="disabled")
+        self.unlock_date_btn.configure(state="normal")
+        self.start_button.configure(state="normal" if self.customer_id_locked else "disabled")
+        self.meta_start_button.configure(state="normal" if self.meta_account_id_locked else "disabled")
+        self.status_text.set("Date range confirmed for all platforms")
+        self.logger.info("Date range confirmed (global)")
+        self._update_checklist_statuses()
+    
+    def _unlock_date_range_global(self) -> None:
+        """Unlock the global date range for editing."""
+        self.date_range_locked = False
+        self.meta_date_range_locked = False
+        self.start_month_menu.configure(state="normal")
+        self.start_year_menu.configure(state="normal")
+        self.end_month_menu.configure(state="normal")
+        self.end_year_menu.configure(state="normal")
+        self.confirm_date_btn.configure(text="Confirm Date Range", state="normal")
+        self.unlock_date_btn.configure(state="disabled")
+        self.start_button.configure(state="disabled")
+        self.meta_start_button.configure(state="disabled")
+        self.status_text.set("Date range unlocked for editing")
+        self.logger.info("Date range unconfirmed (global)")
+        self._update_checklist_statuses()
+    
+    def _confirm_date_range(self) -> None:
+        self._confirm_date_range_global()
+    
+    def _unlock_date_range(self) -> None:
+        self._unlock_date_range_global()
+    
+    def _confirm_meta_date_range(self) -> None:
+        self._confirm_date_range_global()
+    
+    def _unlock_meta_date_range(self) -> None:
+        self._unlock_date_range_global()
+    
+    def _validate_inputs(self) -> Tuple[bool, Optional[str]]:
+        """Validate user inputs."""
+        customer_id = self.customer_id.get().strip()
+        if not customer_id:
+            return False, "Please enter a Customer ID"
+        
+        customer_id_clean = customer_id.replace("-", "")
+        if not customer_id_clean.isdigit() or len(customer_id_clean) != 10:
+            return False, "Customer ID must be a 10-digit number"
+        
+        try:
+            start_year = int(self.start_year.get())
+            start_month_num = self._month_name_to_number(self.start_month.get())
+            end_year = int(self.end_year.get())
+            end_month_num = self._month_name_to_number(self.end_month.get())
+            
+            start_date = datetime(start_year, start_month_num, 1)
+            end_date = datetime(end_year, end_month_num, 1)
+            
+            if start_date > end_date:
+                return False, "Start date must be before or equal to end date"
+            
+            return True, None
+            
+        except ValueError as e:
+            return False, f"Invalid date values: {e}"
+    
+    def _validate_meta_inputs(self) -> Tuple[bool, Optional[str]]:
+        """Validate Meta Ads inputs."""
+        account_id = self.meta_account_id.get().strip()
+        if not account_id or account_id == "act_":
+            return False, "Please enter a valid Ad Account ID"
+        
+        if not account_id.startswith("act_"):
+            return False, "Ad Account ID must start with 'act_'"
+        
+        try:
+            start_year = int(self.start_year.get())
+            start_month_num = self._month_name_to_number(self.start_month.get())
+            end_year = int(self.end_year.get())
+            end_month_num = self._month_name_to_number(self.end_month.get())
+            
+            start_date = datetime(start_year, start_month_num, 1)
+            end_date = datetime(end_year, end_month_num, 1)
+            
+            if start_date > end_date:
+                return False, "Start date must be before or equal to end date"
+            
+            return True, None
+            
+        except ValueError as e:
+            return False, f"Invalid date values: {e}"
+    
+    def _on_start_clicked(self) -> None:
+        """Handle start button click."""
+        if self.is_processing:
+            self.logger.warning("Already processing, ignoring start request")
+            return
+        
+        if not self.customer_id_locked or not self.date_range_locked:
+            self.status_text.set("Error: Please confirm Customer ID and date range before starting")
+            return
+        
+        is_valid, error_msg = self._validate_inputs()
+        if not is_valid:
+            self.status_text.set(f"Error: {error_msg}")
+            return
+        
+        self.cancel_event.clear()
+        self.is_processing = True
+        self.start_button.configure(state="disabled")
+        self.stop_button.configure(state="normal")
+        self.progress_bar.set(0)
+        self.status_text.set("Initializing Google Ads fetch...")
+        
+        thread = threading.Thread(target=self.start_google_fetch_thread, daemon=True)
+        thread.start()
+    
+    def _on_stop_clicked(self) -> None:
+        """Handle stop button click."""
+        if self.is_processing:
+            self.cancel_event.set()
+            self.status_text.set("Stopping... Please wait")
+            self.logger.info("Stop requested by user")
+    
+    def _on_clear_data_clicked(self) -> None:
+        """Handle clear data button click."""
+        self._clear_all_data()
+    
+    def _on_process_all_data_clicked(self) -> None:
+        """Handle Process All Data button click - process and merge all existing data."""
+        if self.is_processing or self.meta_is_processing:
+            self.status_text.set("Cannot process files while fetching is in progress")
+            return
+        
+        self.process_all_data_button.configure(state="disabled")
+        self.status_text.set("Starting full data processing pipeline...")
+        self.logger.info("Process All Data: Starting full pipeline (process + merge)")
+        
+        def process_thread() -> None:
+            try:
+                def status_callback(message: str):
+                    self.root.after(0, lambda msg=message: self.status_text.set(msg))
+                    self.logger.info(f"Processing: {message}")
+                
+                def user_input_callback(campaign_name: str) -> str:
+                    """Callback to get user input for campaign classification."""
+                    return self._show_funnel_dialog(campaign_name)
+                
+                processor = ReportProcessor(
+                    input_dir="raw_reports",
+                    output_dir="processed_reports",
+                    status_callback=status_callback,
+                    user_input_callback=user_input_callback
+                )
+                
+                # Process all files
+                processor.process_all()
+                
+                # Merge platform data
+                self.logger.info("Process All Data: Merging platform data...")
+                self.root.after(0, lambda: self.status_text.set("Merging platform data..."))
+                processor.merge_platform_data()
+                
+                self.logger.info("Process All Data: Complete!")
+                self.root.after(0, lambda: self.status_text.set("Processing Complete!"))
+                self.root.after(0, lambda: self._update_checklist_statuses())
+                
+            except Exception as e:
+                error_msg = f"Error during processing: {str(e)}"
+                self.logger.error(f"Error in Process All Data: {e}", exc_info=True)
+                self.root.after(0, lambda: self.status_text.set(error_msg))
+            finally:
+                self.root.after(0, lambda: self.process_all_data_button.configure(state="normal"))
+        
+        thread = threading.Thread(target=process_thread, daemon=True)
+        thread.start()
+    
+    def _on_run_all_clicked(self) -> None:
+        """Handle Run All button click."""
+        if self.is_processing or self.meta_is_processing:
+            self.status_text.set("Error: Already processing. Please wait for current operation to complete.")
+            return
+        
+        self.run_all_fetches()
+    
+    def run_all_fetches(self) -> None:
+        """
+        Execute batch fetch across all platforms.
+        Only downloads platforms that are ready (ID and date range locked).
+        Chains: Fetch ready platforms → Process → Merge
+        """
+        # Update checklist to show current status
+        self._update_checklist_statuses()
+        
+        # Check which platforms are selected and ready (selected + ID + date range locked)
+        is_valid_google, _ = self._validate_inputs()
+        is_valid_meta, _ = self._validate_meta_inputs()
+        ms_cid = (self.ms_customer_id.get() or "").strip().replace("-", "").replace(" ", "")
+        is_valid_ms = bool(ms_cid and ms_cid.isdigit())
+        google_selected = self.source_google_var.get()
+        meta_selected = self.source_meta_var.get()
+        ms_selected = self.source_ms_var.get()
+        google_ready = google_selected and is_valid_google and self.customer_id_locked and self.date_range_locked
+        meta_ready = meta_selected and is_valid_meta and self.meta_account_id_locked and self.meta_date_range_locked
+        tiktok_selected = self.source_tiktok_var.get()
+        reddit_selected = self.source_reddit_var.get()
+        pinterest_selected = self.source_pinterest_var.get()
+        tiktok_ready = tiktok_selected and self.tiktok_account_id_locked and self.date_range_locked and bool((self.tiktok_account_id.get() or "").strip())
+        reddit_ready = reddit_selected and self.reddit_account_id_locked and self.date_range_locked and bool((self.reddit_account_id.get() or "").strip())
+        pinterest_ready = pinterest_selected and self.pinterest_account_id_locked and self.date_range_locked and bool((self.pinterest_account_id.get() or "").strip())
+        ms_ready = ms_selected and is_valid_ms and self.ms_customer_id_locked and self.date_range_locked
+
+        # Check data status (all platform dirs)
+        raw_dir = Path("raw_reports")
+        has_data = False
+        if raw_dir.exists():
+            for d in raw_dir.iterdir():
+                if d.is_dir() and any(d.glob("*.csv")):
+                    has_data = True
+                    break
+        if not has_data and Path("merged_reports").exists() and any(Path("merged_reports").glob("*.csv")):
+            has_data = True
+
+        # At least one selected platform must be ready, and no existing data
+        any_platform_ready = google_ready or meta_ready or ms_ready or tiktok_ready or reddit_ready or pinterest_ready
+        any_platform_selected = google_selected or meta_selected or ms_selected or tiktok_selected or reddit_selected or pinterest_selected
+        all_ready = any_platform_ready and not has_data
+
+        if not all_ready:
+            missing_items = []
+            if google_selected and not google_ready:
+                missing_items.append("Google Ads (confirm Customer ID and Date Range)")
+            if meta_selected and not meta_ready:
+                missing_items.append("Meta Ads (confirm Account ID and Date Range)")
+            if ms_selected and not ms_ready:
+                missing_items.append("Microsoft Ads (confirm Customer ID and Date Range)")
+            if tiktok_selected and not tiktok_ready:
+                missing_items.append("TikTok Ads (confirm Advertiser ID and Date Range)")
+            if reddit_selected and not reddit_ready:
+                missing_items.append("Reddit Ads (confirm Account ID and Date Range)")
+            if pinterest_selected and not pinterest_ready:
+                missing_items.append("Pinterest Ads (confirm Advertiser ID and Date Range)")
+            if not any_platform_selected:
+                missing_items.append("Select at least one platform")
+            if has_data:
+                missing_items.append("Clear existing data")
+
+            message = "Cannot run pipeline. Please complete the following:\n\n" + "\n".join(f"• {item}" for item in missing_items)
+            messagebox.showwarning("Pipeline Not Ready", message)
+            self.status_text.set("Pipeline not ready - see popup for details")
+            return
+        
+        self.logger.info("Starting Full Pipeline...")
+        self.logger.info(f"Platforms ready: Google={google_ready}, Meta={meta_ready}, MS={ms_ready}, TikTok={tiktok_ready}, Reddit={reddit_ready}, Pinterest={pinterest_ready}")
+        self.status_text.set("Starting Full Pipeline...")
+        self.batch_fetch_active = True
+        self.run_full_pipeline_button.configure(state="disabled")
+        
+        # Show pipeline progress bar
+        self.root.after(0, lambda: self.pipeline_progress_frame.pack(pady=(5, 8), padx=10, fill="x"))
+        self.root.after(0, lambda: self.pipeline_progress_bar.set(0))
+        self.root.after(0, lambda: self.pipeline_status_label.configure(text="Initializing pipeline..."))
+        
+        # Run batch fetch in a thread
+        batch_thread = threading.Thread(target=self._execute_batch_fetch, daemon=True)
+        batch_thread.start()
+    
+    def _execute_batch_fetch(self) -> None:
+        """
+        Execute the batch fetch sequence.
+        Only runs platforms that are ready (date range locked).
+        """
+        try:
+            # Only run platforms that are selected and ready (ID + date range locked)
+            google_ready = self.source_google_var.get() and self.customer_id_locked and self.date_range_locked
+            meta_ready = self.source_meta_var.get() and self.meta_account_id_locked and self.meta_date_range_locked
+            ms_ready = self.source_ms_var.get() and self.ms_customer_id_locked and self.date_range_locked and bool((self.ms_customer_id.get() or "").strip().replace("-", "").replace(" ", ""))
+            tiktok_ready = self.source_tiktok_var.get() and self.tiktok_account_id_locked and self.date_range_locked and bool((self.tiktok_account_id.get() or "").strip())
+            reddit_ready = self.source_reddit_var.get() and self.reddit_account_id_locked and self.date_range_locked and bool((self.reddit_account_id.get() or "").strip())
+            pinterest_ready = self.source_pinterest_var.get() and self.pinterest_account_id_locked and self.date_range_locked and bool((self.pinterest_account_id.get() or "").strip())
+
+            # Build fetch sequence only for selected + ready platforms (loop through GUI selection)
+            fetch_sequence = []
+            if google_ready:
+                fetch_sequence.append(("Google Ads", self._run_google_fetch_in_batch))
+            if meta_ready:
+                fetch_sequence.append(("Meta Ads", self._run_meta_fetch_in_batch))
+            if ms_ready:
+                fetch_sequence.append(("Microsoft Ads", self._run_ms_fetch_in_batch))
+            if tiktok_ready:
+                fetch_sequence.append(("TikTok Ads", self._run_tiktok_fetch_in_batch))
+            if reddit_ready:
+                fetch_sequence.append(("Reddit Ads", self._run_reddit_fetch_in_batch))
+            if pinterest_ready:
+                fetch_sequence.append(("Pinterest Ads", self._run_pinterest_fetch_in_batch))
+
+            total_steps = len(fetch_sequence) + 1  # +1 for processing
+            current_step = 0
+            
+            self.logger.info(f"Pipeline: Running {len(fetch_sequence)} platform(s) and processing")
+            
+            # Execute each ready platform
+            for platform_name, fetch_func in fetch_sequence:
+                if not self.batch_fetch_active:
+                    self.logger.warning("Pipeline cancelled")
+                    break
+                
+                current_step += 1
+                progress = current_step / total_steps
+                self.root.after(0, lambda p=progress, pn=platform_name: (
+                    self.pipeline_progress_bar.set(p),
+                    self.pipeline_status_label.configure(text=f"Fetching {pn}...")
+                ))
+                
+                self.logger.info(f"Pipeline: Starting {platform_name}...")
+                self.root.after(0, lambda pn=platform_name: self.status_text.set(f"Pipeline: Fetching {pn}..."))
+                
+                # Execute fetch and wait for completion
+                fetch_func()
+                
+                # Wait for this platform to complete
+                if platform_name == "Google Ads":
+                    self.google_fetch_complete.wait(timeout=3600)
+                    self.google_fetch_complete.clear()
+                elif platform_name == "Meta Ads":
+                    self.meta_fetch_complete.wait(timeout=3600)
+                    self.meta_fetch_complete.clear()
+                elif platform_name == "Microsoft Ads":
+                    self.ms_fetch_complete.wait(timeout=3600)
+                    self.ms_fetch_complete.clear()
+                elif platform_name == "TikTok Ads":
+                    self.tiktok_fetch_complete.wait(timeout=3600)
+                    self.tiktok_fetch_complete.clear()
+                elif platform_name == "Reddit Ads":
+                    self.reddit_fetch_complete.wait(timeout=3600)
+                    self.reddit_fetch_complete.clear()
+                elif platform_name == "Pinterest Ads":
+                    self.pinterest_fetch_complete.wait(timeout=3600)
+                    self.pinterest_fetch_complete.clear()
+
+                if not self.batch_fetch_active:
+                    break
+            
+            # Process all files after fetching
+            if self.batch_fetch_active:
+                current_step += 1
+                progress = current_step / total_steps
+                self.root.after(0, lambda p=progress: (
+                    self.pipeline_progress_bar.set(p),
+                    self.pipeline_status_label.configure(text="Processing files...")
+                ))
+                
+                self.logger.info("Pipeline: Starting file processing...")
+                self.root.after(0, lambda: self.status_text.set("Pipeline: Processing files..."))
+                
+                try:
+                    def status_callback(message: str):
+                        self.root.after(0, lambda msg=message: self.status_text.set(msg))
+                        self.logger.info(f"Processing: {message}")
+                    
+                    def user_input_callback(campaign_name: str) -> str:
+                        """Callback to get user input for campaign classification."""
+                        return self._show_funnel_dialog(campaign_name)
+                    
+                    processor = ReportProcessor(
+                        input_dir="raw_reports",
+                        output_dir="processed_reports",
+                        status_callback=status_callback,
+                        user_input_callback=user_input_callback
+                    )
+                    
+                    # Process all files
+                    processor.process_all()
+                    
+                    # Merge platform data
+                    self.logger.info("Pipeline: Merging platform data...")
+                    self.root.after(0, lambda: self.status_text.set("Pipeline: Merging data..."))
+                    processor.merge_platform_data()
+                    
+                    self.logger.info("Pipeline: Complete!")
+                    self.root.after(0, lambda: self.status_text.set("Pipeline Complete!"))
+                    self.root.after(0, lambda: (
+                        self.pipeline_progress_bar.set(1.0),
+                        self.pipeline_status_label.configure(text="Pipeline Complete!")
+                    ))
+                except Exception as e:
+                    error_msg = f"Error during processing: {str(e)}"
+                    self.logger.error(f"Error in pipeline processing: {e}", exc_info=True)
+                    self.root.after(0, lambda: self.status_text.set(error_msg))
+                    self.root.after(0, lambda: self.pipeline_status_label.configure(text="Error during processing"))
+            
+        except Exception as e:
+            error_msg = f"Pipeline Error: {str(e)}"
+            self.logger.error(f"Error in pipeline: {e}", exc_info=True)
+            self.root.after(0, lambda: self.status_text.set(error_msg))
+            self.root.after(0, lambda: self.pipeline_status_label.configure(text="Pipeline Error"))
+        finally:
+            self.batch_fetch_active = False
+            self.root.after(0, lambda: self.run_full_pipeline_button.configure(state="normal"))
+            # Hide progress bar after delay
+            self.root.after(3000, lambda: self.pipeline_progress_frame.pack_forget())
+    
+    def _run_google_fetch_in_batch(self) -> None:
+        """Run Google Ads fetch as part of batch operation."""
+        self.root.after(0, lambda: self._on_start_clicked())
+    
+    def _run_meta_fetch_in_batch(self) -> None:
+        """Run Meta Ads fetch as part of batch operation.
+        Starts the Meta fetch thread directly from the pipeline thread so we don't depend
+        on the main thread processing an after(0) callback (which can cause the pipeline to hang).
+        """
+        if self.meta_is_processing:
+            self.meta_fetch_complete.set()
+            return
+        # Update GUI from main thread, then start fetch thread from this (pipeline) thread
+        self.meta_cancel_event.clear()
+        self.meta_is_processing = True
+        self.root.after(0, lambda: (
+            self.meta_start_button.configure(state="disabled"),
+            self.meta_stop_button.configure(state="normal"),
+            self.meta_progress_bar.set(0),
+            self.meta_progress_percent_label.configure(text="0%"),
+            self.meta_eta_label.configure(text=""),
+            self.meta_completion_time_label.configure(text=""),
+            self.status_text.set("Pipeline: Fetching Meta Ads..."),
+        ))
+        self.logger.info("Meta fetch thread starting (from pipeline)")
+        thread = threading.Thread(target=self.start_meta_fetch_thread, daemon=True)
+        thread.start()
+
+    def _run_ms_fetch_in_batch(self) -> None:
+        """Run Microsoft Ads fetch as part of batch. Stub: set completion so pipeline continues; wire microsoft_fetcher when ready."""
+        self.logger.info("Pipeline: Microsoft Ads fetch (stub)")
+        self.root.after(0, lambda: self.status_text.set("Pipeline: Fetching Microsoft Ads..."))
+        self.ms_fetch_complete.set()
+
+    def _run_tiktok_fetch_in_batch(self) -> None:
+        """Run TikTok Ads fetch as part of batch. Stub: set completion; wire tiktok_fetcher when ready."""
+        self.logger.info("Pipeline: TikTok Ads fetch (stub)")
+        self.root.after(0, lambda: self.status_text.set("Pipeline: Fetching TikTok Ads..."))
+        self.tiktok_fetch_complete.set()
+
+    def _run_reddit_fetch_in_batch(self) -> None:
+        """Run Reddit Ads fetch as part of batch. Stub: set completion; wire reddit_fetcher when ready."""
+        self.logger.info("Pipeline: Reddit Ads fetch (stub)")
+        self.root.after(0, lambda: self.status_text.set("Pipeline: Fetching Reddit Ads..."))
+        self.reddit_fetch_complete.set()
+
+    def _run_pinterest_fetch_in_batch(self) -> None:
+        """Run Pinterest Ads fetch as part of batch. Stub: set completion; wire pinterest_fetcher when ready."""
+        self.logger.info("Pipeline: Pinterest Ads fetch (stub)")
+        self.root.after(0, lambda: self.status_text.set("Pipeline: Fetching Pinterest Ads..."))
+        self.pinterest_fetch_complete.set()
+
+    def _clear_all_data(self) -> None:
+        """
+        Delete all CSV files from raw_reports, processed_reports, and merged_reports directories.
+        Preserves directory structure but removes all .csv files.
+        """
+        # Show confirmation dialog
+        result = messagebox.askyesno(
+            "Confirm Clear Data",
+            "Are you sure you want to delete ALL raw, processed, and merged CSV files? This cannot be undone.",
+            icon="warning"
+        )
+        
+        if not result:
+            return
+        
+        deleted_count = 0
+        
+        # Target directories
+        directories = [Path("raw_reports"), Path("processed_reports"), Path("merged_reports")]
+        
+        for directory in directories:
+            if not directory.exists():
+                continue
+            
+            # Walk through all subdirectories
+            for csv_file in directory.rglob("*.csv"):
+                try:
+                    csv_file.unlink()
+                    deleted_count += 1
+                    self.logger.info(f"Deleted: {csv_file}")
+                except Exception as e:
+                    self.logger.error(f"Error deleting {csv_file}: {e}")
+        
+        # Update status
+        status_msg = f"Deleted {deleted_count} files from raw, processed, and merged folders."
+        self.status_text.set(status_msg)
+        self.logger.info(status_msg)
+        
+        # Update checklist statuses after clearing
+        self._update_checklist_statuses()
+        
+        # Also log to GUI log box
+        if deleted_count > 0:
+            self.logger.info(f"Clear Data: Removed {deleted_count} CSV file(s)")
+        else:
+            self.logger.info("Clear Data: No CSV files found to delete")
+    
+    def _on_new_fetch_clicked(self) -> None:
+        """Handle new fetch button click - resets all tabs."""
+        if self.is_processing or self.meta_is_processing:
+            self.logger.warning("Cannot reset while processing")
+            self.status_text.set("Cannot reset while processing")
+            return
+        
+        # Reset Google Ads tab
+        self.date_range_locked = False
+        self.start_month_menu.configure(state="normal")
+        self.start_year_menu.configure(state="normal")
+        self.end_month_menu.configure(state="normal")
+        self.end_year_menu.configure(state="normal")
+        self.confirm_date_btn.configure(text="Confirm Date Range", state="normal")
+        self.start_button.configure(state="disabled")
+        self.progress_bar.set(0)
+        self.progress_percent_label.configure(text="0%")
+        self.eta_label.configure(text="")
+        self.completion_time_label.configure(text="")
+        
+        # Reset Meta Ads (global date already reset above)
+        self.meta_date_range_locked = False
+        self.meta_start_button.configure(state="disabled")
+        self.meta_progress_bar.set(0)
+        self.meta_progress_percent_label.configure(text="0%")
+        self.meta_eta_label.configure(text="")
+        self.meta_completion_time_label.configure(text="")
+        
+        # Reset button state
+        self.new_fetch_button.configure(state="disabled")
+        self.status_text.set("Ready")
+        self.logger.info("Reset all tabs for new fetch")
+        self._update_checklist_statuses()
+    
+    def _on_meta_start_clicked(self) -> None:
+        """Handle Meta Ads start button click."""
+        if self.meta_is_processing:
+            self.logger.warning("Meta Ads already processing, ignoring start request")
+            self.meta_fetch_complete.set()
+            return
+
+        if not self.meta_account_id_locked or not self.meta_date_range_locked:
+            msg = "Error: Please confirm Account ID and date range before starting"
+            self.logger.warning(msg)
+            self.status_text.set(msg)
+            self.meta_fetch_complete.set()
+            return
+
+        is_valid, error_msg = self._validate_meta_inputs()
+        if not is_valid:
+            self.logger.warning(f"Meta start aborted: {error_msg}")
+            self.status_text.set(f"Error: {error_msg}")
+            self.meta_fetch_complete.set()
+            return
+
+        self.meta_cancel_event.clear()
+        self.meta_is_processing = True
+        self.meta_start_button.configure(state="disabled")
+        self.meta_stop_button.configure(state="normal")
+        self.meta_progress_bar.set(0)
+        self.meta_progress_percent_label.configure(text="0%")
+        self.meta_eta_label.configure(text="")
+        self.meta_completion_time_label.configure(text="")
+        self.status_text.set("Initializing Meta Ads fetch...")
+        self.logger.info("Meta fetch thread starting")
+
+        thread = threading.Thread(target=self.start_meta_fetch_thread, daemon=True)
+        thread.start()
+    
+    def _on_meta_stop_clicked(self) -> None:
+        """Handle Meta Ads stop button click."""
+        if self.meta_is_processing:
+            self.meta_cancel_event.set()
+            self.status_text.set("Stopping Meta Ads fetch...")
+            self.logger.info("Meta Ads stop requested by user")
+    
+    def _on_meta_token_update_clicked(self) -> None:
+        """Handle Meta token update button click."""
+        new_token = self.meta_token_input.get().strip()
+        if not new_token:
+            self.status_text.set("Error: Please enter a token")
+            return
+        
+        # Update token in yaml file
+        ok, err = self._update_meta_token(new_token)
+        if not ok:
+            self.status_text.set(f"Error: {err or 'Failed to update token file'}")
+            return
+
+        # Signal that token has been updated (for fetch thread)
+        self.meta_token_updated.set()
+        
+        # Hide token frame
+        self.meta_token_frame.grid_remove()
+        self.meta_token_input.set("")
+        self.status_text.set("Token updated successfully")
+        self.logger.info("Meta token updated from Meta tab input field")
+    
+    def _on_process_clicked(self) -> None:
+        """Handle process button click."""
+        if self.is_processing or self.meta_is_processing:
+            self.status_text.set("Cannot process files while fetching is in progress")
+            return
+        
+        self.process_button.configure(state="disabled")
+        self.status_text.set("Starting file processing...")
+        
+        # Show progress frame
+        self.process_progress_frame.pack(pady=10, padx=20, fill="x")
+        
+        thread = threading.Thread(target=self.start_processing_thread, daemon=True)
+        thread.start()
+    
+    def start_google_fetch_thread(self) -> None:
+        """Run Google Ads fetcher in a background thread."""
+        fetcher = None
+        try:
+            start_year = int(self.start_year.get())
+            start_month_num = self._month_name_to_number(self.start_month.get())
+            end_year = int(self.end_year.get())
+            end_month_num = self._month_name_to_number(self.end_month.get())
+            
+            start_date = datetime(start_year, start_month_num, 1)
+            if end_month_num == 12:
+                end_date = datetime(end_year + 1, 1, 1) - timedelta(days=1)
+            else:
+                end_date = datetime(end_year, end_month_num + 1, 1) - timedelta(days=1)
+            
+            customer_id_raw = self.customer_id.get().strip()
+            customer_id_clean = customer_id_raw.replace("-", "")
+            
+            self.logger.info(f"Starting Google Ads fetch for Customer ID: {customer_id_clean}")
+            self.logger.info(f"Date range: {start_date} to {end_date}")
+            
+            def update_status(message: str) -> None:
+                if self.cancel_event.is_set():
+                    return
+                self.root.after(0, lambda msg=message: self.status_text.set(msg))
+            
+            def update_progress(completed: int, total: int) -> None:
+                self.root.after(0, lambda c=completed, t=total: self._update_progress(c, t))
+            
+            current = datetime(start_date.year, start_date.month, 1)
+            end = datetime(end_date.year, end_date.month, 1)
+            total_months = 0
+            while current <= end:
+                total_months += 1
+                if current.month == 12:
+                    current = datetime(current.year + 1, 1, 1)
+                else:
+                    current = datetime(current.year, current.month + 1, 1)
+            
+            self.total_months = total_months
+            self.start_time = datetime.now()
+            
+            fetcher = AdsApiFetcher(
+                customer_id=customer_id_clean,
+                output_dir="raw_reports/google",
+                status_callback=update_status,
+                progress_callback=update_progress,
+                cancel_flag=self.cancel_event
+            )
+            
+            results = fetcher.fetch_monthly_reports(start_date, end_date)
+            
+            success_count = sum(1 for _, success in results if success)
+            self.root.after(0, lambda: self.status_text.set(
+                f"Completed: {success_count}/{len(results)} reports downloaded successfully"
+            ))
+            self.root.after(0, lambda: self.progress_bar.set(1.0))
+            self.root.after(0, lambda: self.progress_percent_label.configure(text="100%"))
+            self.logger.info(f"Processing complete: {success_count}/{len(results)} successful")
+            
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            self.logger.error(f"Error in Google Ads fetch: {e}", exc_info=True)
+            self.root.after(0, lambda: self.status_text.set(error_msg))
+        finally:
+            self.is_processing = False
+            self.cancel_event.clear()
+            if self.date_range_locked:
+                self.root.after(0, lambda: self.start_button.configure(state="normal"))
+            self.root.after(0, lambda: self.stop_button.configure(state="disabled"))
+            self.root.after(0, lambda: self.new_fetch_button.configure(state="normal"))
+            # Signal batch fetch that Google fetch is complete
+            self.google_fetch_complete.set()
+    
+    def start_meta_fetch_thread(self) -> None:
+        """Run Meta Ads fetcher in a background thread."""
+        fetcher = None
+        try:
+            start_year = int(self.start_year.get())
+            start_month_num = self._month_name_to_number(self.start_month.get())
+            end_year = int(self.end_year.get())
+            end_month_num = self._month_name_to_number(self.end_month.get())
+            
+            start_date = datetime(start_year, start_month_num, 1)
+            if end_month_num == 12:
+                end_date = datetime(end_year + 1, 1, 1) - timedelta(days=1)
+            else:
+                end_date = datetime(end_year, end_month_num + 1, 1) - timedelta(days=1)
+            
+            account_id_raw = self.meta_account_id.get().strip()
+            account_id_clean = account_id_raw.replace("-", "").replace(" ", "")
+            
+            self.logger.info(f"Starting Meta Ads fetch for Account ID: {account_id_clean}")
+            self.logger.info(f"Date range: {start_date} to {end_date}")
+            
+            def update_status(message: str) -> None:
+                if self.meta_cancel_event.is_set():
+                    return
+                self.root.after(0, lambda msg=message: self.status_text.set(msg))
+            
+            def update_progress(completed: int, total: int) -> None:
+                self.root.after(0, lambda c=completed, t=total: self._update_meta_progress(c, t))
+            
+            current = datetime(start_date.year, start_date.month, 1)
+            end = datetime(end_date.year, end_date.month, 1)
+            total_months = 0
+            while current <= end:
+                total_months += 1
+                if current.month == 12:
+                    current = datetime(current.year + 1, 1, 1)
+                else:
+                    current = datetime(current.year, current.month + 1, 1)
+            
+            self.meta_total_months = total_months
+            self.meta_start_time = datetime.now()
+            
+            # Retry loop for token expiration (allows multiple token updates)
+            max_retries = 10  # Allow multiple token attempts
+            retry_count = 0
+            results = None
+            
+            while retry_count < max_retries:
+                try:
+                    fetcher = MetaAdsFetcher(
+                        ad_account_id=account_id_clean,
+                        output_dir="raw_reports/meta",
+                        status_callback=update_status,
+                        progress_callback=update_progress,
+                        cancel_flag=self.meta_cancel_event
+                    )
+                    
+                    results = fetcher.fetch_monthly_reports(start_date, end_date)
+                    break  # Success, exit retry loop
+                    
+                except MetaTokenExpiredError:
+                    retry_count += 1
+                    self.logger.warning(f"Meta token expired (attempt {retry_count}/{max_retries})")
+                    
+                    # Show token input frame in Meta tab
+                    self.root.after(0, lambda: self.status_text.set(
+                        f"Meta token expired (attempt {retry_count}). Please enter new token in Meta tab..."
+                    ))
+                    self.root.after(0, lambda: self.meta_token_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0)))
+                    self.root.after(0, lambda: self.meta_token_entry.focus_set())
+                    
+                    # Reset and wait for user to update token
+                    self.meta_token_updated.clear()
+                    self.meta_token_updated.wait(timeout=300)  # 5 minute timeout
+                    
+                    if not self.meta_token_updated.is_set():
+                        self.logger.warning("Token update timeout")
+                        self.root.after(0, lambda: self.status_text.set(
+                            "Meta fetch cancelled: Token update timeout"
+                        ))
+                        self.root.after(0, lambda: self.meta_token_frame.grid_remove())
+                        return
+                    
+                    new_token = self.meta_token_input.get().strip()
+                    if not new_token:
+                        self.logger.warning("No token provided")
+                        self.root.after(0, lambda: self.status_text.set(
+                            "Meta fetch cancelled: No token provided"
+                        ))
+                        self.root.after(0, lambda: self.meta_token_frame.grid_remove())
+                        return
+                    
+                    # Update token in yaml file
+                    ok, err = self._update_meta_token(new_token)
+                    if not ok:
+                        self.logger.error(f"Failed to update token in meta-ads.yaml: {err}")
+                        self.root.after(0, lambda: self.status_text.set(
+                            f"Error: {err or 'Failed to update token file'}"
+                        ))
+                        self.root.after(0, lambda: self.meta_token_frame.grid_remove())
+                        return
+                    
+                    # Hide token frame (will show again if token still expired)
+                    self.root.after(0, lambda: self.meta_token_frame.grid_remove())
+                    self.root.after(0, lambda: self.meta_token_input.set(""))
+                    
+                    self.logger.info(f"Token updated (attempt {retry_count}), retrying fetch...")
+                    self.root.after(0, lambda: self.status_text.set(
+                        f"Token updated. Retrying Meta fetch (attempt {retry_count})..."
+                    ))
+                    # Continue loop to retry (will catch MetaTokenExpiredError again if new token is also expired)
+            
+            if retry_count >= max_retries:
+                self.logger.error(f"Max retries ({max_retries}) reached for token expiration")
+                self.root.after(0, lambda: self.status_text.set(
+                    f"Error: Failed to update Meta token after {max_retries} attempts"
+                ))
+                self.root.after(0, lambda: self.meta_token_frame.grid_remove())
+                return
+            
+            if results is None:
+                self.logger.error("Failed to fetch Meta data")
+                return
+            
+            success_count = sum(1 for _, success in results if success)
+            self.root.after(0, lambda: self.status_text.set(
+                f"Meta Ads fetch complete: {success_count}/{len(results)} month(s) successful"
+            ))
+            self.root.after(0, lambda: self.meta_progress_bar.set(1.0))
+            self.root.after(0, lambda: self.meta_progress_percent_label.configure(text="100%"))
+            self.logger.info(f"Meta Ads processing complete: {success_count}/{len(results)} successful")
+            
+        except Exception as e:
+            error_msg = f"Error: {str(e)}"
+            self.logger.error(f"Error in Meta Ads fetch: {e}", exc_info=True)
+            self.root.after(0, lambda: self.status_text.set(error_msg))
+        finally:
+            self.meta_is_processing = False
+            self.meta_cancel_event.clear()
+            if self.meta_date_range_locked:
+                self.root.after(0, lambda: self.meta_start_button.configure(state="normal"))
+            self.root.after(0, lambda: self.meta_stop_button.configure(state="disabled"))
+            self.root.after(0, lambda: self.new_fetch_button.configure(state="normal"))
+            # Signal batch fetch that Meta fetch is complete
+            self.meta_fetch_complete.set()
+    
+    def _on_google_process_clicked(self) -> None:
+        """Handle Google process button click - processes only google/ directory."""
+        if self.is_processing or self.meta_is_processing:
+            self.status_text.set("Cannot process files while fetching is in progress")
+            return
+        
+        google_dir = Path("raw_reports/google")
+        if not google_dir.exists() or not any(google_dir.glob("*.csv")):
+            self.status_text.set("No Google Ads files found to process")
+            return
+        
+        self.google_process_button.configure(state="disabled")
+        self.status_text.set("Starting Google Ads file processing...")
+        thread = threading.Thread(target=self.start_google_processing_thread, daemon=True)
+        thread.start()
+    
+    def start_google_processing_thread(self) -> None:
+        """Run ReportProcessor for Google Ads files only."""
+        try:
+            def status_callback(message: str):
+                self.root.after(0, lambda msg=message: self.status_text.set(msg))
+            
+            def user_input_callback(campaign_name: str) -> str:
+                return self._show_funnel_dialog(campaign_name)
+            
+            processor = ReportProcessor(
+                input_dir="raw_reports",
+                output_dir="processed_reports",
+                status_callback=status_callback,
+                user_input_callback=user_input_callback
+            )
+            
+            # Find all files, then filter to only Google files
+            all_files = processor._find_report_files()
+            raw_files = [f for f in all_files if f.parent.name == "google"]
+            
+            if not raw_files:
+                self.root.after(0, lambda: self.status_text.set("No Google Ads files found to process."))
+                self.logger.info("No Google Ads files found for processing.")
+                self.root.after(0, lambda: self.google_process_button.configure(state="normal"))
+                return
+            
+            total_files = len(raw_files)
+            successful_processes = 0
+            
+            for i, file_path in enumerate(raw_files):
+                self.root.after(0, lambda fp=file_path: self.status_text.set(f"Processing {fp.name}..."))
+                processed_path = processor.process_file(file_path)
+                if processed_path:
+                    successful_processes += 1
+                    self.logger.info(f"Successfully processed {file_path.name}")
+            
+            self.root.after(0, lambda: self.status_text.set(
+                f"Google Ads processing complete: {successful_processes}/{total_files} files processed."
+            ))
+            self.logger.info(f"Google Ads processing finished: {successful_processes}/{total_files} files processed.")
+            
+        except Exception as e:
+            error_msg = f"Error during Google Ads processing: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            self.root.after(0, lambda: self.status_text.set(error_msg))
+        finally:
+            self.root.after(0, lambda: self.google_process_button.configure(state="normal"))
+            self.root.after(0, lambda: self._update_checklist_statuses())
+    
+    def _on_meta_process_clicked(self) -> None:
+        """Handle Meta process button click - processes only meta/ directory."""
+        if self.is_processing or self.meta_is_processing:
+            self.status_text.set("Cannot process files while fetching is in progress")
+            return
+        
+        meta_dir = Path("raw_reports/meta")
+        if not meta_dir.exists() or not any(meta_dir.glob("*.csv")):
+            self.status_text.set("No Meta Ads files found to process")
+            return
+        
+        self.meta_process_button.configure(state="disabled")
+        self.status_text.set("Starting Meta Ads file processing...")
+        thread = threading.Thread(target=self.start_meta_processing_thread, daemon=True)
+        thread.start()
+    
+    def start_meta_processing_thread(self) -> None:
+        """Run ReportProcessor for Meta Ads files only."""
+        try:
+            def status_callback(message: str):
+                self.root.after(0, lambda msg=message: self.status_text.set(msg))
+            
+            def user_input_callback(campaign_name: str) -> str:
+                return self._show_funnel_dialog(campaign_name)
+            
+            processor = ReportProcessor(
+                input_dir="raw_reports",
+                output_dir="processed_reports",
+                status_callback=status_callback,
+                user_input_callback=user_input_callback
+            )
+            
+            # Find all files, then filter to only Meta files
+            all_files = processor._find_report_files()
+            raw_files = [f for f in all_files if f.parent.name == "meta"]
+            
+            if not raw_files:
+                self.root.after(0, lambda: self.status_text.set("No Meta Ads files found to process."))
+                self.logger.info("No Meta Ads files found for processing.")
+                self.root.after(0, lambda: self.meta_process_button.configure(state="normal"))
+                return
+            
+            total_files = len(raw_files)
+            successful_processes = 0
+            
+            for i, file_path in enumerate(raw_files):
+                self.root.after(0, lambda fp=file_path: self.status_text.set(f"Processing {fp.name}..."))
+                processed_path = processor.process_file(file_path)
+                if processed_path:
+                    successful_processes += 1
+                    self.logger.info(f"Successfully processed {file_path.name}")
+            
+            self.root.after(0, lambda: self.status_text.set(
+                f"Meta Ads processing complete: {successful_processes}/{total_files} files processed."
+            ))
+            self.logger.info(f"Meta Ads processing finished: {successful_processes}/{total_files} files processed.")
+            
+        except Exception as e:
+            error_msg = f"Error during Meta Ads processing: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            self.root.after(0, lambda: self.status_text.set(error_msg))
+        finally:
+            self.root.after(0, lambda: self.meta_process_button.configure(state="normal"))
+            self.root.after(0, lambda: self._update_checklist_statuses())
+    
+    def _update_progress(self, completed: int, total: int) -> None:
+        """Update progress bar with percentage and ETA (Google Ads)."""
+        if total == 0:
+            return
+        
+        progress = completed / total
+        self.progress_bar.set(progress)
+        self.progress_percent_label.configure(text=f"{int(progress * 100)}%")
+        
+        if completed > 0 and hasattr(self, 'start_time') and self.start_time:
+            elapsed = (datetime.now() - self.start_time).total_seconds()
+            avg_time_per_month = elapsed / completed
+            remaining_months = total - completed
+            eta_seconds = avg_time_per_month * remaining_months
+            
+            hours = int(eta_seconds // 3600)
+            minutes = int((eta_seconds % 3600) // 60)
+            seconds = int(eta_seconds % 60)
+            
+            if hours > 0:
+                eta_str = f"ETA: {hours}h {minutes}m {seconds}s"
+            else:
+                eta_str = f"ETA: {minutes}m {seconds}s"
+            
+            self.eta_label.configure(text=eta_str)
+            
+            completion_time = datetime.now() + timedelta(seconds=eta_seconds)
+            self.completion_time_label.configure(text=f"Complete: {completion_time.strftime('%I:%M:%S %p')}")
+    
+    def _update_meta_progress(self, completed: int, total: int) -> None:
+        """Update progress bar with percentage and ETA (Meta Ads)."""
+        if total == 0:
+            return
+        
+        progress = completed / total
+        self.meta_progress_bar.set(progress)
+        self.meta_progress_percent_label.configure(text=f"{int(progress * 100)}%")
+        
+        if completed > 0 and hasattr(self, 'meta_start_time') and self.meta_start_time:
+            elapsed = (datetime.now() - self.meta_start_time).total_seconds()
+            avg_time_per_month = elapsed / completed
+            remaining_months = total - completed
+            eta_seconds = avg_time_per_month * remaining_months
+            
+            hours = int(eta_seconds // 3600)
+            minutes = int((eta_seconds % 3600) // 60)
+            seconds = int(eta_seconds % 60)
+            
+            if hours > 0:
+                eta_str = f"ETA: {hours}h {minutes}m {seconds}s"
+            else:
+                eta_str = f"ETA: {minutes}m {seconds}s"
+            
+            self.meta_eta_label.configure(text=eta_str)
+            
+            completion_time = datetime.now() + timedelta(seconds=eta_seconds)
+            self.meta_completion_time_label.configure(text=f"Complete: {completion_time.strftime('%I:%M:%S %p')}")
+    
+    def _show_token_input_dialog(self) -> Optional[str]:
+        """Show dialog to get new Meta access token from user."""
+        result = {"token": None}
+        dialog_done = threading.Event()
+        
+        def show_dialog():
+            dialog = ctk.CTkToplevel(self.root)
+            dialog.title("Meta Access Token Expired")
+            dialog.geometry("600x180")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            dialog.attributes('-topmost', True)
+            
+            dialog.update_idletasks()
+            x = (dialog.winfo_screenwidth() // 2) - (600 // 2)
+            y = (dialog.winfo_screenheight() // 2) - (180 // 2)
+            dialog.geometry(f"600x180+{x}+{y}")
+            
+            message_label = ctk.CTkLabel(
+                dialog,
+                text="Meta Access Token Expired. Please enter a new token:",
+                font=ctk.CTkFont(size=12, weight="bold")
+            )
+            message_label.pack(pady=(20, 10), padx=20)
+            
+            token_entry = ctk.CTkEntry(
+                dialog,
+                placeholder_text="Paste your new Meta access token here",
+                width=550,
+                height=35,
+                font=ctk.CTkFont(size=11)
+            )
+            token_entry.pack(pady=10, padx=20)
+            token_entry.focus_set()
+            
+            button_frame = ctk.CTkFrame(dialog)
+            button_frame.pack(pady=10, padx=20)
+            
+            def on_ok():
+                token = token_entry.get().strip()
+                if token:
+                    result["token"] = token
+                dialog_done.set()
+                dialog.destroy()
+            
+            def on_cancel():
+                dialog_done.set()
+                dialog.destroy()
+            
+            ok_btn = ctk.CTkButton(
+                button_frame,
+                text="OK",
+                command=on_ok,
+                width=120,
+                height=35,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                fg_color="green",
+                hover_color="darkgreen"
+            )
+            ok_btn.pack(side="left", padx=10)
+            
+            cancel_btn = ctk.CTkButton(
+                button_frame,
+                text="Cancel",
+                command=on_cancel,
+                width=120,
+                height=35,
+                font=ctk.CTkFont(size=12),
+                fg_color="gray",
+                hover_color="darkgray"
+            )
+            cancel_btn.pack(side="left", padx=10)
+            
+            # Bind Enter key to OK
+            token_entry.bind('<Return>', lambda e: on_ok())
+            dialog.bind('<Escape>', lambda e: on_cancel())
+        
+        self.root.after(0, show_dialog)
+        dialog_done.wait(timeout=300)  # 5 minute timeout
+        
+        return result["token"]
+    
+    def _update_meta_token(self, new_token: str) -> Tuple[bool, Optional[str]]:
+        """Update access_token in meta-ads.yaml file. Validates token before saving.
+        Returns (True, None) on success, (False, error_message) on failure."""
+        try:
+            yaml_path = _APP_DIR / "meta-ads.yaml"
+            if not yaml_path.exists():
+                self.logger.error("meta-ads.yaml not found")
+                return False, "meta-ads.yaml not found"
+
+            # Validate: token must be single-line and look like a real token (not pasted prose)
+            t = new_token.strip()
+            if not t:
+                self.logger.error("Token is empty")
+                return False, "Token is empty"
+            if "\n" in t or "\r" in t:
+                self.logger.error("Token must be a single line (no line breaks)")
+                return False, "Token must be a single line (no line breaks)"
+            if len(t) < 20 or len(t) > 2000:
+                self.logger.error("Token length looks wrong (expected 20–2000 characters)")
+                return False, "Token length looks wrong (expected 20–2000 characters)"
+            if any(x in t for x in ("Goal:", "Requirements:", "Implement ", "Pin the Log")):
+                self.logger.error("Token looks like pasted text; enter only the Meta access token")
+                return False, "Token looks like pasted text; enter only the Meta access token"
+
+            # Read current config
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+
+            # Update token
+            config["access_token"] = t
+
+            # Write back (preserve other keys)
+            with open(yaml_path, "w", encoding="utf-8") as f:
+                yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
+
+            self.logger.info("Meta access token updated in meta-ads.yaml")
+            return True, None
+
+        except Exception as e:
+            self.logger.error(f"Error updating meta-ads.yaml: {e}", exc_info=True)
+            return False, str(e)
+    
+    def _show_funnel_dialog(self, campaign_name: str) -> str:
+        """Show dialog to ask user for funnel stage classification."""
+        result = {"choice": "Top"}
+        dialog_done = threading.Event()
+        
+        def show_dialog():
+            dialog = ctk.CTkToplevel(self.root)
+            dialog.title("Classify Campaign")
+            dialog.geometry("650x200")
+            dialog.transient(self.root)
+            dialog.grab_set()
+            dialog.attributes('-topmost', True)
+            
+            dialog.update_idletasks()
+            x = (dialog.winfo_screenwidth() // 2) - (650 // 2)
+            y = (dialog.winfo_screenheight() // 2) - (200 // 2)
+            dialog.geometry(f"650x200+{x}+{y}")
+            
+            name_label = ctk.CTkLabel(
+                dialog,
+                text="Campaign Name:",
+                font=ctk.CTkFont(size=12, weight="bold")
+            )
+            name_label.pack(pady=(20, 5), padx=20)
+            
+            campaign_label = ctk.CTkLabel(
+                dialog,
+                text=campaign_name,
+                font=ctk.CTkFont(size=13),
+                wraplength=500
+            )
+            campaign_label.pack(pady=5, padx=20)
+            
+            question_label = ctk.CTkLabel(
+                dialog,
+                text="Select Funnel Stage:",
+                font=ctk.CTkFont(size=12)
+            )
+            question_label.pack(pady=(15, 10), padx=20)
+            
+            button_frame = ctk.CTkFrame(dialog)
+            button_frame.pack(pady=10, padx=20)
+            
+            def choose_top():
+                result["choice"] = "Top"
+                dialog_done.set()
+                dialog.destroy()
+            
+            def choose_bottom():
+                result["choice"] = "Bottom"
+                dialog_done.set()
+                dialog.destroy()
+            
+            def choose_skip():
+                result["choice"] = "SKIP"
+                dialog_done.set()
+                dialog.destroy()
+            
+            def choose_always_ignore():
+                result["choice"] = "DELETE"
+                dialog_done.set()
+                dialog.destroy()
+            
+            top_btn = ctk.CTkButton(
+                button_frame,
+                text="Top",
+                command=choose_top,
+                width=110,
+                height=40,
+                font=ctk.CTkFont(size=14, weight="bold"),
+                fg_color="blue",
+                hover_color="darkblue"
+            )
+            top_btn.pack(side="left", padx=4)
+            
+            bottom_btn = ctk.CTkButton(
+                button_frame,
+                text="Bottom",
+                command=choose_bottom,
+                width=110,
+                height=40,
+                font=ctk.CTkFont(size=14, weight="bold"),
+                fg_color="green",
+                hover_color="darkgreen"
+            )
+            bottom_btn.pack(side="left", padx=4)
+            
+            skip_btn = ctk.CTkButton(
+                button_frame,
+                text="Skip (This Report Only)",
+                command=choose_skip,
+                width=140,
+                height=40,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                fg_color="orange",
+                hover_color="darkorange"
+            )
+            skip_btn.pack(side="left", padx=4)
+            
+            always_ignore_btn = ctk.CTkButton(
+                button_frame,
+                text="Always Ignore Campaign",
+                command=choose_always_ignore,
+                width=150,
+                height=40,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                fg_color="red",
+                hover_color="darkred"
+            )
+            always_ignore_btn.pack(side="left", padx=4)
+            
+            dialog.focus()
+            dialog.wait_window()
+        
+        self.root.after(0, show_dialog)
+        dialog_done.wait(timeout=300)
+        
+        return result["choice"]
+    
+    def _load_settings(self) -> Dict:
+        """Load settings from config.json file."""
+        try:
+            settings_file = Path("config.json")
+            if settings_file.exists():
+                with open(settings_file, 'r', encoding='utf-8') as f:
+                    return json.load(f)
+            else:
+                return {
+                    "default_google_favorite": "ML",
+                    "default_meta_favorite": "ML",
+                    "default_ms_favorite": None,
+                    "default_tiktok_favorite": None,
+                    "default_reddit_favorite": None,
+                    "default_pinterest_favorite": None,
+                    "theme_mode": "dark",
+                    "default_download_folder": "raw_reports",
+                    "default_output_folder": "processed_reports"
+                }
+        except Exception as e:
+            # Logger might not be initialized yet, use print
+            try:
+                self.logger.error(f"Error loading settings: {e}", exc_info=True)
+            except:
+                print(f"Error loading settings: {e}")
+            return {
+                "default_google_favorite": "ML",
+                "default_meta_favorite": "ML",
+                "default_ms_favorite": None,
+                "default_tiktok_favorite": None,
+                "default_reddit_favorite": None,
+                "default_pinterest_favorite": None,
+                "theme_mode": "dark",
+                "default_download_folder": "raw_reports",
+                "default_output_folder": "processed_reports"
+            }
+    
+    def _load_favorites(self) -> None:
+        """Load favorites from JSON file."""
+        try:
+            if self.favorites_file.exists():
+                with open(self.favorites_file, 'r', encoding='utf-8') as f:
+                    self.favorites = json.load(f)
+            else:
+                self.favorites = []
+        except Exception as e:
+            self.logger.error(f"Error loading favorites: {e}", exc_info=True)
+            self.favorites = []
+    
+    def _save_favorites(self) -> None:
+        """Save favorites to JSON file."""
+        try:
+            with open(self.favorites_file, 'w', encoding='utf-8') as f:
+                json.dump(self.favorites, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.logger.error(f"Error saving favorites: {e}", exc_info=True)
+    
+    def _update_favorites_menu(self) -> None:
+        """Update the Google ID combobox and settings menus."""
+        google_values = [f"{f['name']} ({f['customer_id']})" for f in self.favorites] if self.favorites else []
+        if hasattr(self, 'customer_id_combobox'):
+            self.customer_id_combobox.configure(values=google_values)
+            self._set_google_id_display_from_id()
+        self._update_settings_google_favorites_menu()
+        if hasattr(self, 'settings_google_favorite_menu'):
+            google_favorite_names = [fav["name"] for fav in self.favorites] if self.favorites else []
+            self.settings_google_favorite_menu.configure(values=["None"] + google_favorite_names if google_favorite_names else ["None"])
+    
+    def _update_settings_google_favorites_menu(self) -> None:
+        """Update the settings Google favorites dropdown menu."""
+        favorite_names = [fav["name"] for fav in self.favorites] if self.favorites else []
+        menu_values = ["Select a favorite..."] + favorite_names if favorite_names else ["Select a favorite..."]
+        if hasattr(self, 'settings_google_favorites_menu'):
+            self.settings_google_favorites_menu.configure(values=menu_values)
+    
+    def _on_favorite_selected(self, choice: str) -> None:
+        """Handle favorite selection from dropdown."""
+        if choice == "Select a favorite...":
+            return
+        
+        for fav in self.favorites:
+            if fav["name"] == choice:
+                self.customer_id.set(fav["customer_id"])
+                break
+    
+    def _on_settings_add_google_favorite(self) -> None:
+        """Show dialog to add a new Google Ads favorite from Settings."""
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Add Google Ads Favorite")
+        dialog.geometry("450x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (450 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (200 // 2)
+        dialog.geometry(f"450x200+{x}+{y}")
+        
+        name_var = ctk.StringVar(value="")
+        customer_id_var = ctk.StringVar(value="")
+        
+        name_label = ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12))
+        name_label.pack(pady=(20, 5), padx=20)
+        
+        name_entry = ctk.CTkEntry(
+            dialog,
+            textvariable=name_var,
+            placeholder_text="Enter a name for this favorite",
+            width=410,
+            font=ctk.CTkFont(size=12)
+        )
+        name_entry.pack(pady=5, padx=20)
+        name_entry.focus()
+        
+        customer_id_label = ctk.CTkLabel(dialog, text="Customer ID (10 digits):", font=ctk.CTkFont(size=12))
+        customer_id_label.pack(pady=(10, 5), padx=20)
+        
+        customer_id_entry = ctk.CTkEntry(
+            dialog,
+            textvariable=customer_id_var,
+            placeholder_text="Enter 10-digit Customer ID",
+            width=410,
+            font=ctk.CTkFont(size=12)
+        )
+        customer_id_entry.pack(pady=5, padx=20)
+        
+        def save_favorite() -> None:
+            name = name_var.get().strip()
+            customer_id = customer_id_var.get().strip()
+            customer_id_clean = customer_id.replace("-", "").replace(" ", "")
+            
+            if not name:
+                self.status_text.set("Error: Please enter a name for the favorite")
+                dialog.destroy()
+                return
+            
+            if not customer_id_clean or not customer_id_clean.isdigit() or len(customer_id_clean) != 10:
+                self.status_text.set("Error: Please enter a valid 10-digit Customer ID")
+                dialog.destroy()
+                return
+            
+            if any(fav["name"] == name for fav in self.favorites):
+                self.status_text.set(f"Error: A favorite named '{name}' already exists")
+                dialog.destroy()
+                return
+            
+            self.favorites.append({
+                "name": name,
+                "customer_id": customer_id_clean
+            })
+            self._save_favorites()
+            self._update_favorites_menu()
+            self.status_text.set(f"Added favorite: {name}")
+            self.logger.info(f"Added Google Ads favorite: {name}")
+            dialog.destroy()
+        
+        button_frame = ctk.CTkFrame(dialog)
+        button_frame.pack(pady=15, padx=20)
+        
+        save_btn = ctk.CTkButton(
+            button_frame,
+            text="Save",
+            command=save_favorite,
+            width=100,
+            font=ctk.CTkFont(size=12)
+        )
+        save_btn.pack(side="left", padx=10)
+        
+        cancel_btn = ctk.CTkButton(
+            button_frame,
+            text="Cancel",
+            command=dialog.destroy,
+            width=100,
+            font=ctk.CTkFont(size=12),
+            fg_color="gray",
+            hover_color="darkgray"
+        )
+        cancel_btn.pack(side="left", padx=10)
+        
+        dialog.bind('<Return>', lambda e: save_favorite())
+        name_entry.bind('<Return>', lambda e: customer_id_entry.focus())
+        customer_id_entry.bind('<Return>', lambda e: save_favorite())
+    
+    def _show_add_favorite_dialog(self) -> None:
+        """Show dialog to add a new favorite (deprecated - use Settings)."""
+        # Redirect to settings method
+        self._on_settings_add_google_favorite()
+    
+    def _on_settings_edit_google_favorite(self) -> None:
+        """Show dialog to edit a Google Ads favorite from Settings."""
+        if not hasattr(self, 'settings_google_favorites_menu'):
+            return
+        current_selection = self.settings_google_favorites_menu.get()
+        if not self.favorites or current_selection == "Select a favorite...":
+            self.status_text.set("Error: Please select a favorite to edit")
+            return
+        
+        selected_fav = None
+        for fav in self.favorites:
+            if fav["name"] == current_selection:
+                selected_fav = fav
+                break
+        
+        if not selected_fav:
+            return
+        
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Edit Google Ads Favorite")
+        dialog.geometry("450x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (450 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (200 // 2)
+        dialog.geometry(f"450x200+{x}+{y}")
+        
+        name_var = ctk.StringVar(value=selected_fav["name"])
+        customer_id_var = ctk.StringVar(value=selected_fav["customer_id"])
+        
+        name_label = ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12))
+        name_label.pack(pady=(20, 5), padx=20)
+        
+        name_entry = ctk.CTkEntry(
+            dialog,
+            textvariable=name_var,
+            width=410,
+            font=ctk.CTkFont(size=12)
+        )
+        name_entry.pack(pady=5, padx=20)
+        name_entry.select_range(0, ctk.END)
+        name_entry.focus()
+        
+        customer_id_label = ctk.CTkLabel(dialog, text="Customer ID (10 digits):", font=ctk.CTkFont(size=12))
+        customer_id_label.pack(pady=(10, 5), padx=20)
+        
+        customer_id_entry = ctk.CTkEntry(
+            dialog,
+            textvariable=customer_id_var,
+            width=410,
+            font=ctk.CTkFont(size=12)
+        )
+        customer_id_entry.pack(pady=5, padx=20)
+        
+        def save_edit() -> None:
+            new_name = name_var.get().strip()
+            customer_id = customer_id_var.get().strip()
+            customer_id_clean = customer_id.replace("-", "").replace(" ", "")
+            
+            if not new_name:
+                self.status_text.set("Error: Please enter a name for the favorite")
+                dialog.destroy()
+                return
+            
+            if not customer_id_clean or not customer_id_clean.isdigit() or len(customer_id_clean) != 10:
+                self.status_text.set("Error: Please enter a valid 10-digit Customer ID")
+                dialog.destroy()
+                return
+            
+            if any(fav["name"] == new_name and fav != selected_fav for fav in self.favorites):
+                self.status_text.set(f"Error: A favorite named '{new_name}' already exists")
+                dialog.destroy()
+                return
+            
+            selected_fav["name"] = new_name
+            selected_fav["customer_id"] = customer_id_clean
+            self._save_favorites()
+            self._update_favorites_menu()
+            self.settings_google_favorites_menu.set(new_name)
+            self.status_text.set(f"Updated favorite: {new_name}")
+            self.logger.info(f"Updated Google Ads favorite: {new_name}")
+            dialog.destroy()
+        
+        button_frame = ctk.CTkFrame(dialog)
+        button_frame.pack(pady=15, padx=20)
+        
+        save_btn = ctk.CTkButton(
+            button_frame,
+            text="Save",
+            command=save_edit,
+            width=100,
+            font=ctk.CTkFont(size=12)
+        )
+        save_btn.pack(side="left", padx=10)
+        
+        cancel_btn = ctk.CTkButton(
+            button_frame,
+            text="Cancel",
+            command=dialog.destroy,
+            width=100,
+            font=ctk.CTkFont(size=12),
+            fg_color="gray",
+            hover_color="darkgray"
+        )
+        cancel_btn.pack(side="left", padx=10)
+        
+        dialog.bind('<Return>', lambda e: save_edit())
+        name_entry.bind('<Return>', lambda e: customer_id_entry.focus())
+        customer_id_entry.bind('<Return>', lambda e: save_edit())
+    
+    def _show_edit_favorite_dialog(self) -> None:
+        """Show dialog to edit a favorite name (deprecated - use Settings)."""
+        # Redirect to settings method
+        self._on_settings_edit_google_favorite()
+        
+        cid = self.customer_id.get().strip()
+        selected_fav = next((f for f in self.favorites if (f.get("customer_id") or "").strip() == cid), None)
+        
+        if not selected_fav:
+            return
+        
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Edit Favorite")
+        dialog.geometry("400x150")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (400 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (150 // 2)
+        dialog.geometry(f"400x150+{x}+{y}")
+        
+        name_var = ctk.StringVar(value=selected_fav["name"])
+        
+        name_label = ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12))
+        name_label.pack(pady=(20, 5), padx=20)
+        
+        name_entry = ctk.CTkEntry(
+            dialog,
+            textvariable=name_var,
+            width=360,
+            font=ctk.CTkFont(size=12)
+        )
+        name_entry.pack(pady=5, padx=20)
+        name_entry.select_range(0, ctk.END)
+        name_entry.focus()
+        
+        def save_edit() -> None:
+            new_name = name_var.get().strip()
+            if not new_name:
+                self.status_text.set("Error: Please enter a name for the favorite")
+                dialog.destroy()
+                return
+            
+            if any(fav["name"] == new_name and fav != selected_fav for fav in self.favorites):
+                self.status_text.set(f"Error: A favorite named '{new_name}' already exists")
+                dialog.destroy()
+                return
+            
+            selected_fav["name"] = new_name
+            self._save_favorites()
+            self._update_favorites_menu()
+            self._set_google_id_display_from_id()
+            self.status_text.set(f"Updated favorite: {new_name}")
+            dialog.destroy()
+        
+        button_frame = ctk.CTkFrame(dialog)
+        button_frame.pack(pady=15, padx=20)
+        
+        save_btn = ctk.CTkButton(
+            button_frame,
+            text="Save",
+            command=save_edit,
+            width=100,
+            font=ctk.CTkFont(size=12)
+        )
+        save_btn.pack(side="left", padx=10)
+        
+        cancel_btn = ctk.CTkButton(
+            button_frame,
+            text="Cancel",
+            command=dialog.destroy,
+            width=100,
+            font=ctk.CTkFont(size=12),
+            fg_color="gray",
+            hover_color="darkgray"
+        )
+        cancel_btn.pack(side="left", padx=10)
+        
+        dialog.bind('<Return>', lambda e: save_edit())
+        name_entry.bind('<Return>', lambda e: save_edit())
+    
+    def _on_settings_delete_google_favorite(self) -> None:
+        """Delete the selected Google Ads favorite from Settings."""
+        if not hasattr(self, 'settings_google_favorites_menu'):
+            return
+        current_selection = self.settings_google_favorites_menu.get()
+        if not self.favorites or current_selection == "Select a favorite...":
+            self.status_text.set("Error: Please select a favorite to delete")
+            return
+        
+        result = messagebox.askyesno(
+            "Confirm Delete",
+            f"Are you sure you want to delete the favorite '{current_selection}'?",
+            icon="warning"
+        )
+        
+        if result:
+            self.favorites = [fav for fav in self.favorites if fav["name"] != current_selection]
+            self._save_favorites()
+            self._update_favorites_menu()
+            self.settings_google_favorites_menu.set("Select a favorite...")
+            self.status_text.set(f"Deleted favorite: {current_selection}")
+            self.logger.info(f"Deleted Google Ads favorite: {current_selection}")
+    
+    def _delete_favorite(self) -> None:
+        """Delete the selected favorite (deprecated - use Settings)."""
+        # Redirect to settings method
+        self._on_settings_delete_google_favorite()
+    
+    def _load_meta_favorites(self) -> None:
+        """Load Meta Ads favorites from JSON file."""
+        try:
+            if self.meta_favorites_file.exists():
+                with open(str(self.meta_favorites_file), 'r', encoding='utf-8') as f:
+                    self.meta_favorites = json.load(f)
+                self.logger.info(f"Loaded {len(self.meta_favorites)} Meta favorite(s) from {self.meta_favorites_file}")
+            else:
+                self.meta_favorites = []
+        except Exception as e:
+            self.logger.error(f"Error loading Meta favorites: {e}", exc_info=True)
+            self.meta_favorites = []
+    
+    def _save_meta_favorites(self) -> None:
+        """Save Meta Ads favorites to JSON file."""
+        try:
+            with open(str(self.meta_favorites_file), 'w', encoding='utf-8') as f:
+                json.dump(self.meta_favorites, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"Saved {len(self.meta_favorites)} Meta favorite(s) to {self.meta_favorites_file}")
+        except Exception as e:
+            self.logger.error(f"Error saving Meta favorites: {e}", exc_info=True)
+    
+    def _load_ms_favorites(self) -> None:
+        try:
+            if self.ms_favorites_file.exists():
+                with open(self.ms_favorites_file, 'r', encoding='utf-8') as f:
+                    self.ms_favorites = json.load(f)
+            else:
+                self.ms_favorites = []
+        except Exception as e:
+            self.logger.error(f"Error loading MS favorites: {e}", exc_info=True)
+            self.ms_favorites = []
+    
+    def _save_ms_favorites(self) -> None:
+        try:
+            with open(self.ms_favorites_file, 'w', encoding='utf-8') as f:
+                json.dump(self.ms_favorites, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.logger.error(f"Error saving MS favorites: {e}", exc_info=True)
+    
+    def _load_tiktok_favorites(self) -> None:
+        try:
+            if self.tiktok_favorites_file.exists():
+                with open(self.tiktok_favorites_file, 'r', encoding='utf-8') as f:
+                    self.tiktok_favorites = json.load(f)
+            else:
+                self.tiktok_favorites = []
+        except Exception as e:
+            self.logger.error(f"Error loading TikTok favorites: {e}", exc_info=True)
+            self.tiktok_favorites = []
+    
+    def _save_tiktok_favorites(self) -> None:
+        try:
+            with open(self.tiktok_favorites_file, 'w', encoding='utf-8') as f:
+                json.dump(self.tiktok_favorites, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.logger.error(f"Error saving TikTok favorites: {e}", exc_info=True)
+    
+    def _load_reddit_favorites(self) -> None:
+        try:
+            if self.reddit_favorites_file.exists():
+                with open(self.reddit_favorites_file, 'r', encoding='utf-8') as f:
+                    self.reddit_favorites = json.load(f)
+            else:
+                self.reddit_favorites = []
+        except Exception as e:
+            self.logger.error(f"Error loading Reddit favorites: {e}", exc_info=True)
+            self.reddit_favorites = []
+    
+    def _save_reddit_favorites(self) -> None:
+        try:
+            with open(self.reddit_favorites_file, 'w', encoding='utf-8') as f:
+                json.dump(self.reddit_favorites, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.logger.error(f"Error saving Reddit favorites: {e}", exc_info=True)
+    
+    def _load_pinterest_favorites(self) -> None:
+        try:
+            if self.pinterest_favorites_file.exists():
+                with open(self.pinterest_favorites_file, 'r', encoding='utf-8') as f:
+                    self.pinterest_favorites = json.load(f)
+            else:
+                self.pinterest_favorites = []
+        except Exception as e:
+            self.logger.error(f"Error loading Pinterest favorites: {e}", exc_info=True)
+            self.pinterest_favorites = []
+    
+    def _save_pinterest_favorites(self) -> None:
+        try:
+            with open(self.pinterest_favorites_file, 'w', encoding='utf-8') as f:
+                json.dump(self.pinterest_favorites, f, indent=2, ensure_ascii=False)
+        except Exception as e:
+            self.logger.error(f"Error saving Pinterest favorites: {e}", exc_info=True)
+    
+    def _update_meta_favorites_menu(self) -> None:
+        """Update the Meta ID combobox and settings menus."""
+        meta_values = [f"{f['name']} ({f['account_id']})" for f in self.meta_favorites] if self.meta_favorites else []
+        if hasattr(self, 'meta_account_id_combobox'):
+            self.meta_account_id_combobox.configure(values=meta_values)
+            self._set_meta_id_display_from_id()
+        self._update_settings_meta_favorites_menu()
+        if hasattr(self, 'settings_meta_favorite_menu'):
+            meta_favorite_names = [fav["name"] for fav in self.meta_favorites] if self.meta_favorites else []
+            self.settings_meta_favorite_menu.configure(values=["None"] + meta_favorite_names if meta_favorite_names else ["None"])
+    
+    def _update_settings_meta_favorites_menu(self) -> None:
+        """Update the settings Meta favorites dropdown menu."""
+        meta_favorite_names = [fav["name"] for fav in self.meta_favorites] if self.meta_favorites else []
+        menu_values = ["Select a favorite..."] + meta_favorite_names if meta_favorite_names else ["Select a favorite..."]
+        if hasattr(self, 'settings_meta_favorites_menu'):
+            self.settings_meta_favorites_menu.configure(values=menu_values)
+    
+    def _update_settings_ms_favorites_menu(self) -> None:
+        ms_names = [f["name"] for f in self.ms_favorites] if self.ms_favorites else []
+        menu_values = ["Select a favorite..."] + ms_names if ms_names else ["Select a favorite..."]
+        if hasattr(self, 'settings_ms_favorites_menu'):
+            self.settings_ms_favorites_menu.configure(values=menu_values)
+    
+    def _update_settings_tiktok_favorites_menu(self) -> None:
+        tk_names = [f["name"] for f in self.tiktok_favorites] if self.tiktok_favorites else []
+        menu_values = ["Select a favorite..."] + tk_names if tk_names else ["Select a favorite..."]
+        if hasattr(self, 'settings_tiktok_favorites_menu'):
+            self.settings_tiktok_favorites_menu.configure(values=menu_values)
+    
+    def _update_settings_reddit_favorites_menu(self) -> None:
+        rd_names = [f["name"] for f in self.reddit_favorites] if self.reddit_favorites else []
+        menu_values = ["Select a favorite..."] + rd_names if rd_names else ["Select a favorite..."]
+        if hasattr(self, 'settings_reddit_favorites_menu'):
+            self.settings_reddit_favorites_menu.configure(values=menu_values)
+    
+    def _update_settings_pinterest_favorites_menu(self) -> None:
+        pt_names = [f["name"] for f in self.pinterest_favorites] if self.pinterest_favorites else []
+        menu_values = ["Select a favorite..."] + pt_names if pt_names else ["Select a favorite..."]
+        if hasattr(self, 'settings_pinterest_favorites_menu'):
+            self.settings_pinterest_favorites_menu.configure(values=menu_values)
+    
+    def _update_ms_favorites_combobox(self) -> None:
+        ms_values = [f"{f['name']} ({f['customer_id']})" for f in self.ms_favorites] if self.ms_favorites else []
+        if hasattr(self, 'ms_customer_id_combobox'):
+            self.ms_customer_id_combobox.configure(values=ms_values)
+            self._set_ms_id_display_from_id()
+        self._update_settings_ms_favorites_menu()
+        if hasattr(self, 'settings_ms_favorite_menu'):
+            ms_names = [f["name"] for f in self.ms_favorites] if self.ms_favorites else []
+            self.settings_ms_favorite_menu.configure(values=["None"] + ms_names if ms_names else ["None"])
+    
+    def _update_tiktok_favorites_combobox(self) -> None:
+        tk_values = [f"{f['name']} ({f['advertiser_id']})" for f in self.tiktok_favorites] if self.tiktok_favorites else []
+        if hasattr(self, 'tiktok_account_id_combobox'):
+            self.tiktok_account_id_combobox.configure(values=tk_values)
+            self._set_tiktok_id_display_from_id()
+        self._update_settings_tiktok_favorites_menu()
+        if hasattr(self, 'settings_tiktok_favorite_menu'):
+            tk_names = [f["name"] for f in self.tiktok_favorites] if self.tiktok_favorites else []
+            self.settings_tiktok_favorite_menu.configure(values=["None"] + tk_names if tk_names else ["None"])
+    
+    def _update_reddit_favorites_combobox(self) -> None:
+        rd_values = [f"{f['name']} ({f['account_id']})" for f in self.reddit_favorites] if self.reddit_favorites else []
+        if hasattr(self, 'reddit_account_id_combobox'):
+            self.reddit_account_id_combobox.configure(values=rd_values)
+            self._set_reddit_id_display_from_id()
+        self._update_settings_reddit_favorites_menu()
+        if hasattr(self, 'settings_reddit_favorite_menu'):
+            rd_names = [f["name"] for f in self.reddit_favorites] if self.reddit_favorites else []
+            self.settings_reddit_favorite_menu.configure(values=["None"] + rd_names if rd_names else ["None"])
+    
+    def _update_pinterest_favorites_combobox(self) -> None:
+        pt_values = [f"{f['name']} ({f['advertiser_id']})" for f in self.pinterest_favorites] if self.pinterest_favorites else []
+        if hasattr(self, 'pinterest_account_id_combobox'):
+            self.pinterest_account_id_combobox.configure(values=pt_values)
+            self._set_pinterest_id_display_from_id()
+        self._update_settings_pinterest_favorites_menu()
+        if hasattr(self, 'settings_pinterest_favorite_menu'):
+            pt_names = [f["name"] for f in self.pinterest_favorites] if self.pinterest_favorites else []
+            self.settings_pinterest_favorite_menu.configure(values=["None"] + pt_names if pt_names else ["None"])
+    
+    def _on_meta_favorite_selected(self, choice: str) -> None:
+        """Handle Meta favorite selection from dropdown."""
+        if choice == "Select a favorite...":
+            return
+        
+        for fav in self.meta_favorites:
+            if fav["name"] == choice:
+                self.meta_account_id.set(fav["account_id"])
+                break
+    
+    def _on_settings_add_meta_favorite(self) -> None:
+        """Show dialog to add a new Meta Ads favorite from Settings."""
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Add Meta Ads Favorite")
+        dialog.geometry("450x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (450 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (200 // 2)
+        dialog.geometry(f"450x200+{x}+{y}")
+        
+        name_var = ctk.StringVar(value="")
+        account_id_var = ctk.StringVar(value="")
+        
+        name_label = ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12))
+        name_label.pack(pady=(20, 5), padx=20)
+        
+        name_entry = ctk.CTkEntry(
+            dialog,
+            textvariable=name_var,
+            placeholder_text="Enter a name for this favorite",
+            width=410,
+            font=ctk.CTkFont(size=12)
+        )
+        name_entry.pack(pady=5, padx=20)
+        name_entry.focus()
+        
+        account_id_label = ctk.CTkLabel(dialog, text="Account ID (e.g., act_12345678):", font=ctk.CTkFont(size=12))
+        account_id_label.pack(pady=(10, 5), padx=20)
+        
+        account_id_entry = ctk.CTkEntry(
+            dialog,
+            textvariable=account_id_var,
+            placeholder_text="Enter Account ID",
+            width=410,
+            font=ctk.CTkFont(size=12)
+        )
+        account_id_entry.pack(pady=5, padx=20)
+        
+        def save_favorite() -> None:
+            name = name_var.get().strip()
+            account_id = account_id_var.get().strip()
+            account_id_clean = account_id.replace("-", "").replace(" ", "")
+            
+            if not name:
+                self.status_text.set("Error: Please enter a name for the favorite")
+                dialog.destroy()
+                return
+            
+            # Auto-prepend "act_" if user entered just the number
+            if account_id_clean.isdigit():
+                account_id_clean = f"act_{account_id_clean}"
+            
+            if account_id_clean == "act_" or len(account_id_clean) <= 4:
+                self.status_text.set("Error: Please enter a valid Ad Account ID (format: act_12345678)")
+                dialog.destroy()
+                return
+            
+            if not account_id_clean.startswith("act_"):
+                self.status_text.set("Error: Ad Account ID must start with 'act_' or be a valid number")
+                dialog.destroy()
+                return
+            
+            # Additional validation: after "act_", should have digits
+            account_part = account_id_clean[4:]
+            if not account_part.isdigit():
+                self.status_text.set("Error: Ad Account ID must be in format: act_12345678 (numbers after 'act_')")
+                dialog.destroy()
+                return
+            
+            if any(fav["name"] == name for fav in self.meta_favorites):
+                self.status_text.set(f"Error: A favorite named '{name}' already exists")
+                dialog.destroy()
+                return
+            
+            self.meta_favorites.append({
+                "name": name,
+                "account_id": account_id_clean
+            })
+            self._save_meta_favorites()
+            self._update_meta_favorites_menu()
+            self.status_text.set(f"Added favorite: {name}")
+            self.logger.info(f"Added Meta Ads favorite: {name}")
+            dialog.destroy()
+        
+        button_frame = ctk.CTkFrame(dialog)
+        button_frame.pack(pady=15, padx=20)
+        
+        save_btn = ctk.CTkButton(
+            button_frame,
+            text="Save",
+            command=save_favorite,
+            width=100,
+            font=ctk.CTkFont(size=12)
+        )
+        save_btn.pack(side="left", padx=10)
+        
+        cancel_btn = ctk.CTkButton(
+            button_frame,
+            text="Cancel",
+            command=dialog.destroy,
+            width=100,
+            font=ctk.CTkFont(size=12),
+            fg_color="gray",
+            hover_color="darkgray"
+        )
+        cancel_btn.pack(side="left", padx=10)
+        
+        dialog.bind('<Return>', lambda e: save_favorite())
+        name_entry.bind('<Return>', lambda e: account_id_entry.focus())
+        account_id_entry.bind('<Return>', lambda e: save_favorite())
+    
+    def _show_add_meta_favorite_dialog(self) -> None:
+        """Show dialog to add a new Meta favorite (deprecated - use Settings)."""
+        # Redirect to settings method
+        self._on_settings_add_meta_favorite()
+        
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Add Meta Favorite")
+        dialog.geometry("400x150")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (400 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (150 // 2)
+        dialog.geometry(f"400x150+{x}+{y}")
+        
+        name_var = ctk.StringVar(value="")
+        
+        name_label = ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12))
+        name_label.pack(pady=(20, 5), padx=20)
+        
+        name_entry = ctk.CTkEntry(
+            dialog,
+            textvariable=name_var,
+            placeholder_text="Enter a name for this Ad Account ID",
+            width=360,
+            font=ctk.CTkFont(size=12)
+        )
+        name_entry.pack(pady=5, padx=20)
+        name_entry.focus()
+        
+        def save_favorite() -> None:
+            name = name_var.get().strip()
+            if not name:
+                self.status_text.set("Error: Please enter a name for the favorite")
+                dialog.destroy()
+                return
+            
+            if any(fav["name"] == name for fav in self.meta_favorites):
+                self.status_text.set(f"Error: A favorite named '{name}' already exists")
+                dialog.destroy()
+                return
+            
+            account_id_clean = self.meta_account_id.get().strip()
+            self.meta_favorites.append({
+                "name": name,
+                "account_id": account_id_clean
+            })
+            self._save_meta_favorites()
+            self._update_meta_favorites_menu()
+            self.status_text.set(f"Added Meta favorite: {name}")
+            dialog.destroy()
+        
+        button_frame = ctk.CTkFrame(dialog)
+        button_frame.pack(pady=15, padx=20)
+        
+        save_btn = ctk.CTkButton(
+            button_frame,
+            text="Save",
+            command=save_favorite,
+            width=100,
+            font=ctk.CTkFont(size=12)
+        )
+        save_btn.pack(side="left", padx=10)
+        
+        cancel_btn = ctk.CTkButton(
+            button_frame,
+            text="Cancel",
+            command=dialog.destroy,
+            width=100,
+            font=ctk.CTkFont(size=12),
+            fg_color="gray",
+            hover_color="darkgray"
+        )
+        cancel_btn.pack(side="left", padx=10)
+        
+        dialog.bind('<Return>', lambda e: save_favorite())
+        name_entry.bind('<Return>', lambda e: save_favorite())
+    
+    def _on_settings_edit_meta_favorite(self) -> None:
+        """Show dialog to edit a Meta Ads favorite from Settings."""
+        if not hasattr(self, 'settings_meta_favorites_menu'):
+            return
+        current_selection = self.settings_meta_favorites_menu.get()
+        if not self.meta_favorites or current_selection == "Select a favorite...":
+            self.status_text.set("Error: Please select a favorite to edit")
+            return
+        
+        selected_fav = None
+        for fav in self.meta_favorites:
+            if fav["name"] == current_selection:
+                selected_fav = fav
+                break
+        
+        if not selected_fav:
+            return
+        
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Edit Meta Ads Favorite")
+        dialog.geometry("450x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (450 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (200 // 2)
+        dialog.geometry(f"450x200+{x}+{y}")
+        
+        name_var = ctk.StringVar(value=selected_fav["name"])
+        account_id_var = ctk.StringVar(value=selected_fav["account_id"])
+        
+        name_label = ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12))
+        name_label.pack(pady=(20, 5), padx=20)
+        
+        name_entry = ctk.CTkEntry(
+            dialog,
+            textvariable=name_var,
+            width=410,
+            font=ctk.CTkFont(size=12)
+        )
+        name_entry.pack(pady=5, padx=20)
+        name_entry.select_range(0, ctk.END)
+        name_entry.focus()
+        
+        account_id_label = ctk.CTkLabel(dialog, text="Account ID (e.g., act_12345678):", font=ctk.CTkFont(size=12))
+        account_id_label.pack(pady=(10, 5), padx=20)
+        
+        account_id_entry = ctk.CTkEntry(
+            dialog,
+            textvariable=account_id_var,
+            width=410,
+            font=ctk.CTkFont(size=12)
+        )
+        account_id_entry.pack(pady=5, padx=20)
+        
+        def save_edit() -> None:
+            new_name = name_var.get().strip()
+            account_id = account_id_var.get().strip()
+            account_id_clean = account_id.replace("-", "").replace(" ", "")
+            
+            if not new_name:
+                self.status_text.set("Error: Please enter a name for the favorite")
+                dialog.destroy()
+                return
+            
+            # Auto-prepend "act_" if user entered just the number
+            if account_id_clean.isdigit():
+                account_id_clean = f"act_{account_id_clean}"
+            
+            if account_id_clean == "act_" or len(account_id_clean) <= 4:
+                self.status_text.set("Error: Please enter a valid Ad Account ID (format: act_12345678)")
+                dialog.destroy()
+                return
+            
+            if not account_id_clean.startswith("act_"):
+                self.status_text.set("Error: Ad Account ID must start with 'act_' or be a valid number")
+                dialog.destroy()
+                return
+            
+            # Additional validation: after "act_", should have digits
+            account_part = account_id_clean[4:]
+            if not account_part.isdigit():
+                self.status_text.set("Error: Ad Account ID must be in format: act_12345678 (numbers after 'act_')")
+                dialog.destroy()
+                return
+            
+            if any(fav["name"] == new_name and fav != selected_fav for fav in self.meta_favorites):
+                self.status_text.set(f"Error: A favorite named '{new_name}' already exists")
+                dialog.destroy()
+                return
+            
+            selected_fav["name"] = new_name
+            selected_fav["account_id"] = account_id_clean
+            self._save_meta_favorites()
+            self._update_meta_favorites_menu()
+            self.settings_meta_favorites_menu.set(new_name)
+            self.status_text.set(f"Updated favorite: {new_name}")
+            self.logger.info(f"Updated Meta Ads favorite: {new_name}")
+            dialog.destroy()
+        
+        button_frame = ctk.CTkFrame(dialog)
+        button_frame.pack(pady=15, padx=20)
+        
+        save_btn = ctk.CTkButton(
+            button_frame,
+            text="Save",
+            command=save_edit,
+            width=100,
+            font=ctk.CTkFont(size=12)
+        )
+        save_btn.pack(side="left", padx=10)
+        
+        cancel_btn = ctk.CTkButton(
+            button_frame,
+            text="Cancel",
+            command=dialog.destroy,
+            width=100,
+            font=ctk.CTkFont(size=12),
+            fg_color="gray",
+            hover_color="darkgray"
+        )
+        cancel_btn.pack(side="left", padx=10)
+        
+        dialog.bind('<Return>', lambda e: save_edit())
+        name_entry.bind('<Return>', lambda e: account_id_entry.focus())
+        account_id_entry.bind('<Return>', lambda e: save_edit())
+    
+    def _show_edit_meta_favorite_dialog(self) -> None:
+        """Show dialog to edit a Meta favorite name (deprecated - use Settings)."""
+        # Redirect to settings method
+        self._on_settings_edit_meta_favorite()
+        
+        aid = self.meta_account_id.get().strip()
+        selected_fav = next((f for f in self.meta_favorites if (f.get("account_id") or "").strip() == aid), None)
+        
+        if not selected_fav:
+            return
+        
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Edit Meta Favorite")
+        dialog.geometry("400x150")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (400 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (150 // 2)
+        dialog.geometry(f"400x150+{x}+{y}")
+        
+        name_var = ctk.StringVar(value=selected_fav["name"])
+        
+        name_label = ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12))
+        name_label.pack(pady=(20, 5), padx=20)
+        
+        name_entry = ctk.CTkEntry(
+            dialog,
+            textvariable=name_var,
+            width=360,
+            font=ctk.CTkFont(size=12)
+        )
+        name_entry.pack(pady=5, padx=20)
+        name_entry.select_range(0, ctk.END)
+        name_entry.focus()
+        
+        def save_edit() -> None:
+            new_name = name_var.get().strip()
+            if not new_name:
+                self.status_text.set("Error: Please enter a name for the favorite")
+                dialog.destroy()
+                return
+            
+            if any(fav["name"] == new_name and fav != selected_fav for fav in self.meta_favorites):
+                self.status_text.set(f"Error: A favorite named '{new_name}' already exists")
+                dialog.destroy()
+                return
+            
+            selected_fav["name"] = new_name
+            self._save_meta_favorites()
+            self._update_meta_favorites_menu()
+            self._set_meta_id_display_from_id()
+            self.status_text.set(f"Updated Meta favorite: {new_name}")
+            dialog.destroy()
+        
+        button_frame = ctk.CTkFrame(dialog)
+        button_frame.pack(pady=15, padx=20)
+        
+        save_btn = ctk.CTkButton(
+            button_frame,
+            text="Save",
+            command=save_edit,
+            width=100,
+            font=ctk.CTkFont(size=12)
+        )
+        save_btn.pack(side="left", padx=10)
+        
+        cancel_btn = ctk.CTkButton(
+            button_frame,
+            text="Cancel",
+            command=dialog.destroy,
+            width=100,
+            font=ctk.CTkFont(size=12),
+            fg_color="gray",
+            hover_color="darkgray"
+        )
+        cancel_btn.pack(side="left", padx=10)
+        
+        dialog.bind('<Return>', lambda e: save_edit())
+        name_entry.bind('<Return>', lambda e: save_edit())
+    
+    def _on_settings_delete_meta_favorite(self) -> None:
+        """Delete the selected Meta Ads favorite from Settings."""
+        if not hasattr(self, 'settings_meta_favorites_menu'):
+            return
+        current_selection = self.settings_meta_favorites_menu.get()
+        if not self.meta_favorites or current_selection == "Select a favorite...":
+            self.status_text.set("Error: Please select a favorite to delete")
+            return
+        
+        result = messagebox.askyesno(
+            "Confirm Delete",
+            f"Are you sure you want to delete the favorite '{current_selection}'?",
+            icon="warning"
+        )
+        
+        if result:
+            self.meta_favorites = [fav for fav in self.meta_favorites if fav["name"] != current_selection]
+            self._save_meta_favorites()
+            self._update_meta_favorites_menu()
+            self.settings_meta_favorites_menu.set("Select a favorite...")
+            self.status_text.set(f"Deleted favorite: {current_selection}")
+            self.logger.info(f"Deleted Meta Ads favorite: {current_selection}")
+    
+    def _delete_meta_favorite(self) -> None:
+        """Delete the selected Meta favorite (deprecated - use Settings)."""
+        # Redirect to settings method
+        self._on_settings_delete_meta_favorite()
+    
+    def _on_ms_default_favorite_changed(self, choice: str) -> None:
+        self.settings["default_ms_favorite"] = None if choice == "None" else choice
+        self._save_settings()
+    
+    def _on_tiktok_default_favorite_changed(self, choice: str) -> None:
+        self.settings["default_tiktok_favorite"] = None if choice == "None" else choice
+        self._save_settings()
+    
+    def _on_reddit_default_favorite_changed(self, choice: str) -> None:
+        self.settings["default_reddit_favorite"] = None if choice == "None" else choice
+        self._save_settings()
+    
+    def _on_pinterest_default_favorite_changed(self, choice: str) -> None:
+        self.settings["default_pinterest_favorite"] = None if choice == "None" else choice
+        self._save_settings()
+    
+    def _on_settings_add_ms_favorite(self) -> None:
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Add Microsoft Ads Favorite")
+        dialog.geometry("450x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        name_var = ctk.StringVar(value="")
+        id_var = ctk.StringVar(value="")
+        ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12)).pack(pady=(20, 5), padx=20)
+        ctk.CTkEntry(dialog, textvariable=name_var, placeholder_text="Enter name", width=410, font=ctk.CTkFont(size=12)).pack(pady=5, padx=20)
+        ctk.CTkLabel(dialog, text="Customer ID (digits):", font=ctk.CTkFont(size=12)).pack(pady=(10, 5), padx=20)
+        ctk.CTkEntry(dialog, textvariable=id_var, placeholder_text="Enter Customer ID", width=410, font=ctk.CTkFont(size=12)).pack(pady=5, padx=20)
+        def save():
+            name, cid = name_var.get().strip(), id_var.get().strip().replace("-", "").replace(" ", "")
+            if not name or not cid or not cid.isdigit():
+                self.status_text.set("Error: Name and valid Customer ID required")
+                dialog.destroy()
+                return
+            if any(f["name"] == name for f in self.ms_favorites):
+                self.status_text.set(f"Error: A favorite named '{name}' already exists")
+                dialog.destroy()
+                return
+            self.ms_favorites.append({"name": name, "customer_id": cid})
+            self._save_ms_favorites()
+            self._update_ms_favorites_combobox()
+            self.status_text.set(f"Added Microsoft Ads favorite: {name}")
+            dialog.destroy()
+        btn_f = ctk.CTkFrame(dialog)
+        btn_f.pack(pady=15, padx=20)
+        ctk.CTkButton(btn_f, text="Save", command=save, width=100, font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
+        ctk.CTkButton(btn_f, text="Cancel", command=dialog.destroy, width=100, font=ctk.CTkFont(size=12), fg_color="gray", hover_color="darkgray").pack(side="left", padx=10)
+    
+    def _on_settings_edit_ms_favorite(self) -> None:
+        if not hasattr(self, 'settings_ms_favorites_menu'):
+            return
+        current = self.settings_ms_favorites_menu.get()
+        if current == "Select a favorite...":
+            self.status_text.set("Error: Select a favorite to edit")
+            return
+        selected = next((f for f in self.ms_favorites if f["name"] == current), None)
+        if not selected:
+            return
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Edit Microsoft Ads Favorite")
+        dialog.geometry("450x180")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        name_var = ctk.StringVar(value=selected["name"])
+        ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12)).pack(pady=(20, 5), padx=20)
+        ctk.CTkEntry(dialog, textvariable=name_var, width=410, font=ctk.CTkFont(size=12)).pack(pady=5, padx=20)
+        def save_edit():
+            new_name = name_var.get().strip()
+            if not new_name:
+                dialog.destroy()
+                return
+            if any(f["name"] == new_name and f != selected for f in self.ms_favorites):
+                self.status_text.set(f"Error: A favorite named '{new_name}' already exists")
+                dialog.destroy()
+                return
+            selected["name"] = new_name
+            self._save_ms_favorites()
+            self._update_ms_favorites_combobox()
+            self.status_text.set(f"Updated: {new_name}")
+            dialog.destroy()
+        btn_f = ctk.CTkFrame(dialog)
+        btn_f.pack(pady=15, padx=20)
+        ctk.CTkButton(btn_f, text="Save", command=save_edit, width=100, font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
+        ctk.CTkButton(btn_f, text="Cancel", command=dialog.destroy, width=100, font=ctk.CTkFont(size=12), fg_color="gray", hover_color="darkgray").pack(side="left", padx=10)
+    
+    def _on_settings_delete_ms_favorite(self) -> None:
+        if not hasattr(self, 'settings_ms_favorites_menu'):
+            return
+        current = self.settings_ms_favorites_menu.get()
+        if current == "Select a favorite...":
+            self.status_text.set("Error: Select a favorite to delete")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Delete favorite '{current}'?", icon="warning"):
+            self.ms_favorites = [f for f in self.ms_favorites if f["name"] != current]
+            self._save_ms_favorites()
+            self._update_ms_favorites_combobox()
+            self.settings_ms_favorites_menu.set("Select a favorite...")
+            self.status_text.set(f"Deleted: {current}")
+    
+    def _on_settings_add_tiktok_favorite(self) -> None:
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Add TikTok Ads Favorite")
+        dialog.geometry("450x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        name_var = ctk.StringVar(value="")
+        id_var = ctk.StringVar(value="")
+        ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12)).pack(pady=(20, 5), padx=20)
+        ctk.CTkEntry(dialog, textvariable=name_var, placeholder_text="Enter name", width=410, font=ctk.CTkFont(size=12)).pack(pady=5, padx=20)
+        ctk.CTkLabel(dialog, text="Advertiser ID:", font=ctk.CTkFont(size=12)).pack(pady=(10, 5), padx=20)
+        ctk.CTkEntry(dialog, textvariable=id_var, placeholder_text="Enter Advertiser ID", width=410, font=ctk.CTkFont(size=12)).pack(pady=5, padx=20)
+        def save():
+            name, aid = name_var.get().strip(), id_var.get().strip()
+            if not name or not aid:
+                self.status_text.set("Error: Name and Advertiser ID required")
+                dialog.destroy()
+                return
+            if any(f["name"] == name for f in self.tiktok_favorites):
+                self.status_text.set(f"Error: A favorite named '{name}' already exists")
+                dialog.destroy()
+                return
+            self.tiktok_favorites.append({"name": name, "advertiser_id": aid})
+            self._save_tiktok_favorites()
+            self._update_tiktok_favorites_combobox()
+            self.status_text.set(f"Added TikTok Ads favorite: {name}")
+            dialog.destroy()
+        btn_f = ctk.CTkFrame(dialog)
+        btn_f.pack(pady=15, padx=20)
+        ctk.CTkButton(btn_f, text="Save", command=save, width=100, font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
+        ctk.CTkButton(btn_f, text="Cancel", command=dialog.destroy, width=100, font=ctk.CTkFont(size=12), fg_color="gray", hover_color="darkgray").pack(side="left", padx=10)
+    
+    def _on_settings_edit_tiktok_favorite(self) -> None:
+        if not hasattr(self, 'settings_tiktok_favorites_menu'):
+            return
+        current = self.settings_tiktok_favorites_menu.get()
+        if current == "Select a favorite...":
+            self.status_text.set("Error: Select a favorite to edit")
+            return
+        selected = next((f for f in self.tiktok_favorites if f["name"] == current), None)
+        if not selected:
+            return
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Edit TikTok Ads Favorite")
+        dialog.geometry("450x180")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        name_var = ctk.StringVar(value=selected["name"])
+        ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12)).pack(pady=(20, 5), padx=20)
+        ctk.CTkEntry(dialog, textvariable=name_var, width=410, font=ctk.CTkFont(size=12)).pack(pady=5, padx=20)
+        def save_edit():
+            new_name = name_var.get().strip()
+            if not new_name:
+                dialog.destroy()
+                return
+            if any(f["name"] == new_name and f != selected for f in self.tiktok_favorites):
+                self.status_text.set(f"Error: A favorite named '{new_name}' already exists")
+                dialog.destroy()
+                return
+            selected["name"] = new_name
+            self._save_tiktok_favorites()
+            self._update_tiktok_favorites_combobox()
+            self.status_text.set(f"Updated: {new_name}")
+            dialog.destroy()
+        btn_f = ctk.CTkFrame(dialog)
+        btn_f.pack(pady=15, padx=20)
+        ctk.CTkButton(btn_f, text="Save", command=save_edit, width=100, font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
+        ctk.CTkButton(btn_f, text="Cancel", command=dialog.destroy, width=100, font=ctk.CTkFont(size=12), fg_color="gray", hover_color="darkgray").pack(side="left", padx=10)
+    
+    def _on_settings_delete_tiktok_favorite(self) -> None:
+        if not hasattr(self, 'settings_tiktok_favorites_menu'):
+            return
+        current = self.settings_tiktok_favorites_menu.get()
+        if current == "Select a favorite...":
+            self.status_text.set("Error: Select a favorite to delete")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Delete favorite '{current}'?", icon="warning"):
+            self.tiktok_favorites = [f for f in self.tiktok_favorites if f["name"] != current]
+            self._save_tiktok_favorites()
+            self._update_tiktok_favorites_combobox()
+            self.settings_tiktok_favorites_menu.set("Select a favorite...")
+            self.status_text.set(f"Deleted: {current}")
+    
+    def _on_settings_add_reddit_favorite(self) -> None:
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Add Reddit Ads Favorite")
+        dialog.geometry("450x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        name_var = ctk.StringVar(value="")
+        id_var = ctk.StringVar(value="")
+        ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12)).pack(pady=(20, 5), padx=20)
+        ctk.CTkEntry(dialog, textvariable=name_var, placeholder_text="Enter name", width=410, font=ctk.CTkFont(size=12)).pack(pady=5, padx=20)
+        ctk.CTkLabel(dialog, text="Account ID:", font=ctk.CTkFont(size=12)).pack(pady=(10, 5), padx=20)
+        ctk.CTkEntry(dialog, textvariable=id_var, placeholder_text="Enter Account ID", width=410, font=ctk.CTkFont(size=12)).pack(pady=5, padx=20)
+        def save():
+            name, aid = name_var.get().strip(), id_var.get().strip()
+            if not name or not aid:
+                self.status_text.set("Error: Name and Account ID required")
+                dialog.destroy()
+                return
+            if any(f["name"] == name for f in self.reddit_favorites):
+                self.status_text.set(f"Error: A favorite named '{name}' already exists")
+                dialog.destroy()
+                return
+            self.reddit_favorites.append({"name": name, "account_id": aid})
+            self._save_reddit_favorites()
+            self._update_reddit_favorites_combobox()
+            self.status_text.set(f"Added Reddit Ads favorite: {name}")
+            dialog.destroy()
+        btn_f = ctk.CTkFrame(dialog)
+        btn_f.pack(pady=15, padx=20)
+        ctk.CTkButton(btn_f, text="Save", command=save, width=100, font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
+        ctk.CTkButton(btn_f, text="Cancel", command=dialog.destroy, width=100, font=ctk.CTkFont(size=12), fg_color="gray", hover_color="darkgray").pack(side="left", padx=10)
+    
+    def _on_settings_edit_reddit_favorite(self) -> None:
+        if not hasattr(self, 'settings_reddit_favorites_menu'):
+            return
+        current = self.settings_reddit_favorites_menu.get()
+        if current == "Select a favorite...":
+            self.status_text.set("Error: Select a favorite to edit")
+            return
+        selected = next((f for f in self.reddit_favorites if f["name"] == current), None)
+        if not selected:
+            return
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Edit Reddit Ads Favorite")
+        dialog.geometry("450x180")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        name_var = ctk.StringVar(value=selected["name"])
+        ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12)).pack(pady=(20, 5), padx=20)
+        ctk.CTkEntry(dialog, textvariable=name_var, width=410, font=ctk.CTkFont(size=12)).pack(pady=5, padx=20)
+        def save_edit():
+            new_name = name_var.get().strip()
+            if not new_name:
+                dialog.destroy()
+                return
+            if any(f["name"] == new_name and f != selected for f in self.reddit_favorites):
+                self.status_text.set(f"Error: A favorite named '{new_name}' already exists")
+                dialog.destroy()
+                return
+            selected["name"] = new_name
+            self._save_reddit_favorites()
+            self._update_reddit_favorites_combobox()
+            self.status_text.set(f"Updated: {new_name}")
+            dialog.destroy()
+        btn_f = ctk.CTkFrame(dialog)
+        btn_f.pack(pady=15, padx=20)
+        ctk.CTkButton(btn_f, text="Save", command=save_edit, width=100, font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
+        ctk.CTkButton(btn_f, text="Cancel", command=dialog.destroy, width=100, font=ctk.CTkFont(size=12), fg_color="gray", hover_color="darkgray").pack(side="left", padx=10)
+    
+    def _on_settings_delete_reddit_favorite(self) -> None:
+        if not hasattr(self, 'settings_reddit_favorites_menu'):
+            return
+        current = self.settings_reddit_favorites_menu.get()
+        if current == "Select a favorite...":
+            self.status_text.set("Error: Select a favorite to delete")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Delete favorite '{current}'?", icon="warning"):
+            self.reddit_favorites = [f for f in self.reddit_favorites if f["name"] != current]
+            self._save_reddit_favorites()
+            self._update_reddit_favorites_combobox()
+            self.settings_reddit_favorites_menu.set("Select a favorite...")
+            self.status_text.set(f"Deleted: {current}")
+    
+    def _on_settings_add_pinterest_favorite(self) -> None:
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Add Pinterest Ads Favorite")
+        dialog.geometry("450x200")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        name_var = ctk.StringVar(value="")
+        id_var = ctk.StringVar(value="")
+        ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12)).pack(pady=(20, 5), padx=20)
+        ctk.CTkEntry(dialog, textvariable=name_var, placeholder_text="Enter name", width=410, font=ctk.CTkFont(size=12)).pack(pady=5, padx=20)
+        ctk.CTkLabel(dialog, text="Advertiser ID:", font=ctk.CTkFont(size=12)).pack(pady=(10, 5), padx=20)
+        ctk.CTkEntry(dialog, textvariable=id_var, placeholder_text="Enter Advertiser ID", width=410, font=ctk.CTkFont(size=12)).pack(pady=5, padx=20)
+        def save():
+            name, aid = name_var.get().strip(), id_var.get().strip()
+            if not name or not aid:
+                self.status_text.set("Error: Name and Advertiser ID required")
+                dialog.destroy()
+                return
+            if any(f["name"] == name for f in self.pinterest_favorites):
+                self.status_text.set(f"Error: A favorite named '{name}' already exists")
+                dialog.destroy()
+                return
+            self.pinterest_favorites.append({"name": name, "advertiser_id": aid})
+            self._save_pinterest_favorites()
+            self._update_pinterest_favorites_combobox()
+            self.status_text.set(f"Added Pinterest Ads favorite: {name}")
+            dialog.destroy()
+        btn_f = ctk.CTkFrame(dialog)
+        btn_f.pack(pady=15, padx=20)
+        ctk.CTkButton(btn_f, text="Save", command=save, width=100, font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
+        ctk.CTkButton(btn_f, text="Cancel", command=dialog.destroy, width=100, font=ctk.CTkFont(size=12), fg_color="gray", hover_color="darkgray").pack(side="left", padx=10)
+    
+    def _on_settings_edit_pinterest_favorite(self) -> None:
+        if not hasattr(self, 'settings_pinterest_favorites_menu'):
+            return
+        current = self.settings_pinterest_favorites_menu.get()
+        if current == "Select a favorite...":
+            self.status_text.set("Error: Select a favorite to edit")
+            return
+        selected = next((f for f in self.pinterest_favorites if f["name"] == current), None)
+        if not selected:
+            return
+        dialog = ctk.CTkToplevel(self.root)
+        dialog.title("Edit Pinterest Ads Favorite")
+        dialog.geometry("450x180")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        name_var = ctk.StringVar(value=selected["name"])
+        ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12)).pack(pady=(20, 5), padx=20)
+        ctk.CTkEntry(dialog, textvariable=name_var, width=410, font=ctk.CTkFont(size=12)).pack(pady=5, padx=20)
+        def save_edit():
+            new_name = name_var.get().strip()
+            if not new_name:
+                dialog.destroy()
+                return
+            if any(f["name"] == new_name and f != selected for f in self.pinterest_favorites):
+                self.status_text.set(f"Error: A favorite named '{new_name}' already exists")
+                dialog.destroy()
+                return
+            selected["name"] = new_name
+            self._save_pinterest_favorites()
+            self._update_pinterest_favorites_combobox()
+            self.status_text.set(f"Updated: {new_name}")
+            dialog.destroy()
+        btn_f = ctk.CTkFrame(dialog)
+        btn_f.pack(pady=15, padx=20)
+        ctk.CTkButton(btn_f, text="Save", command=save_edit, width=100, font=ctk.CTkFont(size=12)).pack(side="left", padx=10)
+        ctk.CTkButton(btn_f, text="Cancel", command=dialog.destroy, width=100, font=ctk.CTkFont(size=12), fg_color="gray", hover_color="darkgray").pack(side="left", padx=10)
+    
+    def _on_settings_delete_pinterest_favorite(self) -> None:
+        if not hasattr(self, 'settings_pinterest_favorites_menu'):
+            return
+        current = self.settings_pinterest_favorites_menu.get()
+        if current == "Select a favorite...":
+            self.status_text.set("Error: Select a favorite to delete")
+            return
+        if messagebox.askyesno("Confirm Delete", f"Delete favorite '{current}'?", icon="warning"):
+            self.pinterest_favorites = [f for f in self.pinterest_favorites if f["name"] != current]
+            self._save_pinterest_favorites()
+            self._update_pinterest_favorites_combobox()
+            self.settings_pinterest_favorites_menu.set("Select a favorite...")
+            self.status_text.set(f"Deleted: {current}")
+    
+    def run(self) -> None:
+        """Start the GUI application."""
+        try:
+            self.root.mainloop()
+        except Exception as e:
+            self.logger.error(f"Fatal error in GUI: {e}", exc_info=True)
+
+
+def main() -> None:
+    """Entry point for the application."""
+    try:
+        app = AdsReportFetcherApp()
+        app.run()
+    except Exception as e:
+        logging.basicConfig(
+            level=logging.ERROR,
+            format='%(asctime)s - %(levelname)s - %(message)s',
+            datefmt='%Y-%m-%d %I:%M:%S %p',
+            handlers=[logging.FileHandler('app_debug.log')]
+        )
+        logger = logging.getLogger(__name__)
+        logger.error(f"Fatal error: {e}", exc_info=True)
+
+
+if __name__ == "__main__":
+    main()
