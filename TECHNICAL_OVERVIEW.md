@@ -10,7 +10,7 @@
 - **Favorites**: Saved customer/account favorites (Google and Meta) with dropdown selection; favorites are edited in the Settings tab.
 - **Pipeline actions**:
   - **New Fetch**: Unlocks inputs so a new fetch can be configured (enabled after a fetch completes).
-  - **Run Full Pipeline**: Loops through only the platforms currently selected in the GUI; fetches each ready platform (locked ID + date range), then processes and merges. Requires no existing data (or user must clear data first).
+  - **Run Full Pipeline**: Loops through only the platforms currently selected in the GUI; fetches each ready platform (valid ID and confirmed date range), then processes and merges. Requires no existing data (or user must clear data first).
   - **Process All Data**: Processes all raw CSVs in `raw_reports/` and runs the merge step (no fetch).
   - **Clear All Data**: Deletes all CSV files in `raw_reports/`, `processed_reports/`, and `merged_reports/` (with confirmation).
 - **Pipeline status**: Checklist shows readiness for Google Ads, Meta Ads, and “has data”; Run Full Pipeline is enabled only when both platforms are ready and there is no existing data.
@@ -50,7 +50,7 @@ File naming: `{month_abbrev}_{year}.csv` (e.g. `jan_2025.csv`). Processor discov
 
 ## Workflow
 
-- **Google Ads tab**: User sets Customer ID and date range (start/end month–year), optionally picks a favorite. “Lock” confirms ID and date range; “Start Google Fetch” runs the API fetcher for each month in the range. Progress and status are shown in the UI and log.
+- **Google Ads tab**: User sets Customer ID and date range (start/end month–year), optionally picks a favorite. “Confirm Date Range” locks the date range for all platforms; “Start Google Fetch” runs the API fetcher for each month in the range. Progress and status are shown in the UI and log.
 - **Meta Ads tab**: Same idea with Account ID (e.g. `act_123`) and date range; “Start Meta Fetch” runs the Meta fetcher. If the token is expired, the app catches `MetaTokenExpiredError`, prompts for a new token, and (if configured) can update `meta-ads.yaml` and retry.
 - **Run Full Pipeline**: Runs only the platforms currently selected in the GUI (Google, Meta, Microsoft, TikTok, Reddit, Pinterest). For each selected and ready platform, runs its fetch step, then process-all, then merge. Pipeline progress bar and status text reflect current step.
 - **Process All Data**: No fetch; finds all raw CSVs, runs process-all and merge. Useful when raw data already exists or after manual edits.

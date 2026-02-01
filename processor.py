@@ -222,7 +222,7 @@ class ReportProcessor:
         
         # Step 2: Auto-rules (check for Brand/Branded keywords)
         campaign_lower = campaign_name.lower()
-        for keyword in self.BOTTOM_FUNNEL_KEYWORDS:
+        for keyword in BOTTOM_FUNNEL_KEYWORDS:
             if keyword.lower() in campaign_lower:
                 # Auto-assign and save to mappings
                 self.campaign_mappings[campaign_name] = "Bottom"

@@ -5,7 +5,9 @@ Main window for the desktop application (Multi-Platform).
 
 import customtkinter as ctk
 import logging
+import queue
 import threading
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, Tuple, List, Dict
@@ -13,6 +15,9 @@ import tkinter.filedialog as filedialog
 import tkinter.scrolledtext as scrolledtext
 import tkinter.messagebox as messagebox
 import json
+import urllib.error
+import urllib.parse
+import urllib.request
 import yaml
 from api_fetcher import AdsApiFetcher
 from meta_fetcher import MetaAdsFetcher, MetaTokenExpiredError
@@ -59,12 +64,15 @@ class AdsReportFetcherApp:
         ctk.set_appearance_mode(theme_mode)
         ctk.set_default_color_theme("blue")
         
-        # Create main window
+        # Create main window: default size must fit header + 3-column cards + scrollbar + log (no cutoff)
         self.root = ctk.CTk()
         self.root.title("Ads Report Fetcher (Multi-Platform)")
-        self.root.geometry("800x900")
+        self.root.geometry("960x1000")
         self.root.resizable(True, True)
-        self.root.minsize(800, 850)
+        # Min width: 3 cards (~240px each) + padx + scrollbar; min height: cards + log
+        _min_w = 900
+        _min_h = 750
+        self.root.minsize(_min_w, _min_h)
         
         # Month names for dropdowns
         self.month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun", 
@@ -113,12 +121,6 @@ class AdsReportFetcherApp:
         self.meta_token_updated = threading.Event()
         self.date_range_locked = False
         self.meta_date_range_locked = False
-        self.customer_id_locked = False
-        self.meta_account_id_locked = False
-        self.ms_customer_id_locked = False
-        self.tiktok_account_id_locked = False
-        self.reddit_account_id_locked = False
-        self.pinterest_account_id_locked = False
         # Note: output_dir is no longer used - each platform has its own directory
         
         # Favorites (Google Ads)
@@ -147,6 +149,8 @@ class AdsReportFetcherApp:
         # Create widgets
         self._create_widgets()
         
+        # Thread-safe log queue so worker threads never touch Tk (avoids deadlock)
+        self._log_queue = queue.Queue()
         # Start logging handler for GUI
         self._setup_gui_logging()
         
@@ -166,23 +170,35 @@ class AdsReportFetcherApp:
             self.root.destroy()
     
     def _setup_gui_logging(self) -> None:
-        """Setup logging to also output to the GUI log box."""
+        """Setup logging to also output to the GUI log box. Handler only enqueues; main thread drains (avoids Tk deadlock from worker threads)."""
         class GUILogHandler(logging.Handler):
-            def __init__(self, text_widget):
+            def __init__(self, log_queue):
                 super().__init__()
-                self.text_widget = text_widget
-            
+                self.log_queue = log_queue
+
             def emit(self, record):
-                msg = self.format(record)
-                def append():
-                    self.text_widget.insert("end", msg + "\n")
-                    self.text_widget.see("end")
-                self.text_widget.after(0, append)
-        
-        gui_handler = GUILogHandler(self.log_textbox)
+                try:
+                    msg = self.format(record)
+                    self.log_queue.put_nowait(msg)
+                except Exception:
+                    self.handleError(record)
+
+        gui_handler = GUILogHandler(self._log_queue)
         gui_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %I:%M:%S %p'))
         gui_handler.setLevel(logging.INFO)
         logging.getLogger().addHandler(gui_handler)
+        self.root.after(100, self._drain_log_queue)
+
+    def _drain_log_queue(self) -> None:
+        """Run on main thread only: drain log queue and append to Live Log. Reschedule to keep draining."""
+        try:
+            while True:
+                msg = self._log_queue.get_nowait()
+                self.log_textbox.insert("end", msg + "\n")
+                self.log_textbox.see("end")
+        except queue.Empty:
+            pass
+        self.root.after(100, self._drain_log_queue)
     
     def _create_widgets(self) -> None:
         """Create and layout all GUI widgets. Live Log pinned at bottom (grid row 1); content fills rest (grid row 0)."""
@@ -191,7 +207,7 @@ class AdsReportFetcherApp:
         content_frame.grid(row=0, column=0, sticky="nsew")
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
-        content_frame.grid_rowconfigure(2, weight=1)
+        content_frame.grid_rowconfigure(3, weight=1)
         content_frame.grid_columnconfigure(0, weight=1)
 
         # Title
@@ -231,158 +247,94 @@ class AdsReportFetcherApp:
             fg_color="#8B0000", hover_color="#A00000", border_width=2, border_color="#FF4500", corner_radius=8
         )
         self.clear_data_button.pack(side="left", padx=pad)
-
-        # Tabview: Main (control panel, sources, accounts, action bar) and Settings
-        self.tabview = ctk.CTkTabview(content_frame, width=760, height=500)
-        self.tabview.grid(row=2, column=0, pady=10, padx=20, sticky="nsew")
-        
-        self.main_tab = self.tabview.add("Main")
-        self.settings_tab = self.tabview.add("Settings")
-        
-        self._create_main_tab()
-        self._create_settings_tab()
-
-        # Checklist/Status (below tabview, inside content area)
-        self._create_checklist_section(content_frame)
-        self.checklist_frame.grid(row=3, column=0, pady=(0, 10), padx=20, sticky="ew")
-
-        # Live Log pinned at bottom (grid row 1, weight=0)
-        log_frame = self._create_shared_log_area()
-        log_frame.grid(row=1, column=0, sticky="ew")
-        self.root.grid_rowconfigure(1, weight=0)
-    
-    def _create_checklist_section(self, parent: Optional[ctk.CTkFrame] = None) -> None:
-        """Create checklist/status indicators showing readiness for each step."""
-        _parent = parent if parent is not None else self.root
-        checklist_frame = ctk.CTkFrame(_parent)
-        # Caller grids this frame (e.g. content_frame row 3)
-        
-        checklist_title = ctk.CTkLabel(
-            checklist_frame,
-            text="Pipeline Status:",
-            font=ctk.CTkFont(size=12, weight="bold")
-        )
-        checklist_title.pack(anchor="w", padx=10, pady=(8, 5))
-        
-        # Status indicators frame
-        status_frame = ctk.CTkFrame(checklist_frame)
-        status_frame.pack(pady=(0, 5), padx=10, fill="x")
-        
-        # Google Ads status
-        self.google_status_label = ctk.CTkLabel(
-            status_frame,
-            text="☐ Google Ads",
-            font=ctk.CTkFont(size=11),
-            text_color="gray"
-        )
-        self.google_status_label.pack(side="left", padx=10, pady=5)
-        
-        # Meta Ads status
-        self.meta_status_label = ctk.CTkLabel(
-            status_frame,
-            text="☐ Meta Ads",
-            font=ctk.CTkFont(size=11),
-            text_color="gray"
-        )
-        self.meta_status_label.pack(side="left", padx=10, pady=5)
-
-        # Microsoft Ads status
-        self.ms_status_label = ctk.CTkLabel(
-            status_frame,
-            text="☐ Microsoft Ads",
-            font=ctk.CTkFont(size=11),
-            text_color="gray"
-        )
-        self.ms_status_label.pack(side="left", padx=10, pady=5)
-        self.tiktok_status_label = ctk.CTkLabel(status_frame, text="☐ TikTok Ads", font=ctk.CTkFont(size=11), text_color="gray")
-        self.tiktok_status_label.pack(side="left", padx=10, pady=5)
-        self.reddit_status_label = ctk.CTkLabel(status_frame, text="☐ Reddit Ads", font=ctk.CTkFont(size=11), text_color="gray")
-        self.reddit_status_label.pack(side="left", padx=10, pady=5)
-        self.pinterest_status_label = ctk.CTkLabel(status_frame, text="☐ Pinterest Ads", font=ctk.CTkFont(size=11), text_color="gray")
-        self.pinterest_status_label.pack(side="left", padx=10, pady=5)
-
-        # Data status
+        # Data guardrail: show data presence next to Clear All Data
         self.data_status_label = ctk.CTkLabel(
-            status_frame,
-            text="☐ No existing data",
-            font=ctk.CTkFont(size=11),
-            text_color="gray"
+            header_frame, text="✓ No existing data", font=ctk.CTkFont(size=11), text_color="#90EE90"
         )
-        self.data_status_label.pack(side="left", padx=10, pady=5)
-        
-        # Store reference for updates
-        self.checklist_frame = checklist_frame
-        
-        # Pipeline progress bar (initially hidden)
-        self.pipeline_progress_frame = ctk.CTkFrame(checklist_frame)
-        self.pipeline_progress_frame.pack(pady=(5, 8), padx=10, fill="x")
-        
-        self.pipeline_progress_bar = ctk.CTkProgressBar(self.pipeline_progress_frame)
-        self.pipeline_progress_bar.pack(pady=5, padx=10, fill="x")
+        self.data_status_label.pack(side="left", padx=(pad, 0))
+
+        # Status message and progress bar directly beneath header (visible during pipeline run)
+        header_status_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
+        header_status_frame.grid(row=2, column=0, pady=(0, 4), padx=20, sticky="ew")
+        content_frame.columnconfigure(0, weight=1)
+        # Global status label (token save, errors, etc.) - so messages are visible from any tab
+        ctk.CTkLabel(header_status_frame, text="Status:", font=ctk.CTkFont(size=10), text_color="#A0A0A0").pack(side="left", padx=(0, 6))
+        self.global_status_label = ctk.CTkLabel(
+            header_status_frame, textvariable=self.status_text, font=ctk.CTkFont(size=10), text_color="#C0C0C0"
+        )
+        self.global_status_label.pack(side="left", padx=0, fill="x", expand=True)
+        self.pipeline_status_label = ctk.CTkLabel(
+            header_status_frame, text="", font=ctk.CTkFont(size=10), text_color="#A0A0A0"
+        )
+        self.pipeline_status_label.pack(side="left", padx=(15, 0))
+        self.pipeline_progress_frame = ctk.CTkFrame(header_status_frame, fg_color="transparent")
+        self.pipeline_progress_bar = ctk.CTkProgressBar(self.pipeline_progress_frame, width=200)
+        self.pipeline_progress_bar.pack(side="left", padx=(10, 0))
         self.pipeline_progress_bar.set(0)
         self.pipeline_progress_bar.configure(progress_color="#0066CC", fg_color="#2B2B2B")
-        
-        self.pipeline_status_label = ctk.CTkLabel(
-            self.pipeline_progress_frame,
-            text="",
-            font=ctk.CTkFont(size=10),
-            text_color="#A0A0A0"
-        )
-        self.pipeline_status_label.pack(pady=(0, 5))
-        
-        # Initially hide progress bar
+        self.pipeline_progress_frame.pack(side="left")
         self.pipeline_progress_frame.pack_forget()
-        
-        # Update statuses
+
+        # Tabview: wide/tall enough so Main tab (control + cards + actions) fits without scroll
+        self.tabview = ctk.CTkTabview(content_frame, width=920, height=580)
+        self.tabview.grid(row=3, column=0, pady=10, padx=20, sticky="nsew")
+        self.main_tab = self.tabview.add("Main")
+        self.settings_tab = self.tabview.add("Settings")
+        self._create_main_tab()
+        self._create_settings_tab()
         self._update_checklist_statuses()
+
+        # Live Log pinned at bottom (grid row 1, weight=0 so it keeps consistent height)
+        log_frame = self._create_shared_log_area()
+        log_frame.grid(row=1, column=0, sticky="ew")
+        self.root.grid_rowconfigure(0, weight=1)
+        self.root.grid_rowconfigure(1, weight=0)
     
     def _update_checklist_statuses(self) -> None:
-        """Update checklist status indicators."""
-        # Check Google Ads readiness (both ID and date range must be locked)
+        """Update Source Selection checkboxes with readiness (✓ when ready), data label, and button states."""
+        # Check readiness per platform (valid ID and date range confirmed)
         is_valid_google, _ = self._validate_inputs()
-        google_ready = is_valid_google and self.customer_id_locked and self.date_range_locked
-        google_text = "✓ Google Ads" if google_ready else "☐ Google Ads"
-        google_color = "#90EE90" if google_ready else "gray"
-        self.google_status_label.configure(text=google_text, text_color=google_color)
-        
-        # Check Meta Ads readiness (both ID and date range must be locked)
+        google_ready = is_valid_google and self.date_range_locked
         is_valid_meta, _ = self._validate_meta_inputs()
-        meta_ready = is_valid_meta and self.meta_account_id_locked and self.meta_date_range_locked
-        meta_text = "✓ Meta Ads" if meta_ready else "☐ Meta Ads"
-        meta_color = "#90EE90" if meta_ready else "gray"
-        self.meta_status_label.configure(text=meta_text, text_color=meta_color)
-
-        # Check Microsoft Ads readiness (ID and global date range locked)
+        meta_ready = is_valid_meta and self.meta_date_range_locked
         ms_cid = (self.ms_customer_id.get() or "").strip().replace("-", "").replace(" ", "")
         is_valid_ms = bool(ms_cid and ms_cid.isdigit())
-        ms_ready = is_valid_ms and self.ms_customer_id_locked and self.date_range_locked
-        ms_text = "✓ Microsoft Ads" if ms_ready else "☐ Microsoft Ads"
-        ms_color = "#90EE90" if ms_ready else "gray"
-        self.ms_status_label.configure(text=ms_text, text_color=ms_color)
-        tiktok_ready = self.tiktok_account_id_locked and self.date_range_locked and bool((self.tiktok_account_id.get() or "").strip())
-        self.tiktok_status_label.configure(text="✓ TikTok Ads" if tiktok_ready else "☐ TikTok Ads", text_color="#90EE90" if tiktok_ready else "gray")
-        reddit_ready = self.reddit_account_id_locked and self.date_range_locked and bool((self.reddit_account_id.get() or "").strip())
-        self.reddit_status_label.configure(text="✓ Reddit Ads" if reddit_ready else "☐ Reddit Ads", text_color="#90EE90" if reddit_ready else "gray")
-        pinterest_ready = self.pinterest_account_id_locked and self.date_range_locked and bool((self.pinterest_account_id.get() or "").strip())
-        self.pinterest_status_label.configure(text="✓ Pinterest Ads" if pinterest_ready else "☐ Pinterest Ads", text_color="#90EE90" if pinterest_ready else "gray")
+        ms_ready = is_valid_ms and self.date_range_locked
+        tiktok_ready = self.date_range_locked and bool((self.tiktok_account_id.get() or "").strip())
+        reddit_ready = self.date_range_locked and bool((self.reddit_account_id.get() or "").strip())
+        pinterest_ready = self.date_range_locked and bool((self.pinterest_account_id.get() or "").strip())
 
-        # Check data status - scan output folders for CSV files
+        # Update Platform Card status labels: Ready / ID Missing / Date not confirmed
+        def _status_text(ready: bool, has_id: bool) -> str:
+            if ready:
+                return "Ready"
+            if not has_id:
+                return "ID Missing"
+            return "Date not confirmed"
+        def _status_color(ready: bool) -> str:
+            return "#90EE90" if ready else "gray"
+        self.google_card_status_label.configure(text=_status_text(google_ready, is_valid_google), text_color=_status_color(google_ready))
+        self.meta_card_status_label.configure(text=_status_text(meta_ready, is_valid_meta), text_color=_status_color(meta_ready))
+        self.ms_card_status_label.configure(text=_status_text(ms_ready, is_valid_ms), text_color=_status_color(ms_ready))
+        self.tiktok_card_status_label.configure(text=_status_text(tiktok_ready, bool((self.tiktok_account_id.get() or "").strip())), text_color=_status_color(tiktok_ready))
+        self.reddit_card_status_label.configure(text=_status_text(reddit_ready, bool((self.reddit_account_id.get() or "").strip())), text_color=_status_color(reddit_ready))
+        self.pinterest_card_status_label.configure(text=_status_text(pinterest_ready, bool((self.pinterest_account_id.get() or "").strip())), text_color=_status_color(pinterest_ready))
+
+        # Data guardrail: update label next to Clear All Data (top)
         google_dir = Path("raw_reports/google")
         meta_dir = Path("raw_reports/meta")
         merged_dir = Path("merged_reports")
         google_has_data = google_dir.exists() and any(google_dir.glob("*.csv"))
         meta_has_data = meta_dir.exists() and any(meta_dir.glob("*.csv"))
         merged_has_data = merged_dir.exists() and any(merged_dir.glob("*.csv"))
-        
-        if google_has_data or meta_has_data or merged_has_data:
-            data_text = "☐ Data present"
-            data_color = "#FF6B6B"  # Red
+        has_csv_files = google_has_data or meta_has_data or merged_has_data
+        if has_csv_files:
+            data_text, data_color = "☐ Data present", "#FF6B6B"
         else:
-            data_text = "✓ No existing data"
-            data_color = "#90EE90"  # Light green
+            data_text, data_color = "✓ No existing data", "#90EE90"
         self.data_status_label.configure(text=data_text, text_color=data_color)
-        
-        # Update Run Full Pipeline button state: at least one selected platform ready, and no data
+
+        # Run Full Pipeline: enabled only when at least one selected platform ready AND no data; gray when disabled
         google_selected = self.source_google_var.get()
         meta_selected = self.source_meta_var.get()
         ms_selected = self.source_ms_var.get()
@@ -397,21 +349,22 @@ class AdsReportFetcherApp:
             or (reddit_selected and reddit_ready)
             or (pinterest_selected and pinterest_ready)
         )
-        no_data = data_text == "✓ No existing data"
+        no_data = not has_csv_files
         all_ready = any_ready and no_data
         self.root.after(0, lambda: self.run_full_pipeline_button.configure(
-            state="normal" if all_ready else "disabled"
+            state="normal" if all_ready else "disabled",
+            fg_color="#0066CC" if all_ready else "gray",
+            hover_color="#0052A3" if all_ready else "darkgray"
         ))
-        
-        # Update Clear All Data button state
-        has_csv_files = google_has_data or meta_has_data or merged_has_data
+
+        # Clear All Data button state
         self.root.after(0, lambda: self.clear_data_button.configure(
             fg_color="#8B0000" if has_csv_files else "gray",
             hover_color="#A00000" if has_csv_files else "darkgray",
             state="normal" if has_csv_files else "disabled"
         ))
-        
-        # Update platform-specific process buttons
+
+        # Platform-specific process buttons
         self.root.after(0, lambda: self.google_process_button.configure(
             state="normal" if google_has_data else "disabled",
             fg_color="orange" if google_has_data else "gray",
@@ -423,31 +376,6 @@ class AdsReportFetcherApp:
             hover_color="darkorange" if meta_has_data else "darkgray"
         ))
 
-        # Lock All / Unlock All IDs button states
-        any_selected = (
-            google_selected or meta_selected or ms_selected
-            or tiktok_selected or reddit_selected or pinterest_selected
-        )
-        any_selected_unlocked = (
-            (google_selected and not self.customer_id_locked)
-            or (meta_selected and not self.meta_account_id_locked)
-            or (ms_selected and not self.ms_customer_id_locked)
-            or (tiktok_selected and not self.tiktok_account_id_locked)
-            or (reddit_selected and not self.reddit_account_id_locked)
-            or (pinterest_selected and not self.pinterest_account_id_locked)
-        )
-        any_locked = (
-            self.customer_id_locked or self.meta_account_id_locked or self.ms_customer_id_locked
-            or self.tiktok_account_id_locked or self.reddit_account_id_locked or self.pinterest_account_id_locked
-        )
-        if hasattr(self, "lock_all_ids_btn"):
-            self.lock_all_ids_btn.configure(
-                state="normal" if (any_selected and any_selected_unlocked) else "disabled"
-            )
-        if hasattr(self, "unlock_all_ids_btn"):
-            self.unlock_all_ids_btn.configure(
-                state="normal" if any_locked else "disabled"
-            )
     
     def _create_process_section(self) -> None:
         """Create process section between tabs and log."""
@@ -556,216 +484,129 @@ class AdsReportFetcherApp:
         self.unlock_date_btn = ctk.CTkButton(date_btn_frame, text="Unlock", command=self._unlock_date_range_global, font=ctk.CTkFont(size=10), width=80, height=30, fg_color="gray", hover_color="darkgray", state="disabled")
         self.unlock_date_btn.pack(side="left", padx=5)
         
-        # --- Scrollable: Source Selection + Accounts (450px; keeps Live Log pinned and visible) ---
-        self.main_scrollable = ctk.CTkScrollableFrame(self.main_tab, height=450, fg_color="transparent")
-        self.main_scrollable.pack(pady=6, padx=20, fill="x", expand=False)
+        # --- Scrollable: 3x2 grid of Platform Cards (expands to fill; scrollbar only when window shrunk)
+        # Platform section and scrollbar use different shades to differentiate
+        PLATFORM_SECTION_BG = ("#e8e8e8", "#2a2a2a")
+        SCROLLBAR_FG = ("#d0d0d0", "#1e1e1e")
+        SCROLLBAR_BUTTON = ("#b0b0b0", "#333333")
+        SCROLLBAR_BUTTON_HOVER = ("#909090", "#444444")
+        self.main_scrollable = ctk.CTkScrollableFrame(
+            self.main_tab,
+            fg_color=PLATFORM_SECTION_BG,
+            corner_radius=8,
+            scrollbar_fg_color=SCROLLBAR_FG,
+            scrollbar_button_color=SCROLLBAR_BUTTON,
+            scrollbar_button_hover_color=SCROLLBAR_BUTTON_HOVER,
+        )
+        self.main_scrollable.pack(pady=6, padx=20, fill="both", expand=True)
 
-        # Source Selection
-        source_frame = ctk.CTkFrame(self.main_scrollable, fg_color="transparent")
-        source_frame.pack(pady=4, padx=0, fill="x")
-        ctk.CTkLabel(source_frame, text="Source Selection", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=0, pady=(0, 3))
-        inner_src = ctk.CTkFrame(source_frame, fg_color="transparent")
-        inner_src.pack(pady=(0, 4), fill="x")
         self.source_google_var = ctk.BooleanVar(value=True)
         self.source_meta_var = ctk.BooleanVar(value=True)
         self.source_ms_var = ctk.BooleanVar(value=False)
         self.source_tiktok_var = ctk.BooleanVar(value=False)
         self.source_reddit_var = ctk.BooleanVar(value=False)
         self.source_pinterest_var = ctk.BooleanVar(value=False)
-        self.source_google_cb = ctk.CTkCheckBox(inner_src, text="Google Ads", variable=self.source_google_var, font=ctk.CTkFont(size=11), command=self._on_source_selection_changed)
-        self.source_google_cb.pack(side="left", padx=10)
-        self.source_meta_cb = ctk.CTkCheckBox(inner_src, text="Meta Ads", variable=self.source_meta_var, font=ctk.CTkFont(size=11), command=self._on_source_selection_changed)
-        self.source_meta_cb.pack(side="left", padx=10)
-        self.source_ms_cb = ctk.CTkCheckBox(inner_src, text="Microsoft Ads", variable=self.source_ms_var, font=ctk.CTkFont(size=11), command=self._on_source_selection_changed)
-        self.source_ms_cb.pack(side="left", padx=10)
-        self.source_tiktok_cb = ctk.CTkCheckBox(inner_src, text="TikTok Ads", variable=self.source_tiktok_var, font=ctk.CTkFont(size=11), command=self._on_source_selection_changed)
-        self.source_tiktok_cb.pack(side="left", padx=10)
-        self.source_reddit_cb = ctk.CTkCheckBox(inner_src, text="Reddit Ads", variable=self.source_reddit_var, font=ctk.CTkFont(size=11), command=self._on_source_selection_changed)
-        self.source_reddit_cb.pack(side="left", padx=10)
-        self.source_pinterest_cb = ctk.CTkCheckBox(inner_src, text="Pinterest Ads", variable=self.source_pinterest_var, font=ctk.CTkFont(size=11), command=self._on_source_selection_changed)
-        self.source_pinterest_cb.pack(side="left", padx=10)
-        
-        # --- Accounts: 2-column rows, separators, global Lock/Unlock ---
-        accounts_frame = ctk.CTkFrame(self.main_scrollable, fg_color="transparent")
-        accounts_frame.pack(pady=4, padx=0, fill="x")
-        ctk.CTkLabel(accounts_frame, text="Accounts", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=0, pady=(0, 3))
-        lock_btn_row = ctk.CTkFrame(accounts_frame, fg_color="transparent")
-        lock_btn_row.pack(pady=(0, 6), fill="x")
-        self.lock_all_ids_btn = ctk.CTkButton(lock_btn_row, text="Lock All Active IDs", command=self._lock_all_active_ids, font=ctk.CTkFont(size=11), width=160, height=30)
-        self.lock_all_ids_btn.pack(side="left", padx=(0, 8))
-        self.unlock_all_ids_btn = ctk.CTkButton(lock_btn_row, text="Unlock All IDs", command=self._unlock_all_ids, font=ctk.CTkFont(size=10), width=120, height=30, fg_color="gray", hover_color="darkgray", state="disabled")
-        self.unlock_all_ids_btn.pack(side="left", padx=0)
 
-        def _sep() -> ctk.CTkFrame:
-            s = ctk.CTkFrame(accounts_frame, height=2, fg_color=("gray70", "gray40"))
-            s.pack(fill="x", pady=(4, 0))
-            s.pack_propagate(False)
-            return s
+        CARD_PAD = 10
+        CARD_COMBO_WIDTH = 220
+        CARD_ACTIVE_BORDER = "#0066CC"
+        CARD_DIM_FG = ("#3a3a3a", "#2d2d2d")
+        CARD_ACTIVE_FG = ("#4a4a4a", "#3d3d3d")
 
-        # Google: 2-col row — single combobox (ID + favorites inline), uniform width
-        self._sep_google = _sep()
-        self.google_account_frame = ctk.CTkFrame(accounts_frame, fg_color="transparent")
-        self.google_account_frame.pack(pady=4, padx=0, fill="x")
-        self.google_account_frame.grid_columnconfigure(1, weight=1)
-        col0_google = ctk.CTkFrame(self.google_account_frame, fg_color="transparent")
-        col0_google.grid(row=0, column=0, sticky="w", padx=(0, 12))
-        ctk.CTkLabel(col0_google, text="Google Ads", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
-        col1_google = ctk.CTkFrame(self.google_account_frame, fg_color="transparent")
-        col1_google.grid(row=0, column=1, sticky="ew")
-        col1_google.grid_columnconfigure(0, weight=1)
+        cards_grid = ctk.CTkFrame(self.main_scrollable, fg_color="transparent")
+        cards_grid.pack(pady=8, padx=8, fill="both", expand=True)
+        for c in range(3):
+            cards_grid.columnconfigure(c, weight=1, uniform="cards")
+        cards_grid.rowconfigure(0, weight=0)
+        cards_grid.rowconfigure(1, weight=0)
+
+        def _make_card(parent: ctk.CTkFrame, row: int, col: int, name: str, var: ctk.BooleanVar) -> ctk.CTkFrame:
+            card = ctk.CTkFrame(parent, fg_color=CARD_DIM_FG, corner_radius=8, border_width=0)
+            card.grid(row=row, column=col, padx=CARD_PAD, pady=CARD_PAD, sticky="nsew")
+            cb = ctk.CTkCheckBox(card, text=name, variable=var, font=ctk.CTkFont(size=11, weight="bold"), command=self._on_source_selection_changed)
+            cb.pack(anchor="w", padx=10, pady=(10, 6))
+            return card
+
+        # Row 0: Google (0,0), Meta (0,1), MS Ads (0,2)
+        self.google_card = _make_card(cards_grid, 0, 0, "Google Ads", self.source_google_var)
         google_values = [f"{f['name']} ({f['customer_id']})" for f in self.favorites] if self.favorites else []
-        self.customer_id_combobox = ctk.CTkComboBox(col1_google, variable=self.google_id_display, values=google_values, width=ID_FIELD_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_google_id_combobox_select)
-        self.customer_id_combobox.grid(row=0, column=0, padx=0, pady=2, sticky="ew")
+        self.customer_id_combobox = ctk.CTkComboBox(self.google_card, variable=self.google_id_display, values=google_values, width=CARD_COMBO_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_google_id_combobox_select)
+        self.customer_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
+        self.google_card_status_label = ctk.CTkLabel(self.google_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray")
+        self.google_card_status_label.pack(anchor="w", padx=10, pady=(0, 10))
         self._set_google_id_display_from_id()
         self.google_id_display.trace_add("write", lambda *a: self._sync_google_id_from_display())
 
-        # Meta: 2-col row — single combobox + token frame below
-        self._sep_meta = _sep()
-        self.meta_account_frame = ctk.CTkFrame(accounts_frame, fg_color="transparent")
-        self.meta_account_frame.pack(pady=4, padx=0, fill="x")
-        self.meta_account_frame.grid_columnconfigure(1, weight=1)
-        col0_meta = ctk.CTkFrame(self.meta_account_frame, fg_color="transparent")
-        col0_meta.grid(row=0, column=0, sticky="w", padx=(0, 12))
-        ctk.CTkLabel(col0_meta, text="Meta Ads", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
-        col1_meta = ctk.CTkFrame(self.meta_account_frame, fg_color="transparent")
-        col1_meta.grid(row=0, column=1, sticky="ew")
-        col1_meta.grid_columnconfigure(0, weight=1)
+        self.meta_card = _make_card(cards_grid, 0, 1, "Meta Ads", self.source_meta_var)
         meta_values = [f"{f['name']} ({f['account_id']})" for f in self.meta_favorites] if self.meta_favorites else []
-        self.meta_account_id_combobox = ctk.CTkComboBox(col1_meta, variable=self.meta_id_display, values=meta_values, width=ID_FIELD_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_meta_id_combobox_select)
-        self.meta_account_id_combobox.grid(row=0, column=0, padx=0, pady=2, sticky="ew")
-        self._set_meta_id_display_from_id()
-        self.meta_id_display.trace_add("write", lambda *a: self._sync_meta_id_from_display())
-        self.meta_token_frame = ctk.CTkFrame(self.meta_account_frame, fg_color="transparent")
-        self.meta_token_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0))
-        self.meta_account_frame.grid_columnconfigure(1, weight=1)
-        ctk.CTkLabel(self.meta_token_frame, text="Meta Access Token Expired. Enter new token:", font=ctk.CTkFont(size=12, weight="bold"), text_color="#FF6B6B").pack(anchor="w", padx=0, pady=(4, 2))
+        self.meta_account_id_combobox = ctk.CTkComboBox(self.meta_card, variable=self.meta_id_display, values=meta_values, width=CARD_COMBO_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_meta_id_combobox_select)
+        self.meta_account_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
+        self.meta_card_status_label = ctk.CTkLabel(self.meta_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray")
+        self.meta_card_status_label.pack(anchor="w", padx=10, pady=(0, 4))
+        self.meta_token_frame = ctk.CTkFrame(self.meta_card, fg_color="transparent")
+        ctk.CTkLabel(self.meta_token_frame, text="Meta Access Token Expired. Enter new token:", font=ctk.CTkFont(size=10, weight="bold"), text_color="#FF6B6B").pack(anchor="w", padx=0, pady=(2, 2))
         token_row = ctk.CTkFrame(self.meta_token_frame, fg_color="transparent")
         token_row.pack(pady=(0, 4), fill="x")
-        self.meta_token_entry = ctk.CTkEntry(token_row, textvariable=self.meta_token_input, placeholder_text="Paste new token", width=400, height=35)
-        self.meta_token_entry.pack(side="left", padx=(0, 8), fill="x", expand=True)
-        self.meta_token_update_btn = ctk.CTkButton(token_row, text="Update Token", command=self._on_meta_token_update_clicked, width=120, height=35, font=ctk.CTkFont(size=12, weight="bold"), fg_color="green", hover_color="darkgreen")
+        self.meta_token_entry = ctk.CTkEntry(token_row, textvariable=self.meta_token_input, placeholder_text="Paste new token", width=200, height=28)
+        self.meta_token_entry.pack(side="left", padx=(0, 6), fill="x", expand=True)
+        self.meta_token_update_btn = ctk.CTkButton(token_row, text="Update Token", command=self._on_meta_token_update_clicked, width=100, height=28, font=ctk.CTkFont(size=10, weight="bold"), fg_color="green", hover_color="darkgreen")
         self.meta_token_update_btn.pack(side="left", padx=0)
-        self.meta_token_frame.grid_remove()
+        self.meta_token_frame.pack(fill="x", padx=10, pady=(0, 6))
+        self.meta_token_frame.pack_forget()
+        self._set_meta_id_display_from_id()
+        self.meta_id_display.trace_add("write", lambda *a: self._sync_meta_id_from_display())
 
-        # Microsoft: 2-col row — combobox (ID + favorites inline), uniform width
-        self._sep_ms = _sep()
-        self.ms_account_frame = ctk.CTkFrame(accounts_frame, fg_color="transparent")
-        self.ms_account_frame.pack(pady=4, padx=0, fill="x")
-        self.ms_account_frame.grid_columnconfigure(1, weight=1)
-        col0_ms = ctk.CTkFrame(self.ms_account_frame, fg_color="transparent")
-        col0_ms.grid(row=0, column=0, sticky="w", padx=(0, 12))
-        ctk.CTkLabel(col0_ms, text="Microsoft Ads", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
-        ms_col1 = ctk.CTkFrame(self.ms_account_frame, fg_color="transparent")
-        ms_col1.grid(row=0, column=1, sticky="ew")
-        ms_col1.grid_columnconfigure(0, weight=1)
+        self.ms_card = _make_card(cards_grid, 0, 2, "Microsoft Ads", self.source_ms_var)
         ms_values = [f"{f['name']} ({f['customer_id']})" for f in self.ms_favorites] if self.ms_favorites else []
-        self.ms_customer_id_combobox = ctk.CTkComboBox(ms_col1, variable=self.ms_id_display, values=ms_values, width=ID_FIELD_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_ms_id_combobox_select)
-        self.ms_customer_id_combobox.grid(row=0, column=0, padx=0, pady=2, sticky="ew")
+        self.ms_customer_id_combobox = ctk.CTkComboBox(self.ms_card, variable=self.ms_id_display, values=ms_values, width=CARD_COMBO_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_ms_id_combobox_select)
+        self.ms_customer_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
+        self.ms_card_status_label = ctk.CTkLabel(self.ms_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray")
+        self.ms_card_status_label.pack(anchor="w", padx=10, pady=(0, 10))
         self._set_ms_id_display_from_id()
         self.ms_id_display.trace_add("write", lambda *a: self._sync_ms_id_from_display())
-        self.ms_account_frame.pack_forget()
 
-        # TikTok: 2-col row — combobox, uniform width
-        self._sep_tiktok = _sep()
-        self.tiktok_account_frame = ctk.CTkFrame(accounts_frame, fg_color="transparent")
-        self.tiktok_account_frame.pack(pady=4, padx=0, fill="x")
-        self.tiktok_account_frame.grid_columnconfigure(1, weight=1)
-        col0_tk = ctk.CTkFrame(self.tiktok_account_frame, fg_color="transparent")
-        col0_tk.grid(row=0, column=0, sticky="w", padx=(0, 12))
-        ctk.CTkLabel(col0_tk, text="TikTok Ads", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
-        tk_col1 = ctk.CTkFrame(self.tiktok_account_frame, fg_color="transparent")
-        tk_col1.grid(row=0, column=1, sticky="ew")
-        tk_col1.grid_columnconfigure(0, weight=1)
+        # Row 1: TikTok (1,0), Reddit (1,1), Pinterest (1,2)
+        self.tiktok_card = _make_card(cards_grid, 1, 0, "TikTok Ads", self.source_tiktok_var)
         tk_values = [f"{f['name']} ({f['advertiser_id']})" for f in self.tiktok_favorites] if self.tiktok_favorites else []
-        self.tiktok_account_id_combobox = ctk.CTkComboBox(tk_col1, variable=self.tiktok_id_display, values=tk_values, width=ID_FIELD_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_tiktok_id_combobox_select)
-        self.tiktok_account_id_combobox.grid(row=0, column=0, padx=0, pady=2, sticky="ew")
+        self.tiktok_account_id_combobox = ctk.CTkComboBox(self.tiktok_card, variable=self.tiktok_id_display, values=tk_values, width=CARD_COMBO_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_tiktok_id_combobox_select)
+        self.tiktok_account_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
+        self.tiktok_card_status_label = ctk.CTkLabel(self.tiktok_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray")
+        self.tiktok_card_status_label.pack(anchor="w", padx=10, pady=(0, 10))
         self._set_tiktok_id_display_from_id()
         self.tiktok_id_display.trace_add("write", lambda *a: self._sync_tiktok_id_from_display())
-        self.tiktok_account_frame.pack_forget()
 
-        # Reddit: 2-col row — combobox, uniform width
-        self._sep_reddit = _sep()
-        self.reddit_account_frame = ctk.CTkFrame(accounts_frame, fg_color="transparent")
-        self.reddit_account_frame.pack(pady=4, padx=0, fill="x")
-        self.reddit_account_frame.grid_columnconfigure(1, weight=1)
-        col0_rd = ctk.CTkFrame(self.reddit_account_frame, fg_color="transparent")
-        col0_rd.grid(row=0, column=0, sticky="w", padx=(0, 12))
-        ctk.CTkLabel(col0_rd, text="Reddit Ads", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
-        rd_col1 = ctk.CTkFrame(self.reddit_account_frame, fg_color="transparent")
-        rd_col1.grid(row=0, column=1, sticky="ew")
-        rd_col1.grid_columnconfigure(0, weight=1)
+        self.reddit_card = _make_card(cards_grid, 1, 1, "Reddit Ads", self.source_reddit_var)
         rd_values = [f"{f['name']} ({f['account_id']})" for f in self.reddit_favorites] if self.reddit_favorites else []
-        self.reddit_account_id_combobox = ctk.CTkComboBox(rd_col1, variable=self.reddit_id_display, values=rd_values, width=ID_FIELD_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_reddit_id_combobox_select)
-        self.reddit_account_id_combobox.grid(row=0, column=0, padx=0, pady=2, sticky="ew")
+        self.reddit_account_id_combobox = ctk.CTkComboBox(self.reddit_card, variable=self.reddit_id_display, values=rd_values, width=CARD_COMBO_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_reddit_id_combobox_select)
+        self.reddit_account_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
+        self.reddit_card_status_label = ctk.CTkLabel(self.reddit_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray")
+        self.reddit_card_status_label.pack(anchor="w", padx=10, pady=(0, 10))
         self._set_reddit_id_display_from_id()
         self.reddit_id_display.trace_add("write", lambda *a: self._sync_reddit_id_from_display())
-        self.reddit_account_frame.pack_forget()
 
-        # Pinterest: 2-col row — combobox, uniform width
-        self._sep_pinterest = _sep()
-        self.pinterest_account_frame = ctk.CTkFrame(accounts_frame, fg_color="transparent")
-        self.pinterest_account_frame.pack(pady=4, padx=0, fill="x")
-        self.pinterest_account_frame.grid_columnconfigure(1, weight=1)
-        col0_pt = ctk.CTkFrame(self.pinterest_account_frame, fg_color="transparent")
-        col0_pt.grid(row=0, column=0, sticky="w", padx=(0, 12))
-        ctk.CTkLabel(col0_pt, text="Pinterest Ads", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
-        pt_col1 = ctk.CTkFrame(self.pinterest_account_frame, fg_color="transparent")
-        pt_col1.grid(row=0, column=1, sticky="ew")
-        pt_col1.grid_columnconfigure(0, weight=1)
+        self.pinterest_card = _make_card(cards_grid, 1, 2, "Pinterest Ads", self.source_pinterest_var)
         pt_values = [f"{f['name']} ({f['advertiser_id']})" for f in self.pinterest_favorites] if self.pinterest_favorites else []
-        self.pinterest_account_id_combobox = ctk.CTkComboBox(pt_col1, variable=self.pinterest_id_display, values=pt_values, width=ID_FIELD_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_pinterest_id_combobox_select)
-        self.pinterest_account_id_combobox.grid(row=0, column=0, padx=0, pady=2, sticky="ew")
+        self.pinterest_account_id_combobox = ctk.CTkComboBox(self.pinterest_card, variable=self.pinterest_id_display, values=pt_values, width=CARD_COMBO_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_pinterest_id_combobox_select)
+        self.pinterest_account_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
+        self.pinterest_card_status_label = ctk.CTkLabel(self.pinterest_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray")
+        self.pinterest_card_status_label.pack(anchor="w", padx=10, pady=(0, 10))
         self._set_pinterest_id_display_from_id()
         self.pinterest_id_display.trace_add("write", lambda *a: self._sync_pinterest_id_from_display())
-        self.pinterest_account_frame.pack_forget()
 
-        # Apply initial visibility (separators + frames) from source selection
         self._on_source_selection_changed()
 
-        # --- Action Bar (centered) ---
-        action_frame = ctk.CTkFrame(self.main_tab, fg_color="transparent")
-        action_frame.pack(pady=12, padx=20, fill="x")
-        ctk.CTkLabel(action_frame, text="Actions", font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=0, pady=(0, 6))
-        action_buttons = ctk.CTkFrame(action_frame, fg_color="transparent")
-        action_buttons.pack(pady=0, fill="x")
-        self.start_button = ctk.CTkButton(action_buttons, text="Start Google Fetch", command=self._on_start_clicked, font=ctk.CTkFont(size=14, weight="bold"), height=40, width=180, state="disabled")
-        self.start_button.pack(side="left", padx=8)
-        self.meta_start_button = ctk.CTkButton(action_buttons, text="Start Meta Fetch", command=self._on_meta_start_clicked, font=ctk.CTkFont(size=14, weight="bold"), height=40, width=180, state="disabled")
-        self.meta_start_button.pack(side="left", padx=8)
-        self.stop_button = ctk.CTkButton(action_buttons, text="Stop", command=self._on_stop_clicked, font=ctk.CTkFont(size=14, weight="bold"), height=40, width=100, fg_color="red", hover_color="darkred", state="disabled")
-        self.stop_button.pack(side="left", padx=8)
-        run_full_btn = ctk.CTkButton(action_buttons, text="Run Full Pipeline", command=self._on_run_all_clicked, font=ctk.CTkFont(size=14, weight="bold"), height=40, width=160, fg_color="#0066CC", hover_color="#0052A3")
-        run_full_btn.pack(side="left", padx=8)
-        
-        # --- Progress ---
-        progress_frame = ctk.CTkFrame(self.main_tab)
-        progress_frame.pack(pady=8, padx=20, fill="x")
-        progress_info_frame = ctk.CTkFrame(progress_frame, fg_color="transparent")
-        progress_info_frame.pack(pady=5, padx=10, fill="x")
-        self.progress_percent_label = ctk.CTkLabel(progress_info_frame, text="0%", font=ctk.CTkFont(size=11, weight="bold"))
-        self.progress_percent_label.pack(side="left", padx=5)
-        self.eta_label = ctk.CTkLabel(progress_info_frame, text="", font=ctk.CTkFont(size=10))
-        self.eta_label.pack(side="left", padx=10, expand=True)
-        self.completion_time_label = ctk.CTkLabel(progress_info_frame, text="", font=ctk.CTkFont(size=10))
-        self.completion_time_label.pack(side="left", padx=5)
-        self.progress_bar = ctk.CTkProgressBar(progress_frame)
-        self.progress_bar.pack(pady=5, padx=20, fill="x")
+        # Invisible progress bars for pipeline (Google/Meta fetch threads update these; pipeline status shows under header)
+        self.progress_bar = ctk.CTkProgressBar(ctk.CTkFrame(self.main_tab, fg_color="transparent"))
         self.progress_bar.set(0)
-        
-        meta_progress_frame = ctk.CTkFrame(self.main_tab)
-        meta_progress_frame.pack(pady=5, padx=20, fill="x")
-        meta_progress_info_frame = ctk.CTkFrame(meta_progress_frame, fg_color="transparent")
-        meta_progress_info_frame.pack(pady=5, padx=10, fill="x")
-        self.meta_progress_percent_label = ctk.CTkLabel(meta_progress_info_frame, text="0%", font=ctk.CTkFont(size=11, weight="bold"))
-        self.meta_progress_percent_label.pack(side="left", padx=5)
-        self.meta_eta_label = ctk.CTkLabel(meta_progress_info_frame, text="", font=ctk.CTkFont(size=10))
-        self.meta_eta_label.pack(side="left", padx=10, expand=True)
-        self.meta_completion_time_label = ctk.CTkLabel(meta_progress_info_frame, text="", font=ctk.CTkFont(size=10))
-        self.meta_completion_time_label.pack(side="left", padx=5)
-        self.meta_progress_bar = ctk.CTkProgressBar(meta_progress_frame)
-        self.meta_progress_bar.pack(pady=5, padx=20, fill="x")
+        self.progress_percent_label = ctk.CTkLabel(self.main_tab, text="0%")
+        self.eta_label = ctk.CTkLabel(self.main_tab, text="")
+        self.completion_time_label = ctk.CTkLabel(self.main_tab, text="")
+        self.meta_progress_bar = ctk.CTkProgressBar(ctk.CTkFrame(self.main_tab, fg_color="transparent"))
         self.meta_progress_bar.set(0)
-        
+        self.meta_progress_percent_label = ctk.CTkLabel(self.main_tab, text="0%")
+        self.meta_eta_label = ctk.CTkLabel(self.main_tab, text="")
+        self.meta_completion_time_label = ctk.CTkLabel(self.main_tab, text="")
+
         process_row = ctk.CTkFrame(self.main_tab, fg_color="transparent")
         process_row.pack(pady=10, padx=20, fill="x")
         self.google_process_button = ctk.CTkButton(process_row, text="Process Google Files", command=self._on_google_process_clicked, font=ctk.CTkFont(size=12, weight="bold"), height=35, fg_color="orange", hover_color="darkorange", state="disabled")
@@ -804,24 +645,27 @@ class AdsReportFetcherApp:
         self.meta_process_spinner_label = self.meta_process_progress_frame.winfo_children()[0].winfo_children()[3]
     
     def _on_source_selection_changed(self) -> None:
-        """Show/hide account blocks and separators; apply smart defaulting when a platform is shown."""
-        platform_blocks = [
-            (self.source_google_var, self._sep_google, self.google_account_frame, "google"),
-            (self.source_meta_var, self._sep_meta, self.meta_account_frame, "meta"),
-            (self.source_ms_var, self._sep_ms, self.ms_account_frame, "ms"),
-            (self.source_tiktok_var, self._sep_tiktok, self.tiktok_account_frame, "tiktok"),
-            (self.source_reddit_var, self._sep_reddit, self.reddit_account_frame, "reddit"),
-            (self.source_pinterest_var, self._sep_pinterest, self.pinterest_account_frame, "pinterest"),
+        """Update card state: enable/disable dropdown, dim/active card; apply smart default when first checked."""
+        CARD_DIM_FG = ("#3a3a3a", "#2d2d2d")
+        CARD_ACTIVE_FG = ("#4a4a4a", "#3d3d3d")
+        CARD_ACTIVE_BORDER = "#0066CC"
+        platform_cards = [
+            (self.source_google_var, self.google_card, self.customer_id_combobox, "google"),
+            (self.source_meta_var, self.meta_card, self.meta_account_id_combobox, "meta"),
+            (self.source_ms_var, self.ms_card, self.ms_customer_id_combobox, "ms"),
+            (self.source_tiktok_var, self.tiktok_card, self.tiktok_account_id_combobox, "tiktok"),
+            (self.source_reddit_var, self.reddit_card, self.reddit_account_id_combobox, "reddit"),
+            (self.source_pinterest_var, self.pinterest_card, self.pinterest_account_id_combobox, "pinterest"),
         ]
-        for var, sep, frame, key in platform_blocks:
-            if var.get():
-                sep.pack(fill="x", pady=(4, 0))
-                sep.pack_propagate(False)
-                frame.pack(pady=4, padx=0, fill="x")
+        for var, card, combobox, key in platform_cards:
+            checked = var.get()
+            combobox.configure(state="normal" if checked else "disabled")
+            if checked:
+                card.configure(fg_color=CARD_ACTIVE_FG, border_width=2, border_color=CARD_ACTIVE_BORDER)
                 self._apply_smart_default_for_platform(key)
             else:
-                sep.pack_forget()
-                frame.pack_forget()
+                card.configure(fg_color=CARD_DIM_FG, border_width=0, border_color="#3a3a3a")
+        self._update_checklist_statuses()
 
     def _apply_smart_default_for_platform(self, platform_key: str) -> None:
         """When a platform is first shown, fill empty ID from last_*_id or primary favorite."""
@@ -1004,24 +848,28 @@ class AdsReportFetcherApp:
         
         self.settings_token_entry = ctk.CTkEntry(
             token_input_frame,
-            placeholder_text="Enter Meta Ads access token",
+            placeholder_text="Paste token (shown as ••• when typing)",
             width=440,
             show="*"
         )
         self.settings_token_entry.pack(side="left", padx=(0, 5), fill="x", expand=True)
         
-        save_token_btn = ctk.CTkButton(
+        self.settings_meta_token_btn = ctk.CTkButton(
             token_input_frame,
             text="Save Token",
             command=self._on_save_meta_token_settings,
             width=120,
             font=ctk.CTkFont(size=11)
         )
-        save_token_btn.pack(side="left", padx=5)
+        self.settings_meta_token_btn.pack(side="left", padx=5)
         
-        # Favourites Editor section
-        favorites_editor_frame = ctk.CTkFrame(self.settings_tab)
-        favorites_editor_frame.pack(pady=10, padx=20, fill="x")
+        # Scrollable area for Favourites Editor + Default Favorites (same pattern as Main tab)
+        self.settings_scrollable = ctk.CTkScrollableFrame(self.settings_tab, height=450, fg_color="transparent")
+        self.settings_scrollable.pack(pady=6, padx=20, fill="x", expand=False)
+        
+        # Favourites Editor section (inside scrollable)
+        favorites_editor_frame = ctk.CTkFrame(self.settings_scrollable)
+        favorites_editor_frame.pack(pady=10, padx=0, fill="x")
         
         favorites_editor_label = ctk.CTkLabel(
             favorites_editor_frame,
@@ -1188,9 +1036,9 @@ class AdsReportFetcherApp:
         ctk.CTkButton(pinterest_fav_select_frame, text="Edit", command=self._on_settings_edit_pinterest_favorite, width=80, font=ctk.CTkFont(size=11)).pack(side="left", padx=5)
         ctk.CTkButton(pinterest_fav_select_frame, text="Delete", command=self._on_settings_delete_pinterest_favorite, width=80, font=ctk.CTkFont(size=11), fg_color="red", hover_color="darkred").pack(side="left", padx=5)
         
-        # Default Favorite section
-        default_favorite_frame = ctk.CTkFrame(self.settings_tab)
-        default_favorite_frame.pack(pady=10, padx=20, fill="x")
+        # Default Favorite section (inside scrollable)
+        default_favorite_frame = ctk.CTkFrame(self.settings_scrollable)
+        default_favorite_frame.pack(pady=10, padx=0, fill="x")
         
         default_favorite_label = ctk.CTkLabel(
             default_favorite_frame,
@@ -1297,7 +1145,7 @@ class AdsReportFetcherApp:
         self.settings_pinterest_favorite_menu.set(default_pinterest_fav)
         self.settings_pinterest_favorite_menu.pack(side="left", padx=5)
         
-        # Theme mode section
+        # Theme mode section (below scrollable)
         theme_frame = ctk.CTkFrame(self.settings_tab)
         theme_frame.pack(pady=10, padx=20, fill="x")
         
@@ -1414,19 +1262,44 @@ class AdsReportFetcherApp:
             self.logger.error(f"Error saving settings: {e}", exc_info=True)
     
     def _on_save_meta_token_settings(self) -> None:
-        """Save Meta token from settings tab."""
+        """Save Meta token from settings tab. Validates token via API before saving (same flow as Main tab)."""
+        self.root.update_idletasks()
         token = self.settings_token_entry.get().strip()
         if not token:
             self.status_text.set("Error: Please enter a token")
             return
 
-        ok, err = self._update_meta_token(token)
-        if ok:
-            self.status_text.set("Meta token saved successfully")
-            self.logger.info("Meta token saved from Settings tab")
-            self.settings_token_entry.delete(0, "end")
-        else:
-            self.status_text.set(f"Error: {err or 'Failed to update token file'}")
+        self.settings_meta_token_btn.configure(state="disabled")
+        self.status_text.set("Checking token...")
+
+        def check_and_save() -> None:
+            try:
+                valid, check_err, _ = self._check_meta_token_with_api(token)
+                if not valid:
+                    def on_check_failed() -> None:
+                        self.settings_meta_token_btn.configure(state="normal")
+                        self.status_text.set(f"Token invalid: {check_err or 'Unknown error'}")
+                    self.root.after(0, on_check_failed)
+                    return
+                self.root.after(0, lambda: self.status_text.set("Token valid. Saving..."))
+                ok, err = self._update_meta_token(token)
+                def on_done() -> None:
+                    self.settings_meta_token_btn.configure(state="normal")
+                    if ok:
+                        self.status_text.set("Token valid and saved successfully")
+                        self.logger.info("Meta token saved from Settings tab")
+                        self.settings_token_entry.delete(0, "end")
+                    else:
+                        self.status_text.set(f"Error: {err or 'Failed to update token file'}")
+                self.root.after(0, on_done)
+            except Exception as e:
+                self.logger.error(f"Meta token save error: {e}", exc_info=True)
+                def on_fail() -> None:
+                    self.settings_meta_token_btn.configure(state="normal")
+                    self.status_text.set(f"Error: {e}")
+                self.root.after(0, on_fail)
+
+        threading.Thread(target=check_and_save, daemon=True).start()
     
     def _on_google_default_favorite_changed(self, choice: str) -> None:
         """Handle Google default favorite change in settings."""
@@ -1516,10 +1389,10 @@ class AdsReportFetcherApp:
         )
         self.log_export_button.pack(side="right", padx=10)
         
-        # Fixed height (8 lines) so log stays compact and always visible
+        # Increased height (16 lines) for more log visibility after removing checklist
         self.log_textbox = scrolledtext.ScrolledText(
             log_frame,
-            height=8,
+            height=16,
             wrap="word",
             font=("Consolas", 9),
             bg="#212121",
@@ -1561,93 +1434,6 @@ class AdsReportFetcherApp:
         except ValueError:
             return 1
     
-    def _lock_all_active_ids(self) -> None:
-        """Validate and lock Account/Customer IDs for all currently selected platforms."""
-        errors = []
-        if self.source_google_var.get():
-            cid = self.customer_id.get().strip()
-            if not cid:
-                errors.append("Google Ads: Please enter a Customer ID")
-            else:
-                clean = cid.replace("-", "")
-                if not clean.isdigit() or len(clean) != 10:
-                    errors.append("Google Ads: Customer ID must be a 10-digit number")
-        if self.source_meta_var.get():
-            aid = self.meta_account_id.get().strip()
-            if not aid or aid == "act_":
-                errors.append("Meta Ads: Please enter a valid Ad Account ID")
-            elif not aid.startswith("act_"):
-                errors.append("Meta Ads: Ad Account ID must start with 'act_'")
-        if self.source_ms_var.get():
-            cid = self.ms_customer_id.get().strip().replace("-", "").replace(" ", "")
-            if not cid or not cid.isdigit():
-                errors.append("Microsoft Ads: Please enter a valid Customer ID (digits)")
-        if self.source_tiktok_var.get():
-            if not (self.tiktok_account_id.get() or "").strip():
-                errors.append("TikTok Ads: Please enter an Advertiser ID")
-        if self.source_reddit_var.get():
-            if not (self.reddit_account_id.get() or "").strip():
-                errors.append("Reddit Ads: Please enter an Account ID")
-        if self.source_pinterest_var.get():
-            if not (self.pinterest_account_id.get() or "").strip():
-                errors.append("Pinterest Ads: Please enter an Advertiser ID")
-        if errors:
-            self.status_text.set(errors[0])
-            return
-        # Lock all selected platforms and persist last_*_id
-        if self.source_google_var.get():
-            self.customer_id_locked = True
-            self.customer_id_combobox.configure(state="disabled")
-            self.settings["last_google_id"] = self.customer_id.get().strip()
-        if self.source_meta_var.get():
-            self.meta_account_id_locked = True
-            self.meta_account_id_combobox.configure(state="disabled")
-            self.settings["last_meta_id"] = self.meta_account_id.get().strip()
-        if self.source_ms_var.get():
-            self.ms_customer_id_locked = True
-            self.ms_customer_id_combobox.configure(state="disabled")
-            self.settings["last_ms_id"] = self.ms_customer_id.get().strip()
-        if self.source_tiktok_var.get():
-            self.tiktok_account_id_locked = True
-            self.tiktok_account_id_combobox.configure(state="disabled")
-            self.settings["last_tiktok_id"] = (self.tiktok_account_id.get() or "").strip()
-        if self.source_reddit_var.get():
-            self.reddit_account_id_locked = True
-            self.reddit_account_id_combobox.configure(state="disabled")
-            self.settings["last_reddit_id"] = (self.reddit_account_id.get() or "").strip()
-        if self.source_pinterest_var.get():
-            self.pinterest_account_id_locked = True
-            self.pinterest_account_id_combobox.configure(state="disabled")
-            self.settings["last_pinterest_id"] = (self.pinterest_account_id.get() or "").strip()
-        self._save_settings()
-        self.lock_all_ids_btn.configure(state="disabled")
-        self.unlock_all_ids_btn.configure(state="normal")
-        self.status_text.set("All active IDs locked")
-        self.logger.info("All active Account/Customer IDs locked")
-        self._update_checklist_statuses()
-
-    def _unlock_all_ids(self) -> None:
-        """Unlock all Account/Customer ID fields for editing."""
-        self.customer_id_locked = False
-        self.meta_account_id_locked = False
-        self.ms_customer_id_locked = False
-        self.tiktok_account_id_locked = False
-        self.reddit_account_id_locked = False
-        self.pinterest_account_id_locked = False
-        self.customer_id_combobox.configure(state="normal")
-        self.meta_account_id_combobox.configure(state="normal")
-        self.ms_customer_id_combobox.configure(state="normal")
-        self.tiktok_account_id_combobox.configure(state="normal")
-        self.reddit_account_id_combobox.configure(state="normal")
-        self.pinterest_account_id_combobox.configure(state="normal")
-        if self.date_range_locked or self.meta_date_range_locked:
-            self._unlock_date_range_global()
-        self.lock_all_ids_btn.configure(state="normal")
-        self.unlock_all_ids_btn.configure(state="disabled")
-        self.status_text.set("All IDs unlocked for editing")
-        self.logger.info("All Account/Customer IDs unlocked")
-        self._update_checklist_statuses()
-
     def _validate_date_only(self) -> Tuple[bool, Optional[str]]:
         """Validate date range only (no account ID)."""
         try:
@@ -1677,8 +1463,8 @@ class AdsReportFetcherApp:
         self.end_year_menu.configure(state="disabled")
         self.confirm_date_btn.configure(text="Date Range Locked", state="disabled")
         self.unlock_date_btn.configure(state="normal")
-        self.start_button.configure(state="normal" if self.customer_id_locked else "disabled")
-        self.meta_start_button.configure(state="normal" if self.meta_account_id_locked else "disabled")
+        is_valid_google, _ = self._validate_inputs()
+        is_valid_meta, _ = self._validate_meta_inputs()
         self.status_text.set("Date range confirmed for all platforms")
         self.logger.info("Date range confirmed (global)")
         self._update_checklist_statuses()
@@ -1693,8 +1479,6 @@ class AdsReportFetcherApp:
         self.end_year_menu.configure(state="normal")
         self.confirm_date_btn.configure(text="Confirm Date Range", state="normal")
         self.unlock_date_btn.configure(state="disabled")
-        self.start_button.configure(state="disabled")
-        self.meta_start_button.configure(state="disabled")
         self.status_text.set("Date range unlocked for editing")
         self.logger.info("Date range unconfirmed (global)")
         self._update_checklist_statuses()
@@ -1770,8 +1554,8 @@ class AdsReportFetcherApp:
             self.logger.warning("Already processing, ignoring start request")
             return
         
-        if not self.customer_id_locked or not self.date_range_locked:
-            self.status_text.set("Error: Please confirm Customer ID and date range before starting")
+        if not self.date_range_locked:
+            self.status_text.set("Error: Please confirm date range before starting")
             return
         
         is_valid, error_msg = self._validate_inputs()
@@ -1781,8 +1565,6 @@ class AdsReportFetcherApp:
         
         self.cancel_event.clear()
         self.is_processing = True
-        self.start_button.configure(state="disabled")
-        self.stop_button.configure(state="normal")
         self.progress_bar.set(0)
         self.status_text.set("Initializing Google Ads fetch...")
         
@@ -1866,7 +1648,7 @@ class AdsReportFetcherApp:
         # Update checklist to show current status
         self._update_checklist_statuses()
         
-        # Check which platforms are selected and ready (selected + ID + date range locked)
+        # Check which platforms are selected and ready (selected + valid ID + date range confirmed)
         is_valid_google, _ = self._validate_inputs()
         is_valid_meta, _ = self._validate_meta_inputs()
         ms_cid = (self.ms_customer_id.get() or "").strip().replace("-", "").replace(" ", "")
@@ -1874,15 +1656,15 @@ class AdsReportFetcherApp:
         google_selected = self.source_google_var.get()
         meta_selected = self.source_meta_var.get()
         ms_selected = self.source_ms_var.get()
-        google_ready = google_selected and is_valid_google and self.customer_id_locked and self.date_range_locked
-        meta_ready = meta_selected and is_valid_meta and self.meta_account_id_locked and self.meta_date_range_locked
+        google_ready = google_selected and is_valid_google and self.date_range_locked
+        meta_ready = meta_selected and is_valid_meta and self.meta_date_range_locked
         tiktok_selected = self.source_tiktok_var.get()
         reddit_selected = self.source_reddit_var.get()
         pinterest_selected = self.source_pinterest_var.get()
-        tiktok_ready = tiktok_selected and self.tiktok_account_id_locked and self.date_range_locked and bool((self.tiktok_account_id.get() or "").strip())
-        reddit_ready = reddit_selected and self.reddit_account_id_locked and self.date_range_locked and bool((self.reddit_account_id.get() or "").strip())
-        pinterest_ready = pinterest_selected and self.pinterest_account_id_locked and self.date_range_locked and bool((self.pinterest_account_id.get() or "").strip())
-        ms_ready = ms_selected and is_valid_ms and self.ms_customer_id_locked and self.date_range_locked
+        tiktok_ready = tiktok_selected and self.date_range_locked and bool((self.tiktok_account_id.get() or "").strip())
+        reddit_ready = reddit_selected and self.date_range_locked and bool((self.reddit_account_id.get() or "").strip())
+        pinterest_ready = pinterest_selected and self.date_range_locked and bool((self.pinterest_account_id.get() or "").strip())
+        ms_ready = ms_selected and is_valid_ms and self.date_range_locked
 
         # Check data status (all platform dirs)
         raw_dir = Path("raw_reports")
@@ -1930,8 +1712,8 @@ class AdsReportFetcherApp:
         self.batch_fetch_active = True
         self.run_full_pipeline_button.configure(state="disabled")
         
-        # Show pipeline progress bar
-        self.root.after(0, lambda: self.pipeline_progress_frame.pack(pady=(5, 8), padx=10, fill="x"))
+        # Show pipeline progress bar (lives under header status row)
+        self.root.after(0, lambda: self.pipeline_progress_frame.pack(side="left"))
         self.root.after(0, lambda: self.pipeline_progress_bar.set(0))
         self.root.after(0, lambda: self.pipeline_status_label.configure(text="Initializing pipeline..."))
         
@@ -1942,16 +1724,20 @@ class AdsReportFetcherApp:
     def _execute_batch_fetch(self) -> None:
         """
         Execute the batch fetch sequence.
-        Only runs platforms that are ready (date range locked).
+        Only runs platforms that are selected and ready (valid ID + date range confirmed).
         """
         try:
-            # Only run platforms that are selected and ready (ID + date range locked)
-            google_ready = self.source_google_var.get() and self.customer_id_locked and self.date_range_locked
-            meta_ready = self.source_meta_var.get() and self.meta_account_id_locked and self.meta_date_range_locked
-            ms_ready = self.source_ms_var.get() and self.ms_customer_id_locked and self.date_range_locked and bool((self.ms_customer_id.get() or "").strip().replace("-", "").replace(" ", ""))
-            tiktok_ready = self.source_tiktok_var.get() and self.tiktok_account_id_locked and self.date_range_locked and bool((self.tiktok_account_id.get() or "").strip())
-            reddit_ready = self.source_reddit_var.get() and self.reddit_account_id_locked and self.date_range_locked and bool((self.reddit_account_id.get() or "").strip())
-            pinterest_ready = self.source_pinterest_var.get() and self.pinterest_account_id_locked and self.date_range_locked and bool((self.pinterest_account_id.get() or "").strip())
+            is_valid_google, _ = self._validate_inputs()
+            is_valid_meta, _ = self._validate_meta_inputs()
+            ms_cid = (self.ms_customer_id.get() or "").strip().replace("-", "").replace(" ", "")
+            is_valid_ms = bool(ms_cid and ms_cid.isdigit())
+            # Only run platforms that are selected and ready (valid ID + date range confirmed)
+            google_ready = self.source_google_var.get() and is_valid_google and self.date_range_locked
+            meta_ready = self.source_meta_var.get() and is_valid_meta and self.meta_date_range_locked
+            ms_ready = self.source_ms_var.get() and is_valid_ms and self.date_range_locked
+            tiktok_ready = self.source_tiktok_var.get() and self.date_range_locked and bool((self.tiktok_account_id.get() or "").strip())
+            reddit_ready = self.source_reddit_var.get() and self.date_range_locked and bool((self.reddit_account_id.get() or "").strip())
+            pinterest_ready = self.source_pinterest_var.get() and self.date_range_locked and bool((self.pinterest_account_id.get() or "").strip())
 
             # Build fetch sequence only for selected + ready platforms (loop through GUI selection)
             fetch_sequence = []
@@ -2070,7 +1856,7 @@ class AdsReportFetcherApp:
             self.root.after(0, lambda: self.pipeline_status_label.configure(text="Pipeline Error"))
         finally:
             self.batch_fetch_active = False
-            self.root.after(0, lambda: self.run_full_pipeline_button.configure(state="normal"))
+            self.root.after(0, self._update_checklist_statuses)
             # Hide progress bar after delay
             self.root.after(3000, lambda: self.pipeline_progress_frame.pack_forget())
     
@@ -2090,8 +1876,6 @@ class AdsReportFetcherApp:
         self.meta_cancel_event.clear()
         self.meta_is_processing = True
         self.root.after(0, lambda: (
-            self.meta_start_button.configure(state="disabled"),
-            self.meta_stop_button.configure(state="normal"),
             self.meta_progress_bar.set(0),
             self.meta_progress_percent_label.configure(text="0%"),
             self.meta_eta_label.configure(text=""),
@@ -2187,7 +1971,6 @@ class AdsReportFetcherApp:
         self.end_month_menu.configure(state="normal")
         self.end_year_menu.configure(state="normal")
         self.confirm_date_btn.configure(text="Confirm Date Range", state="normal")
-        self.start_button.configure(state="disabled")
         self.progress_bar.set(0)
         self.progress_percent_label.configure(text="0%")
         self.eta_label.configure(text="")
@@ -2195,7 +1978,6 @@ class AdsReportFetcherApp:
         
         # Reset Meta Ads (global date already reset above)
         self.meta_date_range_locked = False
-        self.meta_start_button.configure(state="disabled")
         self.meta_progress_bar.set(0)
         self.meta_progress_percent_label.configure(text="0%")
         self.meta_eta_label.configure(text="")
@@ -2214,7 +1996,7 @@ class AdsReportFetcherApp:
             self.meta_fetch_complete.set()
             return
 
-        if not self.meta_account_id_locked or not self.meta_date_range_locked:
+        if not self.meta_date_range_locked:
             msg = "Error: Please confirm Account ID and date range before starting"
             self.logger.warning(msg)
             self.status_text.set(msg)
@@ -2230,8 +2012,6 @@ class AdsReportFetcherApp:
 
         self.meta_cancel_event.clear()
         self.meta_is_processing = True
-        self.meta_start_button.configure(state="disabled")
-        self.meta_stop_button.configure(state="normal")
         self.meta_progress_bar.set(0)
         self.meta_progress_percent_label.configure(text="0%")
         self.meta_eta_label.configure(text="")
@@ -2250,26 +2030,47 @@ class AdsReportFetcherApp:
             self.logger.info("Meta Ads stop requested by user")
     
     def _on_meta_token_update_clicked(self) -> None:
-        """Handle Meta token update button click."""
+        """Handle Meta token update button click. Saves token in a background thread so the main thread never blocks on file I/O (avoids app freezing)."""
+        self.root.update_idletasks()
         new_token = self.meta_token_input.get().strip()
         if not new_token:
             self.status_text.set("Error: Please enter a token")
             return
-        
-        # Update token in yaml file
-        ok, err = self._update_meta_token(new_token)
-        if not ok:
-            self.status_text.set(f"Error: {err or 'Failed to update token file'}")
-            return
 
-        # Signal that token has been updated (for fetch thread)
-        self.meta_token_updated.set()
-        
-        # Hide token frame
-        self.meta_token_frame.grid_remove()
-        self.meta_token_input.set("")
-        self.status_text.set("Token updated successfully")
-        self.logger.info("Meta token updated from Meta tab input field")
+        # Disable button while checking/saving so user doesn't double-click
+        self.meta_token_update_btn.configure(state="disabled")
+        self.status_text.set("Checking token...")
+
+        def check_and_save_token_in_background() -> None:
+            try:
+                valid, check_err, _ = self._check_meta_token_with_api(new_token)
+                if not valid:
+                    def on_check_failed() -> None:
+                        self.meta_token_update_btn.configure(state="normal")
+                        self.status_text.set(f"Token invalid: {check_err or 'Unknown error'}")
+                    self.root.after(0, on_check_failed)
+                    return
+                self.root.after(0, lambda: self.status_text.set("Token valid. Saving..."))
+                ok, err = self._update_meta_token(new_token)
+                def on_done() -> None:
+                    self.meta_token_update_btn.configure(state="normal")
+                    if not ok:
+                        self.status_text.set(f"Error: {err or 'Failed to update token file'}")
+                        return
+                    self.meta_token_updated.set()
+                    self.meta_token_frame.pack_forget()
+                    self.meta_token_input.set("")
+                    self.status_text.set("Token valid and saved successfully")
+                    self.logger.info("Meta token updated from Meta tab input field")
+                self.root.after(0, on_done)
+            except Exception as e:
+                self.logger.error(f"Meta token update error: {e}", exc_info=True)
+                def on_fail() -> None:
+                    self.meta_token_update_btn.configure(state="normal")
+                    self.status_text.set(f"Error: {e}")
+                self.root.after(0, on_fail)
+
+        threading.Thread(target=check_and_save_token_in_background, daemon=True).start()
     
     def _on_process_clicked(self) -> None:
         """Handle process button click."""
@@ -2353,9 +2154,6 @@ class AdsReportFetcherApp:
         finally:
             self.is_processing = False
             self.cancel_event.clear()
-            if self.date_range_locked:
-                self.root.after(0, lambda: self.start_button.configure(state="normal"))
-            self.root.after(0, lambda: self.stop_button.configure(state="disabled"))
             self.root.after(0, lambda: self.new_fetch_button.configure(state="normal"))
             # Signal batch fetch that Google fetch is complete
             self.google_fetch_complete.set()
@@ -2428,7 +2226,7 @@ class AdsReportFetcherApp:
                     self.root.after(0, lambda: self.status_text.set(
                         f"Meta token expired (attempt {retry_count}). Please enter new token in Meta tab..."
                     ))
-                    self.root.after(0, lambda: self.meta_token_frame.grid(row=1, column=0, columnspan=2, sticky="ew", pady=(6, 0)))
+                    self.root.after(0, lambda: self.meta_token_frame.pack(fill="x", pady=(6, 0)))
                     self.root.after(0, lambda: self.meta_token_entry.focus_set())
                     
                     # Reset and wait for user to update token
@@ -2440,44 +2238,26 @@ class AdsReportFetcherApp:
                         self.root.after(0, lambda: self.status_text.set(
                             "Meta fetch cancelled: Token update timeout"
                         ))
-                        self.root.after(0, lambda: self.meta_token_frame.grid_remove())
+                        self.root.after(0, lambda: self.meta_token_frame.pack_forget())
                         return
                     
-                    new_token = self.meta_token_input.get().strip()
-                    if not new_token:
-                        self.logger.warning("No token provided")
-                        self.root.after(0, lambda: self.status_text.set(
-                            "Meta fetch cancelled: No token provided"
-                        ))
-                        self.root.after(0, lambda: self.meta_token_frame.grid_remove())
-                        return
-                    
-                    # Update token in yaml file
-                    ok, err = self._update_meta_token(new_token)
-                    if not ok:
-                        self.logger.error(f"Failed to update token in meta-ads.yaml: {err}")
-                        self.root.after(0, lambda: self.status_text.set(
-                            f"Error: {err or 'Failed to update token file'}"
-                        ))
-                        self.root.after(0, lambda: self.meta_token_frame.grid_remove())
-                        return
-                    
-                    # Hide token frame (will show again if token still expired)
-                    self.root.after(0, lambda: self.meta_token_frame.grid_remove())
-                    self.root.after(0, lambda: self.meta_token_input.set(""))
-                    
+                    # User already saved the token via "Update Token" (which writes to meta-ads.yaml
+                    # and then clears the input). Do not read meta_token_input here—it is empty.
+                    # Retry by creating a new MetaAdsFetcher; it will load the updated token from meta-ads.yaml.
                     self.logger.info(f"Token updated (attempt {retry_count}), retrying fetch...")
                     self.root.after(0, lambda: self.status_text.set(
                         f"Token updated. Retrying Meta fetch (attempt {retry_count})..."
                     ))
-                    # Continue loop to retry (will catch MetaTokenExpiredError again if new token is also expired)
+                    # Short delay so the YAML write is visible to the next reader (e.g. on network drives).
+                    time.sleep(0.25)
+                    continue  # Retry loop; new MetaAdsFetcher() will read meta-ads.yaml
             
             if retry_count >= max_retries:
                 self.logger.error(f"Max retries ({max_retries}) reached for token expiration")
                 self.root.after(0, lambda: self.status_text.set(
                     f"Error: Failed to update Meta token after {max_retries} attempts"
                 ))
-                self.root.after(0, lambda: self.meta_token_frame.grid_remove())
+                self.root.after(0, lambda: self.meta_token_frame.pack_forget())
                 return
             
             if results is None:
@@ -2499,9 +2279,6 @@ class AdsReportFetcherApp:
         finally:
             self.meta_is_processing = False
             self.meta_cancel_event.clear()
-            if self.meta_date_range_locked:
-                self.root.after(0, lambda: self.meta_start_button.configure(state="normal"))
-            self.root.after(0, lambda: self.meta_stop_button.configure(state="disabled"))
             self.root.after(0, lambda: self.new_fetch_button.configure(state="normal"))
             # Signal batch fetch that Meta fetch is complete
             self.meta_fetch_complete.set()
@@ -2775,6 +2552,49 @@ class AdsReportFetcherApp:
         dialog_done.wait(timeout=300)  # 5 minute timeout
         
         return result["token"]
+
+    def _check_meta_token_with_api(self, token: str) -> Tuple[bool, Optional[str], Optional[int]]:
+        """Validate Meta access token via Graph API debug_token. Returns (valid, error_message, expires_at)."""
+        try:
+            yaml_path = _APP_DIR / "meta-ads.yaml"
+            if not yaml_path.exists():
+                return False, "meta-ads.yaml not found", None
+            with open(yaml_path, "r", encoding="utf-8") as f:
+                config = yaml.safe_load(f) or {}
+            app_id = config.get("app_id") or ""
+            app_secret = config.get("app_secret") or ""
+            if not app_id or not app_secret:
+                return False, "meta-ads.yaml missing app_id or app_secret", None
+            app_token = f"{app_id}|{app_secret}"
+            url = (
+                "https://graph.facebook.com/v18.0/debug_token"
+                f"?input_token={urllib.parse.quote(token.strip())}"
+                f"&access_token={urllib.parse.quote(app_token)}"
+            )
+            req = urllib.request.Request(url)
+            with urllib.request.urlopen(req, timeout=15) as resp:
+                data = json.loads(resp.read().decode())
+            info = data.get("data") or {}
+            if not info.get("is_valid"):
+                return False, "Token invalid or expired", None
+            expires_at = info.get("expires_at")
+            if expires_at and expires_at != 0:
+                exp_str = datetime.utcfromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M UTC")
+                self.logger.info(f"Meta token valid until {exp_str}")
+            return True, None, expires_at if expires_at else None
+        except urllib.error.HTTPError as e:
+            body = e.read().decode() if e.fp else ""
+            try:
+                err = json.loads(body).get("error", {})
+                msg = err.get("message", body or str(e))
+            except Exception:
+                msg = body or str(e)
+            return False, f"Token check failed: {msg}", None
+        except urllib.error.URLError as e:
+            return False, f"Token check failed: {e.reason or str(e)}", None
+        except Exception as e:
+            self.logger.error(f"Token check error: {e}", exc_info=True)
+            return False, str(e), None
     
     def _update_meta_token(self, new_token: str) -> Tuple[bool, Optional[str]]:
         """Update access_token in meta-ads.yaml file. Validates token before saving.
