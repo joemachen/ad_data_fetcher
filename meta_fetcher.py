@@ -4,9 +4,11 @@ Fetches report data using the Meta (Facebook) Ads API.
 """
 
 import logging
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Tuple, Callable
+from dateutil.relativedelta import relativedelta
 import pandas as pd
 import yaml
 from facebook_business.api import FacebookAdsApi
@@ -16,6 +18,9 @@ from facebook_business.exceptions import FacebookRequestError
 
 # Directory containing this module (and meta-ads.yaml) so path works regardless of CWD
 _APP_DIR = Path(__file__).resolve().parent
+
+# Meta API only supports data for the last 37 months (Error 3018 for older data)
+META_RETENTION_MONTHS = 37
 
 
 class MetaTokenExpiredError(Exception):
@@ -47,6 +52,9 @@ class MetaAdsFetcher:
         self.progress_callback = progress_callback
         self.cancel_flag = cancel_flag
         
+        # Initialize Meta API client once per pipeline run; same client is reused for all months.
+        # Re-initializing per month can look suspicious to Meta's security filters.
+        
         # Setup logging
         logging.basicConfig(
             level=logging.INFO,
@@ -59,7 +67,6 @@ class MetaAdsFetcher:
         )
         self.logger = logging.getLogger(__name__)
         
-        # Initialize Meta API client
         self._init_api()
     
     def _init_api(self) -> None:
@@ -165,112 +172,106 @@ class MetaAdsFetcher:
         
         return 0
     
+    def _get_facebook_error_code(self, e: FacebookRequestError) -> Optional[int]:
+        """Extract error code from FacebookRequestError. Returns None if unavailable."""
+        try:
+            code = e.api_error_code()
+            return int(code) if code is not None else None
+        except (AttributeError, TypeError, ValueError):
+            pass
+        try:
+            body = getattr(e, "body", None) or getattr(e, "_body", None)
+            if isinstance(body, dict):
+                err = body.get("error") or body
+                code = err.get("code") if isinstance(err, dict) else None
+                return int(code) if code is not None else None
+        except (TypeError, ValueError, KeyError):
+            pass
+        return None
+
     def fetch_month_data(self, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
         """
         Fetch Meta Ads insights for a date range.
-        
-        Args:
-            start_date: Start date of the range
-            end_date: End date of the range
-        
-        Returns:
-            DataFrame with campaign data, or None if error
+        Only raises MetaTokenExpiredError when error code is 190.
+        On error code 17 (rate limit) or 1 (API unknown), pauses 5 seconds and retries.
         """
-        try:
-            start_str = start_date.strftime('%Y-%m-%d')
-            end_str = end_date.strftime('%Y-%m-%d')
-            
-            self._update_status(f"Fetching Meta Ads data for {start_str} to {end_str}...")
-            
-            # Get AdAccount object
-            account = AdAccount(self.ad_account_id)
-            
-            # Fields to request
-            fields = [
-                AdsInsights.Field.campaign_name,
-                AdsInsights.Field.impressions,
-                AdsInsights.Field.inline_link_clicks,
-                AdsInsights.Field.spend,
-                AdsInsights.Field.action_values,
-                AdsInsights.Field.actions
-            ]
-            
-            # Parameters for insights
-            params = {
-                'time_range': {
-                    'since': start_str,
-                    'until': end_str
-                },
-                'level': 'campaign',
-                'fields': fields
-            }
-            
-            # Fetch insights
-            insights = account.get_insights(params=params)
-            
-            # Process results
-            rows = []
-            for insight in insights:
-                campaign_name = insight.get(AdsInsights.Field.campaign_name, '')
-                impressions = int(insight.get(AdsInsights.Field.impressions, 0) or 0)
-                link_clicks = int(insight.get(AdsInsights.Field.inline_link_clicks, 0) or 0)
-                spend = float(insight.get(AdsInsights.Field.spend, 0) or 0)
-                
-                # Parse action_values for purchase conversion value
-                action_values = insight.get(AdsInsights.Field.action_values, [])
-                purchase_value = self._parse_action_value(action_values, 'purchase')
-                
-                # Parse actions for purchase conversions
-                actions = insight.get(AdsInsights.Field.actions, [])
-                purchase_count = self._parse_action_count(actions, 'purchase')
-                
-                rows.append({
-                    'Campaign name': campaign_name,
-                    'Impressions': impressions,
-                    'Link clicks': link_clicks,
-                    'Amount spent': spend,
-                    'Purchases conversion value': purchase_value,
-                    'Results': purchase_count
-                })
-            
-            if not rows:
-                self.logger.warning(f"No data returned for {start_str} to {end_str}")
+        start_str = start_date.strftime('%Y-%m-%d')
+        end_str = end_date.strftime('%Y-%m-%d')
+        max_retries_rate_limit = 3  # Max retries for rate limit / API unknown
+
+        for attempt in range(max_retries_rate_limit + 1):
+            if self.cancel_flag and self.cancel_flag.is_set():
                 return None
-            
-            df = pd.DataFrame(rows)
-            self.logger.info(f"Fetched {len(df)} campaigns for {start_str} to {end_str}")
-            return df
-            
-        except FacebookRequestError as e:
-            # Check if this is a token expiration error
             try:
-                error_code = e.api_error_code()
-                error_type = e.api_error_type()
-                error_message = str(e).lower()
-            except (AttributeError, TypeError):
-                # Fallback if methods don't exist
-                error_code = None
-                error_type = None
-                error_message = str(e).lower()
-            
-            # Check for OAuth token expiration (code 190 or "Session has expired" message)
-            if (error_code == 190 or 
-                error_type == 'OAuthException' or 
-                'session has expired' in error_message or
-                ('access token' in error_message and 'expired' in error_message)):
-                self.logger.error("Meta access token has expired")
-                self._update_status("Meta access token has expired")
-                raise MetaTokenExpiredError("Meta access token has expired. Please provide a new token.")
-            
-            error_msg = f"Meta Ads API error: {e}"
-            self.logger.error(error_msg, exc_info=True)
-            self._update_status(f"Error: {error_msg}")
-            return None
-        except Exception as e:
-            error_msg = f"Failed to fetch data: {str(e)}"
-            self.logger.error(error_msg, exc_info=True)
-            self._update_status(f"Error: {error_msg}")
-            return None
+                self._update_status(f"Fetching Meta Ads data for {start_str} to {end_str}...")
+                account = AdAccount(self.ad_account_id)
+                fields = [
+                    AdsInsights.Field.campaign_name,
+                    AdsInsights.Field.impressions,
+                    AdsInsights.Field.inline_link_clicks,
+                    AdsInsights.Field.spend,
+                    AdsInsights.Field.action_values,
+                    AdsInsights.Field.actions
+                ]
+                params = {
+                    'time_range': {'since': start_str, 'until': end_str},
+                    'level': 'campaign',
+                    'fields': fields
+                }
+                insights = account.get_insights(params=params)
+                rows = []
+                for insight in insights:
+                    campaign_name = insight.get(AdsInsights.Field.campaign_name, '')
+                    impressions = int(insight.get(AdsInsights.Field.impressions, 0) or 0)
+                    link_clicks = int(insight.get(AdsInsights.Field.inline_link_clicks, 0) or 0)
+                    spend = float(insight.get(AdsInsights.Field.spend, 0) or 0)
+                    action_values = insight.get(AdsInsights.Field.action_values, [])
+                    purchase_value = self._parse_action_value(action_values, 'purchase')
+                    actions = insight.get(AdsInsights.Field.actions, [])
+                    purchase_count = self._parse_action_count(actions, 'purchase')
+                    rows.append({
+                        'Campaign name': campaign_name,
+                        'Impressions': impressions,
+                        'Link clicks': link_clicks,
+                        'Amount spent': spend,
+                        'Purchases conversion value': purchase_value,
+                        'Results': purchase_count
+                    })
+                if not rows:
+                    self.logger.warning(f"No data returned for {start_str} to {end_str}")
+                    return None
+                df = pd.DataFrame(rows)
+                self.logger.info(f"Fetched {len(df)} campaigns for {start_str} to {end_str}")
+                return df
+            except FacebookRequestError as e:
+                error_code = self._get_facebook_error_code(e)
+                # Only raise MetaTokenExpiredError for OAuth/token expiry (code 190)
+                if error_code == 190:
+                    self.logger.error("Meta access token has expired (error 190)")
+                    self._update_status("Meta access token has expired")
+                    raise MetaTokenExpiredError("Meta access token has expired. Please provide a new token.")
+                # Rate limit (17) or API unknown (1): pause 5s and retry
+                if error_code in (17, 1):
+                    if attempt < max_retries_rate_limit:
+                        self.logger.warning(
+                            f"Meta API error {error_code} (rate limit or unknown). Pausing 5s and retrying ({attempt + 1}/{max_retries_rate_limit})..."
+                        )
+                        self._update_status(f"Rate limit/API delay (code {error_code}). Pausing 5s, retrying...")
+                        time.sleep(5)
+                        continue
+                    self.logger.error(f"Meta API error {error_code} after {max_retries_rate_limit} retries")
+                    self._update_status(f"Error: Meta API error {error_code} after retries")
+                    return None
+                error_msg = f"Meta Ads API error: {e}"
+                self.logger.error(error_msg, exc_info=True)
+                self._update_status(f"Error: {error_msg}")
+                return None
+            except Exception as e:
+                error_msg = f"Failed to fetch data: {str(e)}"
+                self.logger.error(error_msg, exc_info=True)
+                self._update_status(f"Error: {error_msg}")
+                return None
+        return None
     
     def fetch_monthly_reports(self, start_date: datetime, end_date: datetime) -> List[Tuple[datetime, bool]]:
         """
@@ -284,6 +285,7 @@ class MetaAdsFetcher:
             List of tuples (month_date, success_status)
         """
         results = []
+        meta_cutoff = (datetime.now() - relativedelta(months=META_RETENTION_MONTHS)).replace(day=1)
         
         try:
             # Generate list of months to process
@@ -301,17 +303,24 @@ class MetaAdsFetcher:
             
             self._update_status(f"Processing {len(months_to_process)} month(s)...")
             
-            # Process each month
+            # Process each month (1s delay between months to stay under Meta per-second rate limits)
             for idx, month_date in enumerate(months_to_process):
-                # Check for cancellation
                 if self.cancel_flag and self.cancel_flag.is_set():
                     self.logger.info("Processing cancelled by user")
                     self._update_status("Cancelled by user")
                     break
-                
+                if idx > 0:
+                    time.sleep(1)
+                month_start = datetime(month_date.year, month_date.month, 1)
+                if month_start < meta_cutoff:
+                    month_str = month_start.strftime("%B %Y")
+                    self.logger.info(f"Skipping {month_str} - outside Meta retention window")
+                    results.append((month_date, False))
+                    if self.progress_callback:
+                        self.progress_callback(idx + 1, len(months_to_process))
+                    continue
                 try:
                     # Calculate month start and end
-                    month_start = datetime(month_date.year, month_date.month, 1)
                     if month_date.month == 12:
                         month_end = datetime(month_date.year + 1, 1, 1) - timedelta(days=1)
                     else:

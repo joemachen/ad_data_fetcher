@@ -10,6 +10,7 @@ import threading
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from dateutil.relativedelta import relativedelta
 from typing import Optional, Tuple, List, Dict
 import tkinter.filedialog as filedialog
 import tkinter.scrolledtext as scrolledtext
@@ -28,6 +29,9 @@ _APP_DIR = Path(__file__).resolve().parent
 
 # Uniform width for all platform ID/account input fields (combobox)
 ID_FIELD_WIDTH = 400
+
+# Meta Ads API only supports data for the last 37 months (Error 3018 for older data)
+META_RETENTION_MONTHS = 37
 
 
 def _parse_id_from_favorite_display(display: str) -> str:
@@ -230,7 +234,7 @@ class AdsReportFetcherApp:
         )
         self.new_fetch_button.pack(side="left", padx=pad)
         self.run_full_pipeline_button = ctk.CTkButton(
-            header_frame, text="Run Full Pipeline", command=self._on_run_all_clicked,
+            header_frame, text="Run Fetch", command=self._on_run_all_clicked,
             font=ctk.CTkFont(size=13, weight="bold"), height=btn_h, width=btn_w,
             fg_color="#0066CC", hover_color="#0052A3"
         )
@@ -334,7 +338,7 @@ class AdsReportFetcherApp:
             data_text, data_color = "✓ No existing data", "#90EE90"
         self.data_status_label.configure(text=data_text, text_color=data_color)
 
-        # Run Full Pipeline: enabled only when at least one selected platform ready AND no data; gray when disabled
+        # Run Fetch: enabled only when at least one selected platform ready AND no data; gray when disabled
         google_selected = self.source_google_var.get()
         meta_selected = self.source_meta_var.get()
         ms_selected = self.source_ms_var.get()
@@ -543,6 +547,16 @@ class AdsReportFetcherApp:
         self.meta_account_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
         self.meta_card_status_label = ctk.CTkLabel(self.meta_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray")
         self.meta_card_status_label.pack(anchor="w", padx=10, pady=(0, 4))
+        self.meta_retention_warning_label = ctk.CTkLabel(
+            self.meta_card,
+            text="",
+            font=ctk.CTkFont(size=10),
+            text_color="#FFA500",
+            wraplength=280,
+            justify="left"
+        )
+        self.meta_retention_warning_label.pack(anchor="w", padx=10, pady=(0, 4))
+        self.meta_retention_warning_label.pack_forget()
         self.meta_token_frame = ctk.CTkFrame(self.meta_card, fg_color="transparent")
         ctk.CTkLabel(self.meta_token_frame, text="Meta Access Token Expired. Enter new token:", font=ctk.CTkFont(size=10, weight="bold"), text_color="#FF6B6B").pack(anchor="w", padx=0, pady=(2, 2))
         token_row = ctk.CTkFrame(self.meta_token_frame, fg_color="transparent")
@@ -832,36 +846,10 @@ class AdsReportFetcherApp:
 
     def _create_settings_tab(self) -> None:
         """Create Settings tab with configuration options."""
-        # Meta Token section
-        token_frame = ctk.CTkFrame(self.settings_tab)
-        token_frame.pack(pady=10, padx=20, fill="x")
-        
-        token_label = ctk.CTkLabel(
-            token_frame,
-            text="Meta Ads Access Token:",
-            font=ctk.CTkFont(size=12, weight="bold")
-        )
-        token_label.pack(anchor="w", padx=10, pady=(10, 5))
-        
-        token_input_frame = ctk.CTkFrame(token_frame)
-        token_input_frame.pack(pady=(0, 10), padx=10, fill="x")
-        
-        self.settings_token_entry = ctk.CTkEntry(
-            token_input_frame,
-            placeholder_text="Paste token (shown as ••• when typing)",
-            width=440,
-            show="*"
-        )
-        self.settings_token_entry.pack(side="left", padx=(0, 5), fill="x", expand=True)
-        
-        self.settings_meta_token_btn = ctk.CTkButton(
-            token_input_frame,
-            text="Save Token",
-            command=self._on_save_meta_token_settings,
-            width=120,
-            font=ctk.CTkFont(size=11)
-        )
-        self.settings_meta_token_btn.pack(side="left", padx=5)
+        # --- Campaign Rules Manager (mappings.json) ---
+        self._mappings_data: Dict[str, str] = {}
+        self._mappings_file = _APP_DIR / "mappings.json"
+        self._create_campaign_rules_section()
         
         # Scrollable area for Favourites Editor + Default Favorites (same pattern as Main tab)
         self.settings_scrollable = ctk.CTkScrollableFrame(self.settings_tab, height=450, fg_color="transparent")
@@ -1252,6 +1240,306 @@ class AdsReportFetcherApp:
         )
         save_settings_btn.pack(pady=10, padx=20, fill="x")
     
+    def _create_campaign_rules_section(self) -> None:
+        """Build Campaign Rules Manager UI and load mappings.json."""
+        rules_frame = ctk.CTkFrame(self.settings_tab)
+        rules_frame.pack(pady=10, padx=20, fill="both", expand=True)
+
+        # Sticky header: title, New Rule, Campaign Filter, and Save/Export stay at top; only the list scrolls
+        sticky_header = ctk.CTkFrame(rules_frame, fg_color="transparent")
+        sticky_header.pack(fill="x", pady=(0, 0))
+
+        ctk.CTkLabel(
+            sticky_header, text="Campaign Rules Manager",
+            font=ctk.CTkFont(size=12, weight="bold")
+        ).pack(anchor="w", padx=10, pady=(10, 2))
+        ctk.CTkLabel(
+            sticky_header,
+            text="Rules map campaign names to funnel stage (Top, Bottom) or DELETE (exclude). Used by Process All Data. Stored in mappings.json.",
+            font=ctk.CTkFont(size=10),
+            text_color="gray"
+        ).pack(anchor="w", padx=10, pady=(0, 2))
+        ctk.CTkLabel(
+            sticky_header,
+            text="Auto-rules (in processor): names containing 'Brand' or 'Branded' → Bottom.",
+            font=ctk.CTkFont(size=10),
+            text_color="gray"
+        ).pack(anchor="w", padx=10, pady=(0, 2))
+        ctk.CTkLabel(
+            sticky_header,
+            text="Partial matches are supported. The system matches these keywords case-insensitively.",
+            font=ctk.CTkFont(size=10),
+            text_color="gray"
+        ).pack(anchor="w", padx=10, pady=(0, 8))
+        
+        # --- New Rule section ---
+        ctk.CTkLabel(
+            sticky_header, text="New Rule",
+            font=ctk.CTkFont(size=11, weight="bold")
+        ).pack(anchor="w", padx=10, pady=(0, 4))
+        ctk.CTkLabel(
+            sticky_header,
+            text="New rule — campaign keyword (e.g., Spring Sale Campaign):",
+            font=ctk.CTkFont(size=10),
+            text_color="gray"
+        ).pack(anchor="w", padx=10, pady=(0, 2))
+        add_row = ctk.CTkFrame(sticky_header, fg_color="transparent")
+        add_row.pack(pady=(0, 4), padx=10, fill="x")
+        self.mappings_add_campaign_var = ctk.StringVar(value="")
+        self.mappings_add_campaign_entry = ctk.CTkEntry(
+            add_row, textvariable=self.mappings_add_campaign_var,
+            placeholder_text="e.g., Spring Sale Campaign or Advantage+", width=260, height=28
+        )
+        self.mappings_add_campaign_entry.pack(side="left", padx=(0, 8))
+        self.mappings_add_stage_var = ctk.StringVar(value="Top")
+        self.mappings_add_stage_menu = ctk.CTkOptionMenu(
+            add_row, variable=self.mappings_add_stage_var,
+            values=["Top", "Bottom", "DELETE"], width=100, height=28
+        )
+        self.mappings_add_stage_menu.pack(side="left", padx=(0, 8))
+        ctk.CTkButton(
+            add_row, text="Save new rule", command=self._on_mappings_add,
+            width=110, height=28, font=ctk.CTkFont(size=11),
+            fg_color="#0066CC", hover_color="#0052A3"
+        ).pack(side="left", padx=0)
+        
+        # --- Campaign Filter section (below New Rule) ---
+        ctk.CTkLabel(
+            sticky_header, text="Campaign Filter",
+            font=ctk.CTkFont(size=11, weight="bold")
+        ).pack(anchor="w", padx=10, pady=(10, 4))
+        ctk.CTkLabel(
+            sticky_header,
+            text="Filter by campaign keyword or stage (e.g., Advantage+):",
+            font=ctk.CTkFont(size=10),
+            text_color="gray"
+        ).pack(anchor="w", padx=10, pady=(0, 2))
+        filter_row = ctk.CTkFrame(sticky_header, fg_color="transparent")
+        filter_row.pack(pady=(0, 4), padx=10, fill="x")
+        self.mappings_filter_var = ctk.StringVar(value="")
+        self.mappings_filter_entry = ctk.CTkEntry(
+            filter_row, textvariable=self.mappings_filter_var,
+            placeholder_text="e.g., Advantage+", width=260, height=28
+        )
+        self.mappings_filter_entry.pack(side="left", padx=(0, 8))
+        self.mappings_filter_var.trace_add("write", lambda *a: self._mappings_refresh_list())
+        self.mappings_stage_filter_var = ctk.StringVar(value="All Stages")
+        self.mappings_stage_filter_menu = ctk.CTkOptionMenu(
+            filter_row, variable=self.mappings_stage_filter_var,
+            values=["All Stages", "Top", "Bottom", "DELETE"], width=110, height=28
+        )
+        self.mappings_stage_filter_menu.pack(side="left", padx=(0, 8))
+        self.mappings_stage_filter_var.trace_add("write", lambda *a: self._mappings_refresh_list())
+        
+        # Save + Export buttons (sticky at top; only the rules list scrolls)
+        btn_row = ctk.CTkFrame(sticky_header, fg_color="transparent")
+        btn_row.pack(pady=(6, 6), padx=10, fill="x")
+        save_mappings_btn = ctk.CTkButton(
+            btn_row, text="Save New Rule",
+            command=self._on_mappings_save,
+            width=180, height=32, font=ctk.CTkFont(size=11),
+            fg_color="green", hover_color="darkgreen"
+        )
+        save_mappings_btn.pack(side="left", padx=(0, 10))
+        ctk.CTkButton(
+            btn_row, text="Export to CSV",
+            command=self._on_mappings_export_csv,
+            width=120, height=32, font=ctk.CTkFont(size=11),
+            fg_color="gray", hover_color="darkgray"
+        ).pack(side="left", padx=0)
+        
+        # Rules list: only this part scrolls; sticky header stays pinned above
+        rules_list_container = ctk.CTkFrame(rules_frame, fg_color="transparent")
+        rules_list_container.pack(pady=(6, 10), padx=10, fill="both", expand=True)
+        self.mappings_rules_scroll = ctk.CTkScrollableFrame(rules_list_container, height=200, fg_color="transparent")
+        self.mappings_rules_scroll.pack(fill="both", expand=True)
+
+        def _on_rules_list_container_configure(event) -> None:
+            h = max(100, event.height)
+            if self.mappings_rules_scroll.winfo_exists() and self.mappings_rules_scroll.cget("height") != h:
+                self.mappings_rules_scroll.configure(height=h)
+
+        rules_list_container.bind("<Configure>", _on_rules_list_container_configure)
+
+        self._load_mappings_file()
+        self._mappings_refresh_list()
+    
+    def _load_mappings_file(self) -> None:
+        """Load mappings from mappings.json into _mappings_data."""
+        try:
+            if self._mappings_file.exists():
+                with open(self._mappings_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                self._mappings_data = {str(k): str(v) for k, v in (data or {}).items()}
+            else:
+                self._mappings_data = {}
+        except Exception as e:
+            self.logger.error(f"Error loading mappings: {e}", exc_info=True)
+            self._mappings_data = {}
+    
+    def _save_mappings_file(self) -> None:
+        """Write _mappings_data to mappings.json."""
+        try:
+            with open(self._mappings_file, "w", encoding="utf-8") as f:
+                json.dump(self._mappings_data, f, indent=2, ensure_ascii=False)
+            self.logger.info(f"Saved {len(self._mappings_data)} campaign rules to mappings.json")
+            self.status_text.set(f"Saved {len(self._mappings_data)} rules to mappings.json")
+        except Exception as e:
+            self.logger.error(f"Error saving mappings: {e}", exc_info=True)
+            self.status_text.set(f"Error saving mappings: {e}")
+    
+    def _mappings_refresh_list(self) -> None:
+        """Rebuild the rules list UI from _mappings_data, applying text and stage filters. Sorted by campaign name (case-insensitive)."""
+        for w in self.mappings_rules_scroll.winfo_children():
+            w.destroy()
+        filter_text = (self.mappings_filter_var.get() or "").strip().lower()
+        stage_filter = (self.mappings_stage_filter_var.get() or "All Stages").strip()
+        # Alphabetize by campaign name (case-insensitive)
+        items = sorted(self._mappings_data.items(), key=lambda x: x[0].lower())
+        shown = 0
+        for campaign, stage in items:
+            if filter_text and filter_text not in campaign.lower() and filter_text not in (stage or "").lower():
+                continue
+            if stage_filter != "All Stages" and stage != stage_filter:
+                continue
+            shown += 1
+            # Subtle row bg for tracking; hover darkens slightly
+            row_bg = ("#e8e8e8", "#353535")
+            row_hover_bg = ("#d8d8d8", "#454545")
+            row = ctk.CTkFrame(self.mappings_rules_scroll, fg_color=row_bg, corner_radius=4)
+            row.pack(fill="x", pady=2)
+            def _hover_on(r, bg=row_bg, hover=row_hover_bg):
+                r.configure(fg_color=hover)
+            def _hover_off(r, bg=row_bg):
+                r.configure(fg_color=bg)
+            row.bind("<Enter>", lambda e, r=row: _hover_on(r))
+            row.bind("<Leave>", lambda e, r=row: _hover_off(r))
+            disp_name = campaign if len(campaign) <= 52 else campaign[:49] + "..."
+            ctk.CTkLabel(row, text=disp_name, font=ctk.CTkFont(size=10), anchor="w").pack(side="left", padx=(6, 8), pady=4, fill="x", expand=True)
+            ctk.CTkLabel(row, text=stage, font=ctk.CTkFont(size=10), width=60, anchor="w").pack(side="left", padx=(0, 8), pady=4)
+            ctk.CTkButton(row, text="Edit", width=50, height=24, font=ctk.CTkFont(size=10), command=lambda c=campaign: self._on_mappings_edit(c)).pack(side="left", padx=2, pady=2)
+            ctk.CTkButton(row, text="Delete", width=50, height=24, font=ctk.CTkFont(size=10), fg_color="red", hover_color="darkred", command=lambda c=campaign: self._on_mappings_delete(c)).pack(side="left", padx=2, pady=2)
+        if shown == 0:
+            no_match = ctk.CTkLabel(
+                self.mappings_rules_scroll,
+                text="No matching rules found",
+                font=ctk.CTkFont(size=11),
+                text_color="gray"
+            )
+            no_match.pack(expand=True, pady=40)
+    
+    def _on_mappings_add(self) -> None:
+        """Add a new rule from the Add row. Case-insensitive: replaces any existing rule with same campaign name."""
+        self.root.update_idletasks()
+        campaign = self.mappings_add_campaign_var.get().strip()
+        if not campaign:
+            self.status_text.set("Error: Enter a campaign name")
+            return
+        stage = self.mappings_add_stage_var.get().strip()
+        if stage not in ("Top", "Bottom", "DELETE"):
+            stage = "Top"
+        # Replace any existing key that matches case-insensitively
+        existing = next((k for k in self._mappings_data if k.lower() == campaign.lower()), None)
+        if existing is not None:
+            del self._mappings_data[existing]
+            self.status_text.set("Rule updated (replaced existing). Click Save to write file.")
+        else:
+            self.status_text.set(f"Added rule: {campaign} → {stage} (click Save to write file)")
+        self._mappings_data[campaign] = stage
+        self.mappings_add_campaign_var.set("")
+        self._mappings_refresh_list()
+    
+    def _on_mappings_edit(self, campaign: str) -> None:
+        """Edit an existing rule via dialog."""
+        current_stage = self._mappings_data.get(campaign, "Top")
+        result = {"campaign": campaign, "stage": current_stage}
+        dialog_done = threading.Event()
+        
+        def show_dialog() -> None:
+            d = ctk.CTkToplevel(self.root)
+            d.title("Edit Campaign Rule")
+            d.geometry("420x180")
+            d.transient(self.root)
+            d.grab_set()
+            ctk.CTkLabel(d, text="Campaign name:", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=15, pady=(15, 4))
+            name_entry = ctk.CTkEntry(d, width=380, height=28)
+            name_entry.pack(padx=15, pady=(0, 10), fill="x")
+            name_entry.insert(0, campaign)
+            ctk.CTkLabel(d, text="Funnel stage:", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=15, pady=(8, 4))
+            stage_var = ctk.StringVar(value=current_stage)
+            stage_menu = ctk.CTkOptionMenu(d, variable=stage_var, values=["Top", "Bottom", "DELETE"], width=120)
+            stage_menu.pack(anchor="w", padx=15, pady=(0, 15))
+            def on_ok() -> None:
+                result["campaign"] = name_entry.get().strip()
+                result["stage"] = stage_var.get().strip()
+                if result["stage"] not in ("Top", "Bottom", "DELETE"):
+                    result["stage"] = "Top"
+                dialog_done.set()
+                d.destroy()
+            def on_cancel() -> None:
+                dialog_done.set()
+                d.destroy()
+            btn_frame = ctk.CTkFrame(d, fg_color="transparent")
+            btn_frame.pack(pady=10, padx=15)
+            ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80).pack(side="left", padx=5)
+            ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80, fg_color="gray").pack(side="left", padx=5)
+        
+        self.root.after(0, show_dialog)
+        dialog_done.wait(timeout=60)
+        new_campaign = (result.get("campaign") or "").strip()
+        new_stage = result.get("stage") or "Top"
+        if not new_campaign:
+            return
+        # Remove any key that matches old or new campaign name case-insensitively (consolidate)
+        to_remove = [k for k in self._mappings_data if k.lower() == campaign.lower() or k.lower() == new_campaign.lower()]
+        for k in to_remove:
+            del self._mappings_data[k]
+        self._mappings_data[new_campaign] = new_stage
+        self._mappings_refresh_list()
+        self.status_text.set(f"Updated rule (click Save to write file)")
+    
+    def _on_mappings_delete(self, campaign: str) -> None:
+        """Remove a rule."""
+        if campaign in self._mappings_data:
+            del self._mappings_data[campaign]
+            self._mappings_refresh_list()
+            self.status_text.set(f"Removed rule: {campaign} (click Save to write file)")
+    
+    def _on_mappings_save(self) -> None:
+        """Persist _mappings_data to mappings.json."""
+        self._save_mappings_file()
+    
+    def _on_mappings_export_csv(self) -> None:
+        """Export current rules (filtered view) to a CSV file via file dialog. Columns: Campaign Name, Funnel Stage."""
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Export campaign rules to CSV"
+        )
+        if not path:
+            return
+        filter_text = (self.mappings_filter_var.get() or "").strip().lower()
+        stage_filter = (self.mappings_stage_filter_var.get() or "All Stages").strip()
+        items = sorted(self._mappings_data.items(), key=lambda x: x[0].lower())
+        rows = []
+        for campaign, stage in items:
+            if filter_text and filter_text not in campaign.lower() and filter_text not in (stage or "").lower():
+                continue
+            if stage_filter != "All Stages" and stage != stage_filter:
+                continue
+            rows.append((campaign, stage))
+        try:
+            import csv
+            with open(path, "w", newline="", encoding="utf-8") as f:
+                w = csv.writer(f)
+                w.writerow(["Campaign Name", "Funnel Stage"])
+                w.writerows(rows)
+            self.status_text.set(f"Exported {len(rows)} rules to {path}")
+            self.logger.info(f"Exported {len(rows)} campaign rules to {path}")
+        except Exception as e:
+            self.logger.error(f"Export CSV error: {e}", exc_info=True)
+            self.status_text.set(f"Error exporting: {e}")
+    
     def _save_settings(self) -> None:
         """Save settings to config.json file."""
         try:
@@ -1260,46 +1548,6 @@ class AdsReportFetcherApp:
             self.logger.info("Settings saved successfully")
         except Exception as e:
             self.logger.error(f"Error saving settings: {e}", exc_info=True)
-    
-    def _on_save_meta_token_settings(self) -> None:
-        """Save Meta token from settings tab. Validates token via API before saving (same flow as Main tab)."""
-        self.root.update_idletasks()
-        token = self.settings_token_entry.get().strip()
-        if not token:
-            self.status_text.set("Error: Please enter a token")
-            return
-
-        self.settings_meta_token_btn.configure(state="disabled")
-        self.status_text.set("Checking token...")
-
-        def check_and_save() -> None:
-            try:
-                valid, check_err, _ = self._check_meta_token_with_api(token)
-                if not valid:
-                    def on_check_failed() -> None:
-                        self.settings_meta_token_btn.configure(state="normal")
-                        self.status_text.set(f"Token invalid: {check_err or 'Unknown error'}")
-                    self.root.after(0, on_check_failed)
-                    return
-                self.root.after(0, lambda: self.status_text.set("Token valid. Saving..."))
-                ok, err = self._update_meta_token(token)
-                def on_done() -> None:
-                    self.settings_meta_token_btn.configure(state="normal")
-                    if ok:
-                        self.status_text.set("Token valid and saved successfully")
-                        self.logger.info("Meta token saved from Settings tab")
-                        self.settings_token_entry.delete(0, "end")
-                    else:
-                        self.status_text.set(f"Error: {err or 'Failed to update token file'}")
-                self.root.after(0, on_done)
-            except Exception as e:
-                self.logger.error(f"Meta token save error: {e}", exc_info=True)
-                def on_fail() -> None:
-                    self.settings_meta_token_btn.configure(state="normal")
-                    self.status_text.set(f"Error: {e}")
-                self.root.after(0, on_fail)
-
-        threading.Thread(target=check_and_save, daemon=True).start()
     
     def _on_google_default_favorite_changed(self, choice: str) -> None:
         """Handle Google default favorite change in settings."""
@@ -1463,6 +1711,19 @@ class AdsReportFetcherApp:
         self.end_year_menu.configure(state="disabled")
         self.confirm_date_btn.configure(text="Date Range Locked", state="disabled")
         self.unlock_date_btn.configure(state="normal")
+        # Meta retention: show warning in Meta card if start date is older than 37 months
+        start_year = int(self.start_year.get())
+        start_month_num = self._month_name_to_number(self.start_month.get())
+        start_date = datetime(start_year, start_month_num, 1)
+        meta_cutoff = (datetime.now() - relativedelta(months=META_RETENTION_MONTHS)).replace(day=1)
+        if start_date < meta_cutoff:
+            cutoff_display = meta_cutoff.strftime("%B %Y")
+            self.meta_retention_warning_label.configure(
+                text=f"Meta only supports data for the last {META_RETENTION_MONTHS} months. Dates prior to {cutoff_display} will be skipped."
+            )
+            self.meta_retention_warning_label.pack(anchor="w", padx=10, pady=(0, 4))
+        else:
+            self.meta_retention_warning_label.pack_forget()
         is_valid_google, _ = self._validate_inputs()
         is_valid_meta, _ = self._validate_meta_inputs()
         self.status_text.set("Date range confirmed for all platforms")
@@ -1473,6 +1734,7 @@ class AdsReportFetcherApp:
         """Unlock the global date range for editing."""
         self.date_range_locked = False
         self.meta_date_range_locked = False
+        self.meta_retention_warning_label.pack_forget()
         self.start_month_menu.configure(state="normal")
         self.start_year_menu.configure(state="normal")
         self.end_month_menu.configure(state="normal")

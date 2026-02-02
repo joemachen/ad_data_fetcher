@@ -12,6 +12,9 @@ import re
 import json
 import threading
 
+# Directory containing this module (mappings.json lives here)
+_APP_DIR = Path(__file__).resolve().parent
+
 
 # --- Standardized Schema (platform-agnostic internal format) ---
 
@@ -162,8 +165,8 @@ class ReportProcessor:
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logger.info(f"Output directory: {self.output_dir.absolute()}")
         
-        # Load campaign mappings
-        self.mappings_file = Path("mappings.json")
+        # Load campaign mappings (same path as GUI: _APP_DIR / mappings.json)
+        self.mappings_file = _APP_DIR / "mappings.json"
         self.campaign_mappings: Dict[str, str] = {}
         self._load_mappings()
     
@@ -216,15 +219,19 @@ class ReportProcessor:
         if not campaign_name or not isinstance(campaign_name, str):
             return "Top"
         
-        # Step 1: Check memory (mappings.json)
-        if campaign_name in self.campaign_mappings:
-            return self.campaign_mappings[campaign_name]
+        # Step 1: Check memory (mappings.json) — case-insensitive match
+        campaign_lower = campaign_name.lower()
+        for k, v in self.campaign_mappings.items():
+            if k.lower() == campaign_lower:
+                return v
         
         # Step 2: Auto-rules (check for Brand/Branded keywords)
-        campaign_lower = campaign_name.lower()
         for keyword in BOTTOM_FUNNEL_KEYWORDS:
             if keyword.lower() in campaign_lower:
-                # Auto-assign and save to mappings
+                # Auto-assign and save; replace any existing key that matches case-insensitively
+                existing = next((key for key in self.campaign_mappings if key.lower() == campaign_lower), None)
+                if existing is not None:
+                    del self.campaign_mappings[existing]
                 self.campaign_mappings[campaign_name] = "Bottom"
                 self._save_mappings()
                 self.logger.info(f"Auto-classified '{campaign_name}' as Bottom (contains '{keyword}')")
@@ -235,7 +242,10 @@ class ReportProcessor:
             try:
                 user_choice = self.user_input_callback(campaign_name)
                 if user_choice in ["Top", "Bottom", "DELETE"]:
-                    # Save to mappings for Top, Bottom, and DELETE (always ignore)
+                    # Save to mappings; replace any existing key that matches case-insensitively
+                    existing = next((key for key in self.campaign_mappings if key.lower() == campaign_lower), None)
+                    if existing is not None:
+                        del self.campaign_mappings[existing]
                     self.campaign_mappings[campaign_name] = user_choice
                     self._save_mappings()
                     if user_choice != "DELETE":
