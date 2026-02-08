@@ -1398,42 +1398,41 @@ class AdsReportFetcherApp:
         self._mappings_refresh_list()
     
     def _on_mappings_edit(self, campaign: str) -> None:
-        """Edit an existing rule via dialog."""
+        """Edit an existing rule via dialog. Uses wait_window so the main thread stays responsive (no blocking with Event)."""
         current_stage = self._mappings_data.get(campaign, "Top")
         result = {"campaign": campaign, "stage": current_stage}
-        dialog_done = threading.Event()
         
-        def show_dialog() -> None:
-            d = ctk.CTkToplevel(self.root)
-            d.title("Edit Campaign Rule")
-            d.geometry("420x180")
-            d.transient(self.root)
-            d.grab_set()
-            ctk.CTkLabel(d, text="Campaign name:", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=15, pady=(15, 4))
-            name_entry = ctk.CTkEntry(d, width=380, height=28)
-            name_entry.pack(padx=15, pady=(0, 10), fill="x")
-            name_entry.insert(0, campaign)
-            ctk.CTkLabel(d, text="Funnel stage:", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=15, pady=(8, 4))
-            stage_var = ctk.StringVar(value=current_stage)
-            stage_menu = ctk.CTkOptionMenu(d, variable=stage_var, values=["Top", "Bottom", "DELETE"], width=120)
-            stage_menu.pack(anchor="w", padx=15, pady=(0, 15))
-            def on_ok() -> None:
-                result["campaign"] = name_entry.get().strip()
-                result["stage"] = stage_var.get().strip()
-                if result["stage"] not in ("Top", "Bottom", "DELETE"):
-                    result["stage"] = "Top"
-                dialog_done.set()
-                d.destroy()
-            def on_cancel() -> None:
-                dialog_done.set()
-                d.destroy()
-            btn_frame = ctk.CTkFrame(d, fg_color="transparent")
-            btn_frame.pack(pady=10, padx=15)
-            ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80).pack(side="left", padx=5)
-            ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80, fg_color="gray").pack(side="left", padx=5)
+        d = ctk.CTkToplevel(self.root)
+        d.title("Edit Campaign Rule")
+        d.geometry("420x180")
+        d.transient(self.root)
+        d.grab_set()
+        ctk.CTkLabel(d, text="Campaign name:", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=15, pady=(15, 4))
+        name_entry = ctk.CTkEntry(d, width=380, height=28)
+        name_entry.pack(padx=15, pady=(0, 10), fill="x")
+        name_entry.insert(0, campaign)
+        ctk.CTkLabel(d, text="Funnel stage:", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=15, pady=(8, 4))
+        stage_var = ctk.StringVar(value=current_stage)
+        stage_menu = ctk.CTkOptionMenu(d, variable=stage_var, values=["Top", "Bottom", "DELETE"], width=120)
+        stage_menu.pack(anchor="w", padx=15, pady=(0, 15))
         
-        self.root.after(0, show_dialog)
-        dialog_done.wait(timeout=60)
+        def on_ok() -> None:
+            result["campaign"] = name_entry.get().strip()
+            result["stage"] = stage_var.get().strip()
+            if result["stage"] not in ("Top", "Bottom", "DELETE"):
+                result["stage"] = "Top"
+            d.destroy()
+        
+        def on_cancel() -> None:
+            result["campaign"] = ""
+            d.destroy()
+        
+        btn_frame = ctk.CTkFrame(d, fg_color="transparent")
+        btn_frame.pack(pady=10, padx=15)
+        ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80).pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80, fg_color="gray").pack(side="left", padx=5)
+        
+        d.wait_window(d)
         new_campaign = (result.get("campaign") or "").strip()
         new_stage = result.get("stage") or "Top"
         if not new_campaign:
@@ -3349,11 +3348,6 @@ class AdsReportFetcherApp:
         name_entry.bind('<Return>', lambda e: customer_id_entry.focus())
         customer_id_entry.bind('<Return>', lambda e: save_favorite())
     
-    def _show_add_favorite_dialog(self) -> None:
-        """Show dialog to add a new favorite (deprecated - use Settings)."""
-        # Redirect to settings method
-        self._on_settings_add_google_favorite()
-    
     def _on_settings_edit_google_favorite(self) -> None:
         """Show dialog to edit a Google Ads favorite from Settings."""
         if not hasattr(self, 'settings_google_favorite_menu'):
@@ -3466,88 +3460,6 @@ class AdsReportFetcherApp:
         name_entry.bind('<Return>', lambda e: customer_id_entry.focus())
         customer_id_entry.bind('<Return>', lambda e: save_edit())
     
-    def _show_edit_favorite_dialog(self) -> None:
-        """Show dialog to edit a favorite name (deprecated - use Settings)."""
-        # Redirect to settings method
-        self._on_settings_edit_google_favorite()
-        
-        cid = self.customer_id.get().strip()
-        selected_fav = next((f for f in self.favorites if (f.get("customer_id") or "").strip() == cid), None)
-        
-        if not selected_fav:
-            return
-        
-        dialog = ctk.CTkToplevel(self.root)
-        dialog.title("Edit Favorite")
-        dialog.geometry("400x150")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (400 // 2)
-        y = (dialog.winfo_screenheight() // 2) - (150 // 2)
-        dialog.geometry(f"400x150+{x}+{y}")
-        
-        name_var = ctk.StringVar(value=selected_fav["name"])
-        
-        name_label = ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12))
-        name_label.pack(pady=(20, 5), padx=20)
-        
-        name_entry = ctk.CTkEntry(
-            dialog,
-            textvariable=name_var,
-            width=360,
-            font=ctk.CTkFont(size=12)
-        )
-        name_entry.pack(pady=5, padx=20)
-        name_entry.select_range(0, ctk.END)
-        name_entry.focus()
-        
-        def save_edit() -> None:
-            new_name = name_var.get().strip()
-            if not new_name:
-                self.status_text.set("Error: Please enter a name for the favorite")
-                dialog.destroy()
-                return
-            
-            if any(fav["name"] == new_name and fav != selected_fav for fav in self.favorites):
-                self.status_text.set(f"Error: A favorite named '{new_name}' already exists")
-                dialog.destroy()
-                return
-            
-            selected_fav["name"] = new_name
-            self._save_favorites()
-            self._update_favorites_menu()
-            self._set_google_id_display_from_id()
-            self.status_text.set(f"Updated favorite: {new_name}")
-            dialog.destroy()
-        
-        button_frame = ctk.CTkFrame(dialog)
-        button_frame.pack(pady=15, padx=20)
-        
-        save_btn = ctk.CTkButton(
-            button_frame,
-            text="Save",
-            command=save_edit,
-            width=100,
-            font=ctk.CTkFont(size=12)
-        )
-        save_btn.pack(side="left", padx=10)
-        
-        cancel_btn = ctk.CTkButton(
-            button_frame,
-            text="Cancel",
-            command=dialog.destroy,
-            width=100,
-            font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray"
-        )
-        cancel_btn.pack(side="left", padx=10)
-        
-        dialog.bind('<Return>', lambda e: save_edit())
-        name_entry.bind('<Return>', lambda e: save_edit())
-    
     def _on_settings_delete_google_favorite(self) -> None:
         """Delete the selected Google Ads favorite from Settings."""
         if not hasattr(self, 'settings_google_favorite_menu'):
@@ -3570,11 +3482,6 @@ class AdsReportFetcherApp:
             self.settings_google_favorite_menu.set("None")
             self.status_text.set(f"Deleted favorite: {current_selection}")
             self.logger.info(f"Deleted Google Ads favorite: {current_selection}")
-    
-    def _delete_favorite(self) -> None:
-        """Delete the selected favorite (deprecated - use Settings)."""
-        # Redirect to settings method
-        self._on_settings_delete_google_favorite()
     
     def _load_meta_favorites(self) -> None:
         """Load Meta Ads favorites from JSON file."""
@@ -3869,85 +3776,6 @@ class AdsReportFetcherApp:
         name_entry.bind('<Return>', lambda e: account_id_entry.focus())
         account_id_entry.bind('<Return>', lambda e: save_favorite())
     
-    def _show_add_meta_favorite_dialog(self) -> None:
-        """Show dialog to add a new Meta favorite (deprecated - use Settings)."""
-        # Redirect to settings method
-        self._on_settings_add_meta_favorite()
-        
-        dialog = ctk.CTkToplevel(self.root)
-        dialog.title("Add Meta Favorite")
-        dialog.geometry("400x150")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (400 // 2)
-        y = (dialog.winfo_screenheight() // 2) - (150 // 2)
-        dialog.geometry(f"400x150+{x}+{y}")
-        
-        name_var = ctk.StringVar(value="")
-        
-        name_label = ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12))
-        name_label.pack(pady=(20, 5), padx=20)
-        
-        name_entry = ctk.CTkEntry(
-            dialog,
-            textvariable=name_var,
-            placeholder_text="Enter a name for this Ad Account ID",
-            width=360,
-            font=ctk.CTkFont(size=12)
-        )
-        name_entry.pack(pady=5, padx=20)
-        name_entry.focus()
-        
-        def save_favorite() -> None:
-            name = name_var.get().strip()
-            if not name:
-                self.status_text.set("Error: Please enter a name for the favorite")
-                dialog.destroy()
-                return
-            
-            if any(fav["name"] == name for fav in self.meta_favorites):
-                self.status_text.set(f"Error: A favorite named '{name}' already exists")
-                dialog.destroy()
-                return
-            
-            account_id_clean = self.meta_account_id.get().strip()
-            self.meta_favorites.append({
-                "name": name,
-                "account_id": account_id_clean
-            })
-            self._save_meta_favorites()
-            self._update_meta_favorites_menu()
-            self.status_text.set(f"Added Meta favorite: {name}")
-            dialog.destroy()
-        
-        button_frame = ctk.CTkFrame(dialog)
-        button_frame.pack(pady=15, padx=20)
-        
-        save_btn = ctk.CTkButton(
-            button_frame,
-            text="Save",
-            command=save_favorite,
-            width=100,
-            font=ctk.CTkFont(size=12)
-        )
-        save_btn.pack(side="left", padx=10)
-        
-        cancel_btn = ctk.CTkButton(
-            button_frame,
-            text="Cancel",
-            command=dialog.destroy,
-            width=100,
-            font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray"
-        )
-        cancel_btn.pack(side="left", padx=10)
-        
-        dialog.bind('<Return>', lambda e: save_favorite())
-        name_entry.bind('<Return>', lambda e: save_favorite())
-    
     def _on_settings_edit_meta_favorite(self) -> None:
         """Show dialog to edit a Meta Ads favorite from Settings."""
         if not hasattr(self, 'settings_meta_favorite_menu'):
@@ -4076,88 +3904,6 @@ class AdsReportFetcherApp:
         name_entry.bind('<Return>', lambda e: account_id_entry.focus())
         account_id_entry.bind('<Return>', lambda e: save_edit())
     
-    def _show_edit_meta_favorite_dialog(self) -> None:
-        """Show dialog to edit a Meta favorite name (deprecated - use Settings)."""
-        # Redirect to settings method
-        self._on_settings_edit_meta_favorite()
-        
-        aid = self.meta_account_id.get().strip()
-        selected_fav = next((f for f in self.meta_favorites if (f.get("account_id") or "").strip() == aid), None)
-        
-        if not selected_fav:
-            return
-        
-        dialog = ctk.CTkToplevel(self.root)
-        dialog.title("Edit Meta Favorite")
-        dialog.geometry("400x150")
-        dialog.transient(self.root)
-        dialog.grab_set()
-        
-        dialog.update_idletasks()
-        x = (dialog.winfo_screenwidth() // 2) - (400 // 2)
-        y = (dialog.winfo_screenheight() // 2) - (150 // 2)
-        dialog.geometry(f"400x150+{x}+{y}")
-        
-        name_var = ctk.StringVar(value=selected_fav["name"])
-        
-        name_label = ctk.CTkLabel(dialog, text="Favorite Name:", font=ctk.CTkFont(size=12))
-        name_label.pack(pady=(20, 5), padx=20)
-        
-        name_entry = ctk.CTkEntry(
-            dialog,
-            textvariable=name_var,
-            width=360,
-            font=ctk.CTkFont(size=12)
-        )
-        name_entry.pack(pady=5, padx=20)
-        name_entry.select_range(0, ctk.END)
-        name_entry.focus()
-        
-        def save_edit() -> None:
-            new_name = name_var.get().strip()
-            if not new_name:
-                self.status_text.set("Error: Please enter a name for the favorite")
-                dialog.destroy()
-                return
-            
-            if any(fav["name"] == new_name and fav != selected_fav for fav in self.meta_favorites):
-                self.status_text.set(f"Error: A favorite named '{new_name}' already exists")
-                dialog.destroy()
-                return
-            
-            selected_fav["name"] = new_name
-            self._save_meta_favorites()
-            self._update_meta_favorites_menu()
-            self._set_meta_id_display_from_id()
-            self.status_text.set(f"Updated Meta favorite: {new_name}")
-            dialog.destroy()
-        
-        button_frame = ctk.CTkFrame(dialog)
-        button_frame.pack(pady=15, padx=20)
-        
-        save_btn = ctk.CTkButton(
-            button_frame,
-            text="Save",
-            command=save_edit,
-            width=100,
-            font=ctk.CTkFont(size=12)
-        )
-        save_btn.pack(side="left", padx=10)
-        
-        cancel_btn = ctk.CTkButton(
-            button_frame,
-            text="Cancel",
-            command=dialog.destroy,
-            width=100,
-            font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray"
-        )
-        cancel_btn.pack(side="left", padx=10)
-        
-        dialog.bind('<Return>', lambda e: save_edit())
-        name_entry.bind('<Return>', lambda e: save_edit())
-    
     def _on_settings_delete_meta_favorite(self) -> None:
         """Delete the selected Meta Ads favorite from Settings."""
         if not hasattr(self, 'settings_meta_favorite_menu'):
@@ -4180,11 +3926,6 @@ class AdsReportFetcherApp:
             self.settings_meta_favorite_menu.set("None")
             self.status_text.set(f"Deleted favorite: {current_selection}")
             self.logger.info(f"Deleted Meta Ads favorite: {current_selection}")
-    
-    def _delete_meta_favorite(self) -> None:
-        """Delete the selected Meta favorite (deprecated - use Settings)."""
-        # Redirect to settings method
-        self._on_settings_delete_meta_favorite()
     
     def _on_ms_default_favorite_changed(self, choice: str) -> None:
         self.settings["default_ms_favorite"] = None if choice == "None" else choice

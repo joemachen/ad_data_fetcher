@@ -52,6 +52,7 @@ wheels/
 # --- Logs and runtime ---
 app_debug.log
 *.log
+*.log.*
 
 # --- Browser / auth context (Playwright, etc.) ---
 browser_context/
