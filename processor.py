@@ -11,6 +11,7 @@ from typing import List, Optional, Dict, Callable, Tuple, Any
 import re
 import json
 import threading
+from datetime import datetime
 
 # Directory containing this module (mappings.json lives here)
 _APP_DIR = Path(__file__).resolve().parent
@@ -106,7 +107,10 @@ PLATFORM_CONFIG: Dict[str, Dict[str, Any]] = {
         'column_mapping': {
             'campaign_name': 'Campaign',
             'amount_spent': 'Cost',
-            'conversion': 'Conversions',
+            'impressions': 'Impressions',
+            'clicks': 'Clicks',
+            'conversion_purchase_total_value': 'Revenue',
+            'conversions': 'Conversions',
         },
         'display_name': 'Reddit Ads',
         'channel': 'Paid Social',
@@ -127,6 +131,9 @@ PLATFORM_CONFIG: Dict[str, Dict[str, Any]] = {
 # --- Funnel stage rules (used for all platforms via mappings.json + auto-rules) ---
 
 BOTTOM_FUNNEL_KEYWORDS = ['Brand', 'Branded']
+
+# --- Range-based filename: YYYY-MM-DD_YYYY-MM-DD.csv (same month-day across years pairs for YoY) ---
+RANGE_FILENAME_PATTERN = re.compile(r'^(\d{4})-(\d{2})-(\d{2})_(\d{4})-(\d{2})-(\d{2})\.csv$')
 
 
 class ReportProcessor:
@@ -268,17 +275,36 @@ class ReportProcessor:
         # Fallback: default to Top if no callback
         return "Top"
     
-    def _parse_month_year_from_filename(self, filename: str) -> Tuple[str, str]:
+    def _parse_range_from_filename(self, filename: str) -> Optional[Tuple[str, str, str]]:
         """
-        Parse month and year from filename of form {month}_{year}.csv (e.g. jan_2025.csv).
-        Returns (Month_str, Year_str); ('Unknown', 'Unknown') if pattern does not match.
+        Parse date-range filename of form YYYY-MM-DD_YYYY-MM-DD.csv (e.g. 2025-01-05_2025-01-20.csv).
+        Returns (start_str, end_str, range_id) where range_id is MM-DD_MM-DD for YoY pairing; None if no match.
         """
-        match = re.match(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)_(\d{4})\.csv$', filename, re.IGNORECASE)
-        if not match:
+        m = RANGE_FILENAME_PATTERN.match(filename)
+        if not m:
+            return None
+        y1, mo1, d1, y2, mo2, d2 = m.groups()
+        start_str = f"{y1}-{mo1}-{d1}"
+        end_str = f"{y2}-{mo2}-{d2}"
+        range_id = f"{mo1}-{d1}_{mo2}-{d2}"  # same month-day across years
+        return (start_str, end_str, range_id)
+
+    def _parse_month_year_from_range_filename(self, filename: str) -> Tuple[str, str]:
+        """
+        Derive Month and Year from range filename YYYY-MM-DD_YYYY-MM-DD.csv (use start date).
+        Returns (Month_str, Year_str) for INTERNAL_SCHEMA; ('Unknown', 'Unknown') if pattern does not match.
+        """
+        parsed = self._parse_range_from_filename(filename)
+        if not parsed:
             return ('Unknown', 'Unknown')
-        month_abbrev, year = match.groups()
-        month_display = month_abbrev.capitalize()
-        return (month_display, year)
+        start_str, _, _ = parsed
+        try:
+            dt = datetime.strptime(start_str, "%Y-%m-%d")
+            month_display = dt.strftime("%B")  # January, February, ...
+            year_str = str(dt.year)
+            return (month_display, year_str)
+        except ValueError:
+            return ('Unknown', 'Unknown')
     
     def _get_platform_config(self, parent_dir_name: str, filename: str) -> Tuple[str, Dict[str, Any]]:
         """
@@ -337,26 +363,19 @@ class ReportProcessor:
         """
         Find all CSV report files in subdirectories of the input directory.
         
-        Scans raw_reports/google/ and raw_reports/meta/ for files matching pattern: month_year.csv
+        Scans raw_reports/{platform}/ for files matching pattern: YYYY-MM-DD_YYYY-MM-DD.csv
         
         Returns:
             List of Path objects for found CSV files
         """
         report_files = []
-        
-        # Pattern for month_year.csv format: jan_2023.csv, feb_2025.csv, etc.
-        month_year_pattern = re.compile(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)_\d{4}\.csv$', re.IGNORECASE)
-        
-        # Scan platform subdirectories (google/ and meta/)
         if self.input_dir.exists():
             for platform_dir in self.input_dir.iterdir():
                 if platform_dir.is_dir():
                     for file_path in platform_dir.glob("*.csv"):
-                        filename = file_path.name
-                        if month_year_pattern.match(filename):
+                        if RANGE_FILENAME_PATTERN.match(file_path.name):
                             report_files.append(file_path)
-        
-        report_files.sort()  # Sort alphabetically
+        report_files.sort()
         return report_files
     
     def process_file(self, file_path: Path) -> Optional[Path]:
@@ -410,8 +429,8 @@ class ReportProcessor:
                 if schema_col in processed_df.columns and transform_name == 'divide_1e6':
                     processed_df[schema_col] = pd.to_numeric(processed_df[schema_col], errors='coerce').fillna(0) / 1_000_000
 
-            # Add Month, Year from filename
-            month_str, year_str = self._parse_month_year_from_filename(filename)
+            # Add Month, Year from range filename (start date)
+            month_str, year_str = self._parse_month_year_from_range_filename(filename)
             processed_df['Month'] = month_str
             processed_df['Year'] = year_str
             
@@ -499,7 +518,7 @@ class ReportProcessor:
 
     def merge_platform_data(self) -> None:
         """
-        Merge processed data by {month}_{year}.csv across all subfolders in processed_reports/.
+        Merge processed data by YYYY-MM-DD_YYYY-MM-DD.csv across all subfolders in processed_reports/.
         Each subfolder (google/, meta/, etc.) is scanned; matching filenames are combined
         and saved to merged_reports/ with INTERNAL_SCHEMA column order and validation.
         """
@@ -510,14 +529,13 @@ class ReportProcessor:
             merged_dir = Path("merged_reports")
             merged_dir.mkdir(parents=True, exist_ok=True)
             
-            # Collect all unique {month}_{year}.csv from any platform subfolder
-            month_year_pattern = re.compile(r'^(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)_\d{4}\.csv$', re.IGNORECASE)
+            # Collect all unique YYYY-MM-DD_YYYY-MM-DD.csv from any platform subfolder
             filenames = set()
             if self.output_dir.exists():
                 for platform_dir in self.output_dir.iterdir():
                     if platform_dir.is_dir():
                         for csv_file in platform_dir.glob("*.csv"):
-                            if month_year_pattern.match(csv_file.name):
+                            if RANGE_FILENAME_PATTERN.match(csv_file.name):
                                 filenames.add(csv_file.name)
             
             if not filenames:
@@ -574,5 +592,100 @@ class ReportProcessor:
             
         except Exception as e:
             error_msg = f"Error during merge: {e}"
+            self.logger.error(error_msg, exc_info=True)
+            self._update_status(error_msg)
+
+    def build_yoy_reports(self) -> None:
+        """
+        Build Year-over-Year (YoY) comparison CSVs from merged_reports.
+
+        Pairs merged files by same month-day range (e.g. 2025-01-05_2025-01-20 and 2024-01-05_2024-01-20).
+        Produces one ready file per pair: ready_2025-01-05_2025-01-20_vs_2024.csv.
+
+        Column order: Campaign, Platform, Channel, Funnel Stage, Year1, Year2,
+        Impressions (Year1), Impressions (Year2), ... (Year1 = prior year, Year2 = current year).
+        """
+        try:
+            self._update_status("Building YoY reports...")
+            self.logger.info("Building YoY reports from merged_reports")
+            merged_dir = Path("merged_reports")
+            if not merged_dir.exists():
+                self._update_status("No merged_reports directory")
+                self.logger.info("No merged_reports directory; skipping YoY")
+                return
+            # Group merged filenames by range_id (MM-DD_MM-DD) and year (from first YYYY in filename)
+            range_to_files: Dict[str, Dict[int, str]] = {}  # range_id -> {year: filename}
+            for csv_path in merged_dir.glob("*.csv"):
+                parsed = self._parse_range_from_filename(csv_path.name)
+                if not parsed:
+                    continue
+                start_str, end_str, range_id = parsed
+                year = int(start_str[:4])
+                if range_id not in range_to_files:
+                    range_to_files[range_id] = {}
+                range_to_files[range_id][year] = csv_path.name
+            key_cols = ['Campaign', 'Platform', 'Channel', 'Funnel Stage']
+            metric_cols = ['Impressions', 'Clicks', 'Cost', 'Revenue', 'Conversions']
+            ready_dir = Path("ready_reports")
+            ready_dir.mkdir(parents=True, exist_ok=True)
+            built = 0
+            for range_id, year_to_filename in range_to_files.items():
+                years = sorted(year_to_filename.keys())
+                if len(years) < 2:
+                    continue
+                # Use consecutive year pair: prior = min, current = next year present
+                for i in range(len(years) - 1):
+                    y1, y2 = years[i], years[i + 1]
+                    if y2 - y1 != 1:
+                        continue
+                    fn1 = merged_dir / year_to_filename[y1]
+                    fn2 = merged_dir / year_to_filename[y2]
+                    if not fn1.exists() or not fn2.exists():
+                        continue
+                    try:
+                        df1 = pd.read_csv(fn1)
+                        df2 = pd.read_csv(fn2)
+                    except Exception as e:
+                        self.logger.error(f"Error reading {fn1.name} or {fn2.name}: {e}")
+                        continue
+                    for col in key_cols + metric_cols:
+                        if col not in df1.columns:
+                            df1[col] = 0 if col in SCHEMA_NUMERIC else 'Unknown'
+                        if col not in df2.columns:
+                            df2[col] = 0 if col in SCHEMA_NUMERIC else 'Unknown'
+                    df1 = df1[key_cols + metric_cols].copy()
+                    df2 = df2[key_cols + metric_cols].copy()
+                    df1 = df1.groupby(key_cols, as_index=False)[metric_cols].sum()
+                    df2 = df2.groupby(key_cols, as_index=False)[metric_cols].sum()
+                    merged = df1.merge(
+                        df2,
+                        on=key_cols,
+                        how='outer',
+                        suffixes=(f' ({y1})', f' ({y2})')
+                    )
+                    for c in merged.columns:
+                        if f' ({y1})' in c or f' ({y2})' in c:
+                            merged[c] = pd.to_numeric(merged[c], errors='coerce').fillna(0)
+                    # Column order: Campaign, Platform, Channel, Funnel Stage, then each metric with newer year first: metric (y2), metric (y1)
+                    final_cols = (
+                        key_cols
+                        + [f"{c} ({y2})" for c in metric_cols]
+                        + [f"{c} ({y1})" for c in metric_cols]
+                    )
+                    merged = merged[[c for c in final_cols if c in merged.columns]]
+                    # Output: ready_2025-01-05_2025-01-20_vs_2024.csv (current range vs prior year)
+                    out_name = f"ready_{year_to_filename[y2].replace('.csv', '')}_vs_{y1}.csv"
+                    out_path = ready_dir / out_name
+                    merged.to_csv(out_path, index=False)
+                    self._update_status(f"YoY report saved: {out_path.name}")
+                    self.logger.info(f"YoY report saved: {out_path} ({len(merged)} rows)")
+                    built += 1
+            if built == 0:
+                self._update_status("No YoY pairs found (need same date range in two consecutive years)")
+                self.logger.info("No YoY pairs found; skipping ready_reports")
+            else:
+                self._update_status(f"YoY complete: {built} report(s) saved to ready_reports/")
+        except Exception as e:
+            error_msg = f"Error building YoY reports: {e}"
             self.logger.error(error_msg, exc_info=True)
             self._update_status(error_msg)

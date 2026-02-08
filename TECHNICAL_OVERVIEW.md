@@ -1,58 +1,61 @@
 # Ads Report Fetcher — Technical Overview
 
+For a quick **platform status and next steps** (what works, what’s pending, setup links), see **[PLATFORM_STATUS.md](PLATFORM_STATUS.md)**.
+
 ## Purpose
 
-**Ads Report Fetcher** is a desktop application that fetches advertising performance data from **Google Ads** and **Meta (Facebook) Ads**, processes it into a standardized format, and merges it into monthly reports. It supports a multi-step pipeline: fetch → process → merge, with a single “Run Full Pipeline” flow that runs fetches only for platforms selected in the GUI.
+**Ads Report Fetcher** is a desktop application that fetches advertising performance data from **Google Ads**, **Meta (Facebook) Ads**, **Microsoft Ads**, **Reddit Ads**, and (stubs) TikTok and Pinterest. It processes data into a standardized format and merges by **date range**, with optional **year-over-year** (YoY) comparison. Pipeline: fetch → process → merge (and optionally build YoY ready reports).
 
 ## Key Features
 
-- **Multi-platform fetch**: Google Ads, Meta Ads, Microsoft Ads, TikTok Ads, Reddit Ads, and Pinterest Ads. A single global date range (Control Panel) and per-platform Customer/Account ID inputs. Only **Google** and **Meta** fetchers are currently wired; Microsoft, TikTok, Reddit, and Pinterest are stubs (pipeline completes without fetching).
+- **Multi-platform fetch**: Google Ads, Meta Ads, Microsoft Ads, TikTok Ads, Reddit Ads, and Pinterest Ads. A single global date range (Control Panel) and per-platform Customer/Account ID inputs. **Google**, **Meta**, **Microsoft**, and **Reddit** fetchers are wired; TikTok and Pinterest are stubs (pipeline completes without fetching).
 - **Favorites**: Saved customer/account favorites for all six platforms (Google, Meta, Microsoft, TikTok, Reddit, Pinterest), editable in the Settings tab.
 - **Pipeline actions**:
   - **New Fetch**: Unlocks date range and inputs so a new fetch can be configured (enabled after a fetch completes).
-  - **Run Full Pipeline**: Runs only the platforms currently selected and “ready” (valid ID + confirmed date range). For each ready platform: runs its fetch (Google/Meta implemented; others stub), then processes all raw CSVs and merges. Requires no existing data (or user must clear data first). Progress and status appear in the header status bar and Live Log.
-  - **Process All Data**: No fetch; processes all raw CSVs in `raw_reports/` and runs the merge step.
+  - **Run Fetch**: Runs only the platforms currently selected and “ready” (valid ID + confirmed date range). For each ready platform: fetches the current date range (and optionally the same range for the previous year), then processes all raw CSVs, merges by range, and builds YoY ready reports when prior-year data exists. Progress and status appear in the header status bar and Live Log.
+  - **Process All Data**: No fetch; processes all raw CSVs and runs merge + YoY step.
   - **Clear All Data**: Deletes all CSV files in `raw_reports/`, `processed_reports/`, and `merged_reports/` (with confirmation).
-- **Pipeline status**: A global **Status** label (header bar) shows messages (e.g. “Checking token…”, “Token valid and saved successfully”). Run Full Pipeline is enabled only when at least one platform is selected and ready and there is no existing data.
+- **Pipeline status**: A global **Status** label (header bar) shows messages (e.g. “Checking token…”, “Token valid and saved successfully”). Run Fetch is enabled when at least one platform is selected and ready (data may exist; run overwrites).
 - **Campaign classification**: During processing, campaigns are classified as Top/Bottom funnel (or excluded). Uses `mappings.json`, auto-rules (e.g. “Brand”/“Branded” → Bottom), and optional user prompts for unclassified campaigns.
 - **Theme and config**: Settings tab for theme (dark/light), default favorites per platform, and Meta Ads access token. Config persisted in `config.json`.
 - **Meta token**: Token can be set in Settings or, when expired during a fetch, in the Main tab (token input frame). Token is validated via Meta Graph API `debug_token` before saving to `meta-ads.yaml`; save runs in a background thread so the UI stays responsive.
-- **Logging**: File (`app_debug.log`) and GUI Live Log; log messages from worker threads are enqueued and appended on the main thread to avoid Tk deadlock. Log is cleared on window close.
+- **Logging**: Rotating file (`app_debug.log`, 2 MB × 3 backups) and GUI Live Log; worker threads enqueue messages for the main thread. Tokens and full account/customer IDs are never logged (IDs are masked in log messages).
 
 ## Architecture
 
-- **GUI**: Single-window CustomTkinter app. **Header**: New Fetch, Run Full Pipeline, Process All Data, Clear All Data, data-status label; below it a **Status** label (bound to `status_text`) and pipeline progress when running. **Tabs**: **Main** (Control Panel — date range; platform cards in a scrollable frame with checkbox, account dropdown, and status per platform; Process Google Files / Process Meta Files buttons; Live Log at bottom) and **Settings** (Meta token field, Favourites Editor, default favorites). All long-running work (fetch, process, merge) runs in background threads; UI updates are scheduled on the main thread.
-- **Fetch**: Google via **Google Ads API** (`api_fetcher.py`); Meta via **Meta Ads API** (`meta_fetcher.py`). Microsoft, TikTok, Reddit, Pinterest are stubs in `main.py` (completion events set; fetcher modules exist but are not yet imported by main).
+- **GUI**: Single-window CustomTkinter app. **Header**: New Fetch, Run Fetch, Process All Data, Clear All Data, data-status label; below it a **Status** label and pipeline progress when running. **Tabs**: **Main** (date range picker, Confirm/Unlock, “Also pull same range previous year” checkbox below, then platform cards in two rows and Live Log), **Accounts** (default account per platform), **Settings** (theme, default favorites, Meta token, favorites editor). Default window size 960×1150 so both platform rows and Live Log are visible. All long-running work runs in background threads; UI updates are scheduled on the main thread.
+- **Fetch**: Google via **Google Ads API** (`api_fetcher.py`); Meta via **Meta Ads API** (`meta_fetcher.py`); Microsoft via **Bing Ads Reporting API** (`microsoft_fetcher.py`); Reddit via **Reddit Ads API v2** (`reddit_fetcher.py`, config in `reddit-ads.yaml`: client_id, client_secret, refresh_token; run `setup_reddit_auth.py` once for refresh_token). TikTok and Pinterest are stubs in `main.py`.
 - **Process**: `processor.py` is platform-agnostic. Defines **INTERNAL_SCHEMA** and **PLATFORM_CONFIG** (column mapping + display name + channel per platform). Raw CSVs in `raw_reports/{platform}/` are mapped, funnel stage applied (via `mappings.json`), then validated/filled and written to `processed_reports/{platform}/`.
-- **Merge**: Same module merges by `{month}_{year}.csv` across all subfolders of `processed_reports/` and writes unified monthly CSVs to `merged_reports/`.
-- **Config and state**: `config.json` (theme, default favorites, default folders), `customer_favorites.json`, `meta_favorites.json`, `ms_favorites.json`, `tiktok_favorites.json`, `reddit_favorites.json`, `pinterest_favorites.json`, `mappings.json` (campaign → funnel), `google-ads.yaml`, `meta-ads.yaml` for API credentials.
+- **Merge**: Processor discovers files by **date-range** pattern `YYYY-MM-DD_YYYY-MM-DD.csv` in `raw_reports/{platform}/` and `processed_reports/{platform}/`. Merges current-range and (if present) prior-year range into unified CSVs; builds YoY ready reports `ready_{current_range}_vs_{prior_year}.csv` with columns: Campaign, Platform, Channel, Funnel Stage, then per metric newer-year then older-year (e.g. `Impressions (2026)`, `Impressions (2025)`).
+- **Config and state**: All config paths are resolved from the app directory (`_APP_DIR`, same folder as `main.py`): `config.json`, `*_favorites.json`, `mappings.json`, `*-ads.yaml`. Restrictive file permissions (0o600) are applied on first write for `config.json` and `meta-ads.yaml`.
 
 ## Components
 
 | File | Role |
 |------|------|
-| **main.py** | GUI entry point. Builds Main tab (platform cards, date range, token-expired frame for Meta) and Settings tab (Meta token, favorites). Handles Run Full Pipeline, Process All Data, Clear All Data; starts background threads for fetch/process/merge. Meta token: validate via API, save to `meta-ads.yaml`, retry on expiry. |
-| **api_fetcher.py** | Google Ads API client. Loads `google-ads.yaml`, runs GAQL queries for campaign metrics per month, saves CSVs to `raw_reports/google/` as `{month}_{year}.csv`. |
+| **main.py** | GUI entry point. Builds Main tab (platform cards, date range, token-expired frame for Meta), Accounts tab (default account grid), and Settings tab (Meta token, favorites). Handles Run Fetch, Process All Data, Clear All Data; starts background threads for fetch/process/merge. Meta token: validate via API, save to `meta-ads.yaml`, retry on expiry. |
+| **api_fetcher.py** | Google Ads API client. Loads `google-ads.yaml`, runs GAQL for campaign metrics by date range, saves to `raw_reports/google/` as `YYYY-MM-DD_YYYY-MM-DD.csv`. |
 | **meta_fetcher.py** | Meta Ads API client. Loads `meta-ads.yaml` (app_id, app_secret, access_token), calls Insights API, saves to `raw_reports/meta/`. Raises `MetaTokenExpiredError` on token expiry. |
-| **microsoft_fetcher.py** | Microsoft Ads fetcher (skeleton). Not imported by main; pipeline stub only. |
+| **microsoft_fetcher.py** | Microsoft Ads fetcher. Uses bingads SDK; loads `microsoft-ads.yaml`; Campaign Performance Report by date range; saves to `raw_reports/microsoft/`. |
 | **tiktok_fetcher.py** | TikTok Ads fetcher (skeleton). Not imported by main; pipeline stub only. |
-| **reddit_fetcher.py** | Reddit Ads fetcher (skeleton). Not imported by main; pipeline stub only. |
+| **reddit_fetcher.py** | Reddit Ads fetcher. OAuth2 (adsread); loads `reddit-ads.yaml`; calls Reddit Ads API v2 report; saves to `raw_reports/reddit/` with campaign_name, amount_spent, conversion. |
 | **pinterest_fetcher.py** | Pinterest Ads fetcher (skeleton). Not imported by main; pipeline stub only. |
 | **processor.py** | Platform-agnostic. INTERNAL_SCHEMA, PLATFORM_CONFIG, reads raw CSVs, maps columns, applies funnel (mappings.json + auto-rules), writes processed CSVs, merges into `merged_reports/`. |
 
 ## Data Flow and Directories
 
-1. **Raw**: `raw_reports/google/`, `raw_reports/meta/`, (future: microsoft/, tiktok/, reddit/, pinterest/) — one CSV per month per platform, e.g. `jan_2025.csv`. Subfolders are auto-created by fetchers and processor.
-2. **Processed**: `processed_reports/{platform}/` — same filenames, standardized columns and funnel stage.
-3. **Merged**: `merged_reports/` — one CSV per month combining all platform rows.
+1. **Raw**: `raw_reports/{platform}/` — one CSV per date range per platform, e.g. `2025-01-05_2025-01-20.csv`. Subfolders are auto-created. No data for a range is skipped (logged, not fatal).
+2. **Processed**: `processed_reports/{platform}/` — same range filenames, standardized columns and funnel stage.
+3. **Merged**: `merged_reports/` — one CSV per range combining all platforms (current range and, if pulled, prior-year range).
+4. **Ready (YoY)**: Same folder; files named `ready_{start}_{end}_vs_{prior_year}.csv` (e.g. `ready_2025-01-05_2025-01-20_vs_2024.csv`). Columns: Campaign, Platform, Channel, Funnel Stage, then each metric with actual year in header (e.g. `Revenue (2025)`, `Revenue (2024)`), newer year first.
 
-File naming: `{month_abbrev}_{year}.csv` (e.g. `jan_2025.csv`). Processor discovers files by this pattern in subfolders of `raw_reports`.
+File naming: `YYYY-MM-DD_YYYY-MM-DD.csv`. Processor only considers this range pattern; legacy monthly filenames are not supported.
 
 ## Workflow
 
-- **Main tab**: User sets date range (start/end month–year) and confirms it (locks for all platforms). User selects platforms via checkboxes and sets account IDs (or picks favorites). **Run Full Pipeline** runs fetch for each selected, ready platform (Google and Meta implemented; others stub), then process-all and merge. No per-platform “Start Google Fetch” / “Start Meta Fetch” buttons; fetching is only via Run Full Pipeline.
+- **Main tab**: User sets date range (start/end; default on load: first of month → today), optionally checks “Also pull same range previous year”, and confirms (locks range). User selects platforms and account IDs (or favorites). **Run Fetch** runs fetch for each selected, ready platform for current (and if checked, prior-year) range, then process-all, merge, and YoY. Fetching is only via Run Fetch. (Pipeline runs fetch → process → merge → YoY.)
 - **Meta token**: When token expires during a fetch, the app shows a token input frame in the Meta card; user pastes a new token and clicks **Update Token**. Token is validated via Meta `debug_token` API; if valid, saved to `meta-ads.yaml` and fetch retries. Token can also be set in Settings (same validation and save).
-- **Process All Data**: No fetch; processes all raw CSVs and runs merge.
+- **Process All Data**: No fetch; processes all raw CSVs and runs merge + YoY.
 - **Clear All Data**: Removes all CSVs from raw, processed, and merged directories after confirmation.
 
 ## Error Handling
@@ -71,7 +74,7 @@ File naming: `{month_abbrev}_{year}.csv` (e.g. `jan_2025.csv`). Processor discov
 - **Data**: `pandas`, `pyyaml`; standard library `logging`, `threading`, `queue`, `pathlib`, `json`, `urllib`.
 - **Utilities**: `python-dateutil`.
 
-Setup scripts: `setup_auth.py`, `setup_meta_auth.py`, `setup_ms_auth.py`, `update_mcc_id.py` (run directly with Python). Batch: `run_debug.bat` (launch app with console), `stop_app.bat` (stop running instances). Dependencies in `requirements.txt` (no Playwright).
+Setup scripts: `setup_auth.py`, `setup_meta_auth.py`, `setup_ms_auth.py`, `update_mcc_id.py` (run directly with Python). Run: `run.bat` (or `run_debug.bat` for console), `stop_app.bat` to stop instances. Dependencies in `requirements.txt`. Version is in `main.py` as `__version__` and shown in the window title.
 
 ---
 
@@ -81,8 +84,8 @@ Setup scripts: `setup_auth.py`, `setup_meta_auth.py`, `setup_ms_auth.py`, `updat
 |------|--------|
 | **favorites.json** | Not referenced in code. The app uses `customer_favorites.json`, `meta_favorites.json`, and per-platform `*_favorites.json`. If present, can be deleted (keep in `.gitignore` for local leftovers). |
 
-**Removed (as of last cleanup):** `fetcher.py` (legacy Playwright fetcher); batch files consolidated to `run_debug.bat` and `stop_app.bat` only (removed: `run.bat`, `setup.bat`, `setup_meta.bat`, `setup_ms_auth.bat`, `update_mcc.bat`, `kill_app.bat`). Auth is done by running the Python setup scripts directly.
+**Removed (as of last cleanup):** `fetcher.py` (legacy Playwright fetcher); Ad-Hoc tab; per-platform “Process Google/Meta Files” buttons; preset date dropdown (all ranges custom). Auth is done by running the Python setup scripts directly.
 
 ---
 
-This overview reflects the current codebase. For step-by-step usage, rely on in-app labels, tooltips, and status messages (no README in repo at time of writing).
+This overview reflects the current codebase. For run instructions and first-run steps, see **[README.md](README.md)**.

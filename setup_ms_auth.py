@@ -9,6 +9,11 @@ Usage:
 
 Requirements:
     pip install bingads
+
+If you see "Need admin approval" from Microsoft:
+    The app needs the MICROSOFT ADVERTISING API permission (msads.manage), not just
+    Microsoft Graph → User.Read. Give your admin the instructions in
+    MICROSOFT_ADS_ADMIN_SETUP.md (or the printed message when you run this script).
 """
 
 import webbrowser
@@ -82,6 +87,11 @@ def main() -> int:
     print("=" * 60)
     print("Microsoft Ads – OAuth refresh token setup")
     print("=" * 60)
+    print()
+    print("If you later see 'Need admin approval' from Microsoft:")
+    print("  Your app needs the MICROSOFT ADVERTISING API (msads.manage), not just")
+    print("  Microsoft Graph → User.Read. See MICROSOFT_ADS_ADMIN_SETUP.md for")
+    print("  exact steps to give your Azure admin.")
     print()
 
     try:

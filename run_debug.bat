@@ -1,5 +1,5 @@
 @echo off
-REM Ads Report Fetcher - Debug launcher (console stays open, shows log and errors)
+REM Ads Report Fetcher - Debug launcher (console stays open for log/errors; use run.bat for no console)
 setlocal
 set "SCRIPT_DIR=%~dp0"
 cd /d "%SCRIPT_DIR%"
