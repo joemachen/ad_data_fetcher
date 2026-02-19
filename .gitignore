@@ -21,6 +21,7 @@ favorites.json
 raw_reports/
 processed_reports/
 merged_reports/
+ready_reports/
 
 # --- Python environment and cache ---
 venv/

@@ -93,7 +93,7 @@ Suggestions and recommendations to make the app more useful, efficient, futurepr
 | **TECHNICAL_OVERVIEW** | Good high-level description. | Update it for **range-based** fetch, **ready report** naming (YYYY-MM-DD, actual years in headers), and **no Ad-Hoc tab**. Add a one-page “Data flow” diagram (text or Mermaid). | Low |
 | **README** | Not present in list. | Add **README.md**: what the app does, how to run (`run.bat` / venv), link to TECHNICAL_OVERVIEW and PLATFORM_STATUS, and “First run” steps. | Low |
 | **Setup scripts** | Separate scripts per platform. | Document **order of setup** (Google → Meta → Microsoft → Reddit) and any **prerequisites** (accounts, app creation). Consider a single `setup.py` or `setup.sh` that runs the right script per platform. | Low |
-| **Changelog** | None. | Keep a **CHANGELOG.md** (or release notes) for version bumps so users and future-you know what changed. | Low |
+| **Changelog** | ✅ CHANGELOG.md added. | Keep updating **CHANGELOG.md** for each version bump. | Low |
 
 ---
 
@@ -110,16 +110,16 @@ Suggestions and recommendations to make the app more useful, efficient, futurepr
 
 ## 10. Suggested Roadmap Order
 
-1. **Phase 1 – Solid base**  
+1. **Phase 1 – Solid base** ✅ Done  
    Config path consistency, file permissions, no sensitive logging, version visible, README, TECHNICAL_OVERVIEW update.
 
-2. **Phase 2 – Reliability**  
-   Specific JSON/YAML error handling, thread error handling audit, retries for APIs, optional log rotation.
+2. **Phase 2 – Reliability** ✅ Done  
+   Specific JSON/YAML error handling, thread error handling audit (Run Fetch re-enabled in `finally`), retries for Google/Microsoft/Reddit APIs, log rotation (RotatingFileHandler).
 
-3. **Phase 3 – Quality**  
-   Pytest for processor (and optionally fetchers with mocks), ruff + mypy, constants for timeouts/retries.
+3. **Phase 3 – Quality** ✅ Done  
+   Pytest for processor (`tests/test_processor.py`), ruff + mypy in `pyproject.toml`, constants for timeouts/retries (`constants.py`).
 
-4. **Phase 4 – Scale & polish**  
-   Split `main.py`, configurable output dir, export/import settings, per-platform progress, then keychain/credential manager if you need stronger security.
+4. **Phase 4 – Scale & polish** (partial)  
+   Configurable output dir ✅ (config.json + Settings UI). Export/import settings and per-platform progress still open. Split `main.py` deferred. See [CHANGELOG.md](CHANGELOG.md) for v1.0.0 release notes.
 
 Use this list as a checklist; re-prioritize based on how you use the app and who else might use it.

@@ -94,6 +94,12 @@ class MicrosoftAdsFetcher:
             raise ValueError(
                 "microsoft-ads.yaml must contain client_id and refresh_token. Run setup_ms_auth.py and add refresh_token."
             )
+        if not developer_token:
+            raise ValueError(
+                "microsoft-ads.yaml must contain developer_token for the Reporting API. "
+                "Get it from Microsoft Advertising: sign in at ads.microsoft.com → Tools → API → Developer token. "
+                "Add developer_token: \"YOUR_TOKEN\" to microsoft-ads.yaml."
+            )
         # Use Web app flow (client_secret) when available so refresh succeeds
         if client_secret:
             auth = OAuthWebAuthCodeGrant(
@@ -118,7 +124,7 @@ class MicrosoftAdsFetcher:
             ) from e
         if not tokens or not getattr(tokens, "access_token", None):
             raise RuntimeError("No access_token in response. Re-run setup_ms_auth.py.")
-        auth.oauth_tokens = tokens
+        # request_oauth_tokens_by_refresh_token already set auth._oauth_tokens; no setter to assign
         account_id = int(self.customer_id) if self.customer_id.isdigit() else 0
         if account_id <= 0:
             raise ValueError("Microsoft Ads customer_id must be a positive numeric account ID.")
