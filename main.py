@@ -35,7 +35,7 @@ from constants import PIPELINE_FETCH_WAIT_SECONDS, DIALOG_WAIT_SECONDS
 
 # Directory containing main.py; config and credentials live here so paths don't depend on CWD
 _APP_DIR = Path(__file__).resolve().parent
-__version__ = "1.0.0"
+__version__ = "1.0.1"
 
 # Uniform width for all platform ID/account input fields (combobox)
 ID_FIELD_WIDTH = 400
@@ -144,6 +144,10 @@ class AdsReportFetcherApp:
         self.reddit_fetch_complete = threading.Event()
         self.pinterest_fetch_complete = threading.Event()
         self.meta_token_updated = threading.Event()
+        # Per-platform pipeline progress: short_name -> (current, total) ranges; order for display
+        self._pipeline_platform_progress: Dict[str, Tuple[int, int]] = {}
+        self._pipeline_platform_order: List[str] = []
+        self._current_platform_key: Optional[str] = None
         self.date_range_locked = False
         self.meta_date_range_locked = False
         # Note: output_dir is no longer used - each platform has its own directory
@@ -1991,6 +1995,29 @@ class AdsReportFetcherApp:
         # Run batch fetch in a thread
         batch_thread = threading.Thread(target=self._execute_batch_fetch, daemon=True)
         batch_thread.start()
+
+    def _report_pipeline_platform_progress(self, platform_key: str, current: int, total: int) -> None:
+        """Update per-platform progress (e.g. Google: 1/2) and refresh pipeline status. Thread-safe via root.after(0)."""
+        def _do():
+            self._pipeline_platform_progress[platform_key] = (current, total)
+            self._update_pipeline_platform_status()
+        self.root.after(0, _do)
+
+    def _update_pipeline_platform_status(self) -> None:
+        """Format and set pipeline_status_label from _pipeline_platform_progress (e.g. 'Google: 2/2, Meta: 1/2')."""
+        if not self._pipeline_platform_progress:
+            return
+        order = self._pipeline_platform_order or sorted(self._pipeline_platform_progress.keys())
+        parts = []
+        for key in order:
+            pair = self._pipeline_platform_progress.get(key)
+            if pair is None:
+                continue
+            cur, tot = pair
+            parts.append(f"{key}: {cur}/{tot}")
+        text = ", ".join(parts) if parts else ""
+        if text:
+            self.pipeline_status_label.configure(text=text)
     
     def _execute_batch_fetch(self) -> None:
         """
@@ -2021,20 +2048,28 @@ class AdsReportFetcherApp:
             if self.source_pinterest_var.get() and (self.pinterest_account_id.get() or "").strip() and not pinterest_config_exists:
                 self.logger.info("Skipping Pinterest Ads: pinterest-ads.yaml not found. See PLATFORM_STATUS.md.")
 
-            # Build fetch sequence only for selected + ready platforms (loop through GUI selection)
+            # Build fetch sequence: (short_name, platform_name, fetch_func). Short names for per-platform progress.
             fetch_sequence = []
             if google_ready:
-                fetch_sequence.append(("Google Ads", self._run_google_fetch_in_batch))
+                fetch_sequence.append(("Google", "Google Ads", self._run_google_fetch_in_batch))
             if meta_ready:
-                fetch_sequence.append(("Meta Ads", self._run_meta_fetch_in_batch))
+                fetch_sequence.append(("Meta", "Meta Ads", self._run_meta_fetch_in_batch))
             if ms_ready:
-                fetch_sequence.append(("Microsoft Ads", self._run_ms_fetch_in_batch))
+                fetch_sequence.append(("Microsoft", "Microsoft Ads", self._run_ms_fetch_in_batch))
             if tiktok_ready:
-                fetch_sequence.append(("TikTok Ads", self._run_tiktok_fetch_in_batch))
+                fetch_sequence.append(("TikTok", "TikTok Ads", self._run_tiktok_fetch_in_batch))
             if reddit_ready:
-                fetch_sequence.append(("Reddit Ads", self._run_reddit_fetch_in_batch))
+                fetch_sequence.append(("Reddit", "Reddit Ads", self._run_reddit_fetch_in_batch))
             if pinterest_ready:
-                fetch_sequence.append(("Pinterest Ads", self._run_pinterest_fetch_in_batch))
+                fetch_sequence.append(("Pinterest", "Pinterest Ads", self._run_pinterest_fetch_in_batch))
+
+            # Per-platform progress: each platform has total_ranges (1 or 2); stubs (TikTok, Pinterest) use 1
+            total_ranges = 2 if self.main_pull_prior_year_var.get() else 1
+            def _ranges_for(short: str) -> int:
+                return 1 if short in ("TikTok", "Pinterest") else total_ranges
+            self._pipeline_platform_order = [s[0] for s in fetch_sequence]
+            self._pipeline_platform_progress = {s[0]: (0, _ranges_for(s[0])) for s in fetch_sequence}
+            self.root.after(0, self._update_pipeline_platform_status)
 
             total_steps = len(fetch_sequence) + 1  # +1 for processing
             current_step = 0
@@ -2042,16 +2077,19 @@ class AdsReportFetcherApp:
             self.logger.info(f"Pipeline: Running {len(fetch_sequence)} platform(s) and processing")
             
             # Execute each ready platform
-            for platform_name, fetch_func in fetch_sequence:
+            for short_name, platform_name, fetch_func in fetch_sequence:
                 if not self.batch_fetch_active:
                     self.logger.warning("Pipeline cancelled")
                     break
                 
                 current_step += 1
                 progress = current_step / total_steps
-                self.root.after(0, lambda p=progress, pn=platform_name: (
+                platform_total = _ranges_for(short_name)
+                self._current_platform_key = short_name
+                self._pipeline_platform_progress[short_name] = (0, platform_total)
+                self.root.after(0, lambda p=progress: (
                     self.pipeline_progress_bar.set(p),
-                    self.pipeline_status_label.configure(text=f"Fetching {pn}...")
+                    self._update_pipeline_platform_status()
                 ))
                 
                 self.logger.info(f"Pipeline: Starting {platform_name}...")
@@ -2080,6 +2118,9 @@ class AdsReportFetcherApp:
                     self.pinterest_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
                     self.pinterest_fetch_complete.clear()
 
+                # Mark this platform complete (in case fetch thread didn't report final step)
+                self._pipeline_platform_progress[short_name] = (platform_total, platform_total)
+                self.root.after(0, self._update_pipeline_platform_status)
                 if not self.batch_fetch_active:
                     break
             
@@ -2149,6 +2190,7 @@ class AdsReportFetcherApp:
             self.root.after(0, lambda: self.pipeline_status_label.configure(text="Pipeline Error"))
         finally:
             self.batch_fetch_active = False
+            self._current_platform_key = None
             self.root.after(0, lambda: self.run_full_pipeline_button.configure(state="normal"))
             self.root.after(0, self._update_checklist_statuses)
             # Hide progress bar after delay
@@ -2211,6 +2253,9 @@ class AdsReportFetcherApp:
             )
             out_dir.mkdir(parents=True, exist_ok=True)
             saved = 0
+            pipeline_total = 2 if self.main_pull_prior_year_var.get() else 1
+            if getattr(self, "_current_platform_key", None) == "Microsoft":
+                self._report_pipeline_platform_progress("Microsoft", 0, pipeline_total)
             # Current range
             df = fetcher.fetch_month_data(start_date, end_date)
             if df is not None and not df.empty:
@@ -2221,6 +2266,8 @@ class AdsReportFetcherApp:
                 saved += 1
             else:
                 self.logger.info(f"Microsoft Ads: no data for {start_date.date()} to {end_date.date()}")
+            if getattr(self, "_current_platform_key", None) == "Microsoft":
+                self._report_pipeline_platform_progress("Microsoft", 1, pipeline_total)
             # Prior year range (if checkbox)
             if self.main_pull_prior_year_var.get():
                 prior_start = start_date - relativedelta(years=1)
@@ -2234,6 +2281,8 @@ class AdsReportFetcherApp:
                     saved += 1
                 else:
                     self.logger.info(f"Microsoft Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
+                if getattr(self, "_current_platform_key", None) == "Microsoft":
+                    self._report_pipeline_platform_progress("Microsoft", 2, pipeline_total)
             self.root.after(0, lambda: self.status_text.set(
                 f"Microsoft Ads fetch complete: {saved} range(s) saved"
             ))
@@ -2249,6 +2298,7 @@ class AdsReportFetcherApp:
         """Run TikTok Ads fetch as part of batch. Stub: set completion; wire tiktok_fetcher when ready."""
         self.logger.info("Pipeline: TikTok Ads fetch (stub)")
         self.root.after(0, lambda: self.status_text.set("Pipeline: Fetching TikTok Ads..."))
+        self._report_pipeline_platform_progress("TikTok", 1, 1)
         self.tiktok_fetch_complete.set()
 
     def _run_reddit_fetch_in_batch(self) -> None:
@@ -2282,6 +2332,9 @@ class AdsReportFetcherApp:
             )
             out_dir.mkdir(parents=True, exist_ok=True)
             saved = 0
+            pipeline_total = 2 if self.main_pull_prior_year_var.get() else 1
+            if getattr(self, "_current_platform_key", None) == "Reddit":
+                self._report_pipeline_platform_progress("Reddit", 0, pipeline_total)
             # Current range
             df = fetcher.fetch_month_data(start_date, end_date)
             if df is not None and not df.empty:
@@ -2292,6 +2345,8 @@ class AdsReportFetcherApp:
                 saved += 1
             else:
                 self.logger.info(f"Reddit Ads: no data for {start_date.date()} to {end_date.date()}")
+            if getattr(self, "_current_platform_key", None) == "Reddit":
+                self._report_pipeline_platform_progress("Reddit", 1, pipeline_total)
             # Prior year range (if checkbox)
             if self.main_pull_prior_year_var.get():
                 prior_start = start_date - relativedelta(years=1)
@@ -2305,6 +2360,8 @@ class AdsReportFetcherApp:
                     saved += 1
                 else:
                     self.logger.info(f"Reddit Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
+                if getattr(self, "_current_platform_key", None) == "Reddit":
+                    self._report_pipeline_platform_progress("Reddit", 2, pipeline_total)
             self.root.after(0, lambda: self.status_text.set(
                 f"Reddit Ads fetch complete: {saved} range(s) saved"
             ))
@@ -2320,6 +2377,7 @@ class AdsReportFetcherApp:
         """Run Pinterest Ads fetch as part of batch. Stub: set completion; wire pinterest_fetcher when ready."""
         self.logger.info("Pipeline: Pinterest Ads fetch (stub)")
         self.root.after(0, lambda: self.status_text.set("Pipeline: Fetching Pinterest Ads..."))
+        self._report_pipeline_platform_progress("Pinterest", 1, 1)
         self.pinterest_fetch_complete.set()
 
     def _clear_all_data(self) -> None:
@@ -2533,6 +2591,9 @@ class AdsReportFetcherApp:
             )
             out_dir.mkdir(parents=True, exist_ok=True)
             saved = 0
+            pipeline_total = 2 if self.main_pull_prior_year_var.get() else 1
+            if getattr(self, "_current_platform_key", None) == "Google":
+                self._report_pipeline_platform_progress("Google", 0, pipeline_total)
             # Current range
             df = fetcher.fetch_month_data(start_date, end_date)
             if df is not None and not df.empty:
@@ -2543,6 +2604,8 @@ class AdsReportFetcherApp:
                 saved += 1
             else:
                 self.logger.info(f"Google Ads: no data for {start_date.date()} to {end_date.date()}")
+            if getattr(self, "_current_platform_key", None) == "Google":
+                self._report_pipeline_platform_progress("Google", 1, pipeline_total)
             # Prior year range (if checkbox)
             if self.main_pull_prior_year_var.get():
                 prior_start = start_date - relativedelta(years=1)
@@ -2556,6 +2619,8 @@ class AdsReportFetcherApp:
                     saved += 1
                 else:
                     self.logger.info(f"Google Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
+                if getattr(self, "_current_platform_key", None) == "Google":
+                    self._report_pipeline_platform_progress("Google", 2, pipeline_total)
             self.root.after(0, lambda: self.status_text.set(
                 f"Google Ads fetch complete: {saved} range(s) saved"
             ))
@@ -2590,6 +2655,9 @@ class AdsReportFetcherApp:
             out_dir = Path(raw_base) / "meta"
             out_dir.mkdir(parents=True, exist_ok=True)
             saved = 0
+            pipeline_total = 2 if self.main_pull_prior_year_var.get() else 1
+            if getattr(self, "_current_platform_key", None) == "Meta":
+                self._report_pipeline_platform_progress("Meta", 0, pipeline_total)
             max_retries = 10
             retry_count = 0
 
@@ -2616,6 +2684,8 @@ class AdsReportFetcherApp:
                         saved += 1
                     else:
                         self.logger.info(f"Meta Ads: no data for {start_date.date()} to {end_date.date()}")
+                    if getattr(self, "_current_platform_key", None) == "Meta":
+                        self._report_pipeline_platform_progress("Meta", 1, pipeline_total)
                     # Prior year range (if checkbox)
                     if self.main_pull_prior_year_var.get():
                         prior_start = start_date - relativedelta(years=1)
@@ -2628,6 +2698,8 @@ class AdsReportFetcherApp:
                             saved += 1
                         else:
                             self.logger.info(f"Meta Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
+                        if getattr(self, "_current_platform_key", None) == "Meta":
+                            self._report_pipeline_platform_progress("Meta", 2, pipeline_total)
                     break  # Success, exit retry loop
 
                 except MetaTokenExpiredError:

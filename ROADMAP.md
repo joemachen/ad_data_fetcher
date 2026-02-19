@@ -4,6 +4,35 @@ Suggestions and recommendations to make the app more useful, efficient, futurepr
 
 ---
 
+## Where we are (as of v1.0.1)
+
+| Phase | Status | Notes |
+|-------|--------|--------|
+| **Phase 1 – Solid base** | ✅ Done | Config path (`_APP_DIR`), file permissions, no sensitive logging, version in title, README, TECHNICAL_OVERVIEW. |
+| **Phase 2 – Reliability** | ✅ Done | JSON/YAML error handling, Run Fetch re-enabled in `finally`, retries (Google/Microsoft/Reddit), log rotation. |
+| **Phase 3 – Quality** | ✅ Done | Pytest (processor), ruff + mypy in pyproject.toml, `constants.py`. |
+| **Phase 4 – Scale & polish** | 🔶 Partial | Configurable output dirs + Settings UI ✅. Per-platform pipeline progress ✅. Export/import settings not done. Split `main.py` deferred. |
+
+---
+
+## What’s next (suggested order)
+
+1. **Export / Import settings** (Phase 4, Medium)  
+   Export config + favorites (no secrets) to a zip or folder; import to restore or move to another machine. High value for backup and onboarding.
+
+2. **CI** (Section 3, Low)  
+   GitHub Actions: run `pytest` and optionally `ruff check` on push/PR. Keeps tests and lint in check.
+
+3. **First-run / empty state** (Section 5, Low)  
+   If no config or no platform set up, show a short checklist or “Set up at least one platform” with links to setup scripts.
+
+4. **Optional later**  
+   - **Keychain for credentials** (Section 1, Medium): store tokens in OS keychain with YAML fallback.  
+   - **Split main.py** (Section 4, High): UI modules + pipeline module; improves maintainability.  
+   - **Fetcher tests with mocks** (Section 3): lock in CSV shape and date-range filenames.
+
+---
+
 ## 1. Security
 
 | Item | Current state | Recommendation | Effort |
@@ -54,7 +83,7 @@ Suggestions and recommendations to make the app more useful, efficient, futurepr
 
 | Item | Current state | Recommendation | Effort |
 |------|----------------|----------------|--------|
-| **Progress feedback** | Status text and pipeline progress bar. | For long runs, consider **per-platform progress** (e.g. “Google: 2/2 ranges, Meta: 1/2…”) and/or **estimated time** where feasible. | Medium |
+| **Progress feedback** | Status text, pipeline progress bar, and **per-platform progress** (e.g. “Google: 2/2, Meta: 1/2…”) in header during Run Fetch. | Optional: **estimated time** where feasible. | Low |
 | **Cancellation** | Google/Meta support cancel; others may not. | Ensure **all** fetch threads respect a shared cancel flag and that “stop” is visible and works for the full pipeline. | Low–Medium |
 | **Empty state** | User may open app with no config. | **First-run flow**: e.g. “No config found. Set up at least one platform (Google or Meta) to get started” with links to setup scripts or a short in-app checklist. | Low |
 | **Export / backup** | Config and favorites are local files. | Add **Export settings** (config + favorites, no secrets) and **Import** so users can backup or move to another machine. Optionally “Export without credentials”. | Medium |
@@ -120,6 +149,6 @@ Suggestions and recommendations to make the app more useful, efficient, futurepr
    Pytest for processor (`tests/test_processor.py`), ruff + mypy in `pyproject.toml`, constants for timeouts/retries (`constants.py`).
 
 4. **Phase 4 – Scale & polish** (partial)  
-   Configurable output dir ✅ (config.json + Settings UI). Export/import settings and per-platform progress still open. Split `main.py` deferred. See [CHANGELOG.md](CHANGELOG.md) for v1.0.0 release notes.
+   Configurable output dir ✅ (config.json + Settings UI). Per-platform pipeline progress ✅ (v1.0.1). Export/import settings still open. Split `main.py` deferred. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 Use this list as a checklist; re-prioritize based on how you use the app and who else might use it.

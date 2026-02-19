@@ -4,6 +4,15 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ---
 
+## [1.0.1] — 2026-02-01
+
+### Added
+
+- **Per-platform pipeline progress**  
+  During **Run Fetch**, the header status bar now shows live per-platform progress (e.g. `Google: 2/2, Meta: 1/2, Microsoft: 0/2`) so long runs are less opaque. Each platform reports completed date ranges (current + optional prior year). Stub platforms (TikTok, Pinterest) show as 1/1 when skipped.
+
+---
+
 ## [1.0.0] — 2026-02-20
 
 First versioned release. Multi-platform ads report fetcher with configurable output directories, Settings UI for report paths, Reddit and Microsoft Ads improvements, and reliability fixes.
