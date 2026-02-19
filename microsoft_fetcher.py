@@ -15,11 +15,15 @@ import yaml
 
 _APP_DIR = Path(__file__).resolve().parent
 
+# Redirect URI used during setup (Web app flow); must match Azure app registration
+MS_REDIRECT_URI = "http://localhost:8400"
+
 # Optional bingads imports; report logic runs only when SDK is available
 try:
     from bingads.authorization import (
         AuthorizationData,
         OAuthDesktopMobileAuthCodeGrant,
+        OAuthWebAuthCodeGrant,
     )
     from bingads.v13.reporting.reporting_service_manager import ReportingServiceManager
     from bingads.v13.reporting.reporting_download_parameters import ReportingDownloadParameters
@@ -31,6 +35,10 @@ except ImportError:
 
 # Column names our processor expects for Microsoft (processor.PLATFORM_CONFIG['microsoft'])
 OUTPUT_COLUMNS = ["Campaign", "Impressions", "Clicks", "Spend", "AllConversions", "AllRevenue"]
+
+# Retries for transient API errors (rate limit, 5xx)
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 2  # seconds
 
 
 class MicrosoftAdsFetcher:
@@ -79,17 +87,28 @@ class MicrosoftAdsFetcher:
     def _ensure_auth(self) -> None:
         """Build AuthorizationData from config; refresh access token from refresh_token."""
         client_id = (self.config.get("client_id") or "").strip()
+        client_secret = (self.config.get("client_secret") or "").strip() or None
         refresh_token = (self.config.get("refresh_token") or "").strip()
         developer_token = (self.config.get("developer_token") or "").strip()
         if not client_id or not refresh_token:
             raise ValueError(
                 "microsoft-ads.yaml must contain client_id and refresh_token. Run setup_ms_auth.py and add refresh_token."
             )
-        auth = OAuthDesktopMobileAuthCodeGrant(
-            client_id=client_id,
-            env="production",
-            oauth_scope="msads.manage",
-        )
+        # Use Web app flow (client_secret) when available so refresh succeeds
+        if client_secret:
+            auth = OAuthWebAuthCodeGrant(
+                client_id=client_id,
+                client_secret=client_secret,
+                redirection_uri=MS_REDIRECT_URI,
+                env="production",
+                oauth_scope="msads.manage",
+            )
+        else:
+            auth = OAuthDesktopMobileAuthCodeGrant(
+                client_id=client_id,
+                env="production",
+                oauth_scope="msads.manage",
+            )
         try:
             tokens = auth.request_oauth_tokens_by_refresh_token(refresh_token)
         except Exception as e:
@@ -147,51 +166,60 @@ class MicrosoftAdsFetcher:
         start_str = start_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
         self._update_status(f"Fetching Microsoft Ads {start_str} to {end_str}...")
-        try:
-            manager = ReportingServiceManager(
-                authorization_data=self._authorization_data,
-                poll_interval_in_milliseconds=5000,
-                environment="production",
-            )
-            factory = manager.service_client.factory
-            request = self._build_report_request(factory, start_date, end_date)
-            with tempfile.TemporaryDirectory(prefix="ms_ads_report_") as tmpdir:
-                result_dir = str(Path(tmpdir))
-                result_name = "report.csv"
-                params = ReportingDownloadParameters(
-                    report_request=request,
-                    result_file_directory=result_dir,
-                    result_file_name=result_name,
-                    overwrite_result_file=True,
-                    timeout_in_milliseconds=300000,
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                manager = ReportingServiceManager(
+                    authorization_data=self._authorization_data,
+                    poll_interval_in_milliseconds=5000,
+                    environment="production",
                 )
-                file_path = manager.download_file(params)
-                if not file_path or not Path(file_path).exists():
-                    self.logger.warning(f"No report file for {start_str} to {end_str}")
+                factory = manager.service_client.factory
+                request = self._build_report_request(factory, start_date, end_date)
+                with tempfile.TemporaryDirectory(prefix="ms_ads_report_") as tmpdir:
+                    result_dir = str(Path(tmpdir))
+                    result_name = "report.csv"
+                    params = ReportingDownloadParameters(
+                        report_request=request,
+                        result_file_directory=result_dir,
+                        result_file_name=result_name,
+                        overwrite_result_file=True,
+                        timeout_in_milliseconds=300000,
+                    )
+                    file_path = manager.download_file(params)
+                    if not file_path or not Path(file_path).exists():
+                        self.logger.warning(f"No report file for {start_str} to {end_str}")
+                        return None
+                    df = pd.read_csv(file_path)
+                if df.empty:
+                    self.logger.warning(f"No rows for {start_str} to {end_str}")
                     return None
-                df = pd.read_csv(file_path)
-            if df.empty:
-                self.logger.warning(f"No rows for {start_str} to {end_str}")
-                return None
-            # Normalize column names to match processor: CampaignName -> Campaign
-            rename = {}
-            for c in df.columns:
-                c2 = str(c).strip()
-                if c2 == "Campaign Name" or c2 == "CampaignName":
-                    rename[c] = "Campaign"
-                elif c2 in OUTPUT_COLUMNS:
-                    rename[c] = c2
-            df = df.rename(columns=rename)
-            for col in OUTPUT_COLUMNS:
-                if col not in df.columns:
-                    df[col] = 0 if col != "Campaign" else ""
-            df = df[OUTPUT_COLUMNS].copy()
-            self.logger.info(f"Fetched {len(df)} campaigns for {start_str} to {end_str}")
-            return df
-        except Exception as e:
-            self.logger.error(f"Microsoft Ads fetch failed: {e}", exc_info=True)
-            self._update_status(f"Error: {e}")
-            return None
+                # Normalize column names to match processor: CampaignName -> Campaign
+                rename = {}
+                for c in df.columns:
+                    c2 = str(c).strip()
+                    if c2 == "Campaign Name" or c2 == "CampaignName":
+                        rename[c] = "Campaign"
+                    elif c2 in OUTPUT_COLUMNS:
+                        rename[c] = c2
+                df = df.rename(columns=rename)
+                for col in OUTPUT_COLUMNS:
+                    if col not in df.columns:
+                        df[col] = 0 if col != "Campaign" else ""
+                df = df[OUTPUT_COLUMNS].copy()
+                self.logger.info(f"Fetched {len(df)} campaigns for {start_str} to {end_str}")
+                return df
+            except Exception as e:
+                last_error = e
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
+                    self.logger.warning(f"Microsoft Ads transient error (attempt {attempt + 1}/{MAX_RETRIES}), retrying in {delay}s: {e}")
+                    time.sleep(delay)
+                else:
+                    self.logger.error(f"Microsoft Ads fetch failed: {e}", exc_info=True)
+                    self._update_status(f"Error: {e}")
+                    return None
+        return None
 
     def fetch_monthly_reports(self, start_date: datetime, end_date: datetime) -> List[Tuple[datetime, bool]]:
         """Fetch reports for each month in range; save to {month}_{year}.csv. 1s delay between months."""

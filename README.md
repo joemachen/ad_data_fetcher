@@ -35,3 +35,9 @@ Desktop app to pull advertising performance data from multiple platforms (Google
 ## Version
 
 Shown in the window title (e.g. `Ads Report Fetcher (Multi-Platform) v1.0.0`). Defined in `main.py` as `__version__`.
+
+## Development
+
+- **Tests**: `pytest` (from project root with venv active). Processor tests live in `tests/test_processor.py`.
+- **Lint**: `ruff check .` (config in `pyproject.toml`). Optional: `mypy .` for type checking.
+- **Constants**: Timeouts and dialog waits are in `constants.py`; retry settings are in each fetcher module.

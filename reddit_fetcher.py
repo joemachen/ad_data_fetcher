@@ -28,6 +28,12 @@ _APP_DIR = Path(__file__).resolve().parent
 REDDIT_USER_AGENT = "AdsReportFetcher/1.0 (Desktop; Python)"
 REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 REDDIT_REDIRECT_URI = "http://127.0.0.1:8765/reddit_oauth"
+
+# Retries for transient API errors (5xx, 429 rate limit)
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 2  # seconds
+RETRYABLE_HTTP_CODES = (429, 500, 502, 503, 504)
+
 # Reddit Ads API base URLs to try (v2, v2.0, v3)
 REDDIT_ADS_BASES = [
     "https://ads-api.reddit.com/api/v2.0",
@@ -149,11 +155,39 @@ class RedditAdsFetcher:
         }
 
     def _api_request(self, url: str, method: str = "GET", data: Optional[bytes] = None) -> Any:
-        req = urllib.request.Request(url, data=data, method=method, headers=self._headers())
-        if data:
-            req.add_header("Content-Type", "application/json")
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            return json.loads(resp.read().decode())
+        last_error = None
+        for attempt in range(MAX_RETRIES):
+            try:
+                req = urllib.request.Request(url, data=data, method=method, headers=self._headers())
+                if data:
+                    req.add_header("Content-Type", "application/json")
+                with urllib.request.urlopen(req, timeout=60) as resp:
+                    return json.loads(resp.read().decode())
+            except urllib.error.HTTPError as e:
+                last_error = e
+                if e.code in RETRYABLE_HTTP_CODES and attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
+                    self.logger.warning(
+                        "Reddit API %s (attempt %s/%s), retrying in %ss",
+                        e.code, attempt + 1, MAX_RETRIES, delay,
+                    )
+                    time.sleep(delay)
+                else:
+                    raise
+            except (urllib.error.URLError, OSError) as e:
+                last_error = e
+                if attempt < MAX_RETRIES - 1:
+                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
+                    self.logger.warning(
+                        "Reddit API connection error (attempt %s/%s), retrying in %ss: %s",
+                        attempt + 1, MAX_RETRIES, delay, e,
+                    )
+                    time.sleep(delay)
+                else:
+                    raise
+        if last_error:
+            raise last_error
+        return None  # unreachable
 
     def _fetch_v3_me(self) -> Optional[Dict[str, Any]]:
         """Call GET /api/v3/me to discover profile/ad_account structure; cache result."""
@@ -185,7 +219,7 @@ class RedditAdsFetcher:
         # API requires hourly granularity: YYYY-MM-DDTHH:00:00Z (no minutes/seconds)
         starts_at = f"{start_str}T00:00:00Z"
         ends_at = f"{end_str}T23:00:00Z"
-        # Fields per https://ads-api.reddit.com/docs/v3/operations/Get%20A%20Report
+        # Breakdown by CAMPAIGN_ID; if API returns only IDs we resolve names via campaigns list
         return {
             "data": {
                 "breakdowns": ["CAMPAIGN_ID"],
@@ -324,6 +358,36 @@ class RedditAdsFetcher:
             out.append((base, f"/profiles/{profile_id}/ad_accounts/{aid}/report", body))
         return out
 
+    def _fetch_campaign_name_map(self) -> Dict[str, str]:
+        """Fetch campaign id -> name for the ad account so we can resolve IDs in report rows. Returns {} on failure."""
+        account_id = self.account_id.strip()
+        if not account_id.startswith("a2_"):
+            account_id = f"a2_{account_id}" if account_id.startswith("g01") else account_id
+        url = f"https://ads-api.reddit.com/api/v3/ad_accounts/{account_id}/campaigns"
+        try:
+            raw = self._api_request(url)
+            out: Dict[str, str] = {}
+            data_list = raw.get("data") if isinstance(raw, dict) else None
+            if isinstance(data_list, list):
+                for c in data_list:
+                    if isinstance(c, dict):
+                        cid = c.get("id") or c.get("campaign_id") or c.get("CAMPAIGN_ID")
+                        name = c.get("name") or c.get("campaign_name") or c.get("CAMPAIGN_NAME")
+                        if cid and name:
+                            out[str(cid)] = str(name)
+            self.logger.debug("Reddit campaign name map: %s entries", len(out))
+            return out
+        except Exception as e:
+            self.logger.debug("Reddit campaigns list failed (report may still have names): %s", e)
+            return {}
+
+    def _resolve_campaign_names(self, rows: List[Dict], name_map: Dict[str, str]) -> None:
+        """Replace numeric campaign_name with resolved name from name_map (in-place)."""
+        for row in rows:
+            name = (row.get("campaign_name") or "").strip()
+            if name and name.isdigit() and len(name) >= 10 and name in name_map:
+                row["campaign_name"] = name_map[name]
+
     def _fetch_report_api(self, start_date: datetime, end_date: datetime) -> Optional[List[Dict]]:
         """
         Call Reddit Ads API report. Tries v3 ad_accounts first (404 on /accounts/...), then v2.0/v2.
@@ -341,7 +405,16 @@ class RedditAdsFetcher:
         # Official v3 "Get A Report": POST /api/v3/ad_accounts/{id}/reports (try first)
         rows, http_status = self._fetch_v3_get_a_report(start_str, end_str)
         if rows:
+            # If report returned only campaign IDs (long numeric names), resolve to names via campaigns list
+            if any((r.get("campaign_name") or "").strip().isdigit() and len((r.get("campaign_name") or "").strip()) >= 10 for r in rows):
+                name_map = self._fetch_campaign_name_map()
+                if name_map:
+                    self._resolve_campaign_names(rows, name_map)
             return rows
+        if http_status == 200:
+            # v3 returned success but no rows (e.g. no ads in this date range); treat as success, don't try fallbacks
+            self.logger.info("Reddit v3 reported no data for this date range; skipping fallback endpoints.")
+            return []
         if http_status == 401:
             # Token not authorized for reports; skip fallbacks (they would also fail)
             return None
@@ -525,14 +598,18 @@ class RedditAdsFetcher:
         for item in data_list:
             if not isinstance(item, dict):
                 continue
+            # Prefer name from breakdown (CAMPAIGN_NAME); fall back to campaign_name, name, or ID
             campaign_name = (
-                item.get("campaign_name") or item.get("campaignName") or item.get("name")
-                or str(item.get("campaign_id") or "") or ""
-            )
+                item.get("CAMPAIGN_NAME") or item.get("campaign_name") or item.get("campaignName") or item.get("name")
+                or str(item.get("campaign_id") or item.get("CAMPAIGN_ID") or "") or ""
+            ).strip()
             amount_spent = self._to_float(
                 item.get("spend") or item.get("SPEND") or item.get("amount_spent") or item.get("cost") or 0
             )
-            if amount_spent and amount_spent > 0 and amount_spent < 1e-6:
+            # Reddit Ads API returns SPEND in micro-currency (1e-6); convert to dollars for display
+            if amount_spent and amount_spent >= 1:
+                amount_spent = amount_spent / 1_000_000
+            elif amount_spent and amount_spent > 0 and amount_spent < 1e-6:
                 amount_spent = amount_spent * 1_000_000
             impressions = self._to_float(
                 item.get("impressions") or item.get("IMPRESSIONS") or 0
@@ -549,6 +626,9 @@ class RedditAdsFetcher:
             conv_total_value = self._to_float(
                 item.get("conversion_purchase_total_value") or item.get("CONVERSION_PURCHASE_TOTAL_VALUE") or 0
             )
+            # Reddit Ads API returns CONVERSION_PURCHASE_TOTAL_VALUE in cents; convert to dollars
+            if conv_total_value and conv_total_value >= 1:
+                conv_total_value = conv_total_value / 100
             conversions = conv_clicks + conv_views
             rows.append({
                 "campaign_name": campaign_name or "Unknown",

@@ -1,0 +1,27 @@
+[project]
+name = "ads-report-fetcher"
+version = "1.0.0"
+description = "Multi-platform ads report fetcher and processor"
+readme = "README.md"
+requires-python = ">=3.10"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
+addopts = "-v"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 120
+exclude = ["venv", ".venv", "__pycache__", ".git"]
+select = ["E", "F", "W", "I"]
+
+[tool.ruff.lint.per-file-ignores]
+"__init__.py" = ["F401"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+ignore_missing_imports = true

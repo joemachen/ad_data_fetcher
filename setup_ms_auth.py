@@ -1,8 +1,9 @@
 """
 Microsoft Ads OAuth Setup – generate initial refresh token.
 
-Uses OAuthDesktopMobileAuthCodeGrant from the bingads library with msads.manage scope.
-Run once to get a refresh_token, then copy it into your configuration (e.g. microsoft-ads.yaml).
+Uses the Web app flow (client_id + client_secret + redirect URI) so the token exchange
+succeeds. Microsoft requires 'client_assertion' or 'client_secret' when exchanging
+the authorization code for tokens.
 
 Usage:
     python setup_ms_auth.py
@@ -10,10 +11,11 @@ Usage:
 Requirements:
     pip install bingads
 
-If you see "Need admin approval" from Microsoft:
-    The app needs the MICROSOFT ADVERTISING API permission (msads.manage), not just
-    Microsoft Graph → User.Read. Give your admin the instructions in
-    MICROSOFT_ADS_ADMIN_SETUP.md (or the printed message when you run this script).
+Azure app registration (required):
+  - Register as "Web" (not Native). Add Redirect URI: http://localhost:8400
+  - Create a Client secret (Certificates & secrets). Put client_id and client_secret
+    in microsoft-ads.yaml or enter when prompted.
+  - API permission: MICROSOFT ADVERTISING API → msads.manage (see MICROSOFT_ADS_ADMIN_SETUP.md).
 """
 
 import webbrowser
@@ -22,13 +24,14 @@ from typing import Optional
 
 import yaml
 
-# Default scope for Microsoft Advertising API (required for MFA compliance)
+# Web redirect URI – must be added to Azure app (Web platform). User pastes full callback URL.
+MS_REDIRECT_URI = "http://localhost:8400"
 MSADS_MANAGE = "msads.manage"
 
 try:
-    from bingads.authorization import OAuthDesktopMobileAuthCodeGrant
+    from bingads.authorization import OAuthWebAuthCodeGrant
 except ImportError:
-    OAuthDesktopMobileAuthCodeGrant = None
+    OAuthWebAuthCodeGrant = None
 
 
 def load_config(yaml_path: Path) -> dict:
@@ -61,6 +64,10 @@ def get_client_credentials() -> tuple[str, Optional[str]]:
         client_id = input("Enter your Microsoft Ads Application (client) ID: ").strip()
         if not client_id:
             raise SystemExit("client_id is required.")
+    if not client_secret:
+        print("Client secret is required for the token exchange (Microsoft requires it for Web apps).")
+        print("Create one in Azure Portal → App registration → Certificates & secrets.")
+        client_secret = input("Enter your Microsoft Ads Client secret: ").strip() or None
     return client_id, client_secret
 
 
@@ -79,30 +86,37 @@ def main() -> int:
         )
         return 1
 
-    if OAuthDesktopMobileAuthCodeGrant is None:
+    if OAuthWebAuthCodeGrant is None:
         print("Error: bingads is required. Install with: pip install bingads")
         return 1
 
     print()
     print("=" * 60)
-    print("Microsoft Ads – OAuth refresh token setup")
+    print("Microsoft Ads – OAuth refresh token setup (Web app flow)")
     print("=" * 60)
     print()
-    print("If you later see 'Need admin approval' from Microsoft:")
-    print("  Your app needs the MICROSOFT ADVERTISING API (msads.manage), not just")
-    print("  Microsoft Graph → User.Read. See MICROSOFT_ADS_ADMIN_SETUP.md for")
-    print("  exact steps to give your Azure admin.")
+    print("In Azure Portal, your app must be registered as a Web app with:")
+    print("  - Redirect URI: " + MS_REDIRECT_URI)
+    print("  - Client secret created (Certificates & secrets)")
+    print("  - API permission: MICROSOFT ADVERTISING API → msads.manage")
+    print("  See MICROSOFT_ADS_ADMIN_SETUP.md if you see 'Need admin approval'.")
     print()
 
     try:
-        client_id, _client_secret = get_client_credentials()
+        client_id, client_secret = get_client_credentials()
     except (KeyboardInterrupt, EOFError):
         print("\nCancelled.")
         return 0
 
-    # Desktop/mobile flow uses no client_secret; scope defaults to msads.manage
-    authentication = OAuthDesktopMobileAuthCodeGrant(
+    if not client_secret:
+        print("Error: client_secret is required. Create one in Azure and add to microsoft-ads.yaml or enter above.")
+        return 1
+
+    # Web app flow: client_secret and redirect_uri required for token exchange
+    authentication = OAuthWebAuthCodeGrant(
         client_id=client_id,
+        client_secret=client_secret,
+        redirection_uri=MS_REDIRECT_URI,
         env="production",
         oauth_scope=MSADS_MANAGE,
     )
@@ -114,10 +128,9 @@ def main() -> int:
     print("=" * 60 + "\n")
     webbrowser.open(authorization_url, new=1)
 
-    print(
-        "After clicking 'Accept', you will be redirected to a URL."
-    )
-    print("Paste the FULL callback URL here (the entire address from the browser bar).")
+    print("After clicking 'Accept', you will be redirected to " + MS_REDIRECT_URI)
+    print("(The page may show 'This site can't be reached' – that is OK.)")
+    print("Copy the FULL URL from the browser bar (it contains code=...) and paste it here.")
     print()
     try:
         response_uri = input("Full callback URL: ").strip()

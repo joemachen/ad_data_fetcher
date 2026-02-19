@@ -31,6 +31,7 @@ from meta_fetcher import MetaAdsFetcher, MetaTokenExpiredError
 from microsoft_fetcher import MicrosoftAdsFetcher
 from reddit_fetcher import RedditAdsFetcher
 from processor import ReportProcessor
+from constants import PIPELINE_FETCH_WAIT_SECONDS, DIALOG_WAIT_SECONDS
 
 # Directory containing main.py; config and credentials live here so paths don't depend on CWD
 _APP_DIR = Path(__file__).resolve().parent
@@ -129,6 +130,8 @@ class AdsReportFetcherApp:
         self.pinterest_id_display = ctk.StringVar(value="")
         self.meta_token_input = ctk.StringVar(value="")
         self.status_text = ctk.StringVar(value="Ready")
+        if getattr(self, "_config_corrupted_msg", None):
+            self.status_text.set(self._config_corrupted_msg)
         self.is_processing = False
         self.meta_is_processing = False
         self.batch_fetch_active = False
@@ -359,10 +362,11 @@ class AdsReportFetcherApp:
             self.pinterest_card_status_label.configure(text=_status_text(pinterest_ready, bool((self.pinterest_account_id.get() or "").strip())), text_color=_status_color(pinterest_ready))
 
         # Data guardrail: update label next to Clear All Data (top)
-        google_dir = Path("raw_reports/google")
-        meta_dir = Path("raw_reports/meta")
-        merged_dir = Path("merged_reports")
-        ready_dir = Path("ready_reports")
+        raw_base = Path(self.settings.get("raw_reports_dir", "raw_reports"))
+        google_dir = raw_base / "google"
+        meta_dir = raw_base / "meta"
+        merged_dir = Path(self.settings.get("merged_reports_dir", "merged_reports"))
+        ready_dir = Path(self.settings.get("ready_reports_dir", "ready_reports"))
         google_has_data = google_dir.exists() and any(google_dir.glob("*.csv"))
         meta_has_data = meta_dir.exists() and any(meta_dir.glob("*.csv"))
         merged_has_data = merged_dir.exists() and any(merged_dir.glob("*.csv"))
@@ -1076,12 +1080,10 @@ class AdsReportFetcherApp:
 
     def _create_settings_tab(self) -> None:
         """Create Settings tab with configuration options."""
-        # --- Campaign Rules Manager (mappings.json) ---
         self._mappings_data: Dict[str, str] = {}
         self._mappings_file = _APP_DIR / "mappings.json"
-        self._create_campaign_rules_section()
 
-        # Theme mode section
+        # Theme mode section (pack first so it stays visible at top)
         theme_frame = ctk.CTkFrame(self.settings_tab)
         theme_frame.pack(pady=10, padx=20, fill="x")
         
@@ -1106,72 +1108,37 @@ class AdsReportFetcherApp:
         self.settings_theme_menu.set(current_theme)
         self.settings_theme_menu.pack(side="left", padx=10)
         
-        # Folder settings section
+        # Report directories section (used by fetch, process, merge, YoY)
         folder_frame = ctk.CTkFrame(self.settings_tab)
         folder_frame.pack(pady=10, padx=20, fill="x")
         
         folder_label = ctk.CTkLabel(
             folder_frame,
-            text="Default Folders:",
+            text="Report directories:",
             font=ctk.CTkFont(size=12, weight="bold")
         )
-        folder_label.pack(anchor="w", padx=10, pady=(10, 5))
+        folder_label.pack(anchor="w", padx=10, pady=(10, 2))
+        ctk.CTkLabel(
+            folder_frame,
+            text="Paths for raw downloads, processed files, merged CSVs, and YoY ready reports.",
+            font=ctk.CTkFont(size=10),
+            text_color="gray"
+        ).pack(anchor="w", padx=10, pady=(0, 5))
         
-        # Download folder
-        download_folder_frame = ctk.CTkFrame(folder_frame)
-        download_folder_frame.pack(pady=5, padx=10, fill="x")
+        def add_dir_row(parent: ctk.CTkFrame, label: str, setting_key: str, default: str) -> ctk.CTkEntry:
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(pady=4, padx=10, fill="x")
+            ctk.CTkLabel(row, text=label + ":", font=ctk.CTkFont(size=11)).pack(side="left", padx=(0, 10))
+            entry = ctk.CTkEntry(row, width=300, font=ctk.CTkFont(size=11))
+            entry.insert(0, self.settings.get(setting_key, default))
+            entry.pack(side="left", padx=5, fill="x", expand=True)
+            ctk.CTkButton(row, text="Browse", command=lambda e=entry: self._on_browse_folder(e), width=80, font=ctk.CTkFont(size=11)).pack(side="left", padx=5)
+            return entry
         
-        download_folder_label = ctk.CTkLabel(
-            download_folder_frame,
-            text="Download Folder:",
-            font=ctk.CTkFont(size=11)
-        )
-        download_folder_label.pack(side="left", padx=10)
-        
-        self.settings_download_folder_entry = ctk.CTkEntry(
-            download_folder_frame,
-            width=300,
-            font=ctk.CTkFont(size=11)
-        )
-        self.settings_download_folder_entry.insert(0, self.settings.get("default_download_folder", "raw_reports"))
-        self.settings_download_folder_entry.pack(side="left", padx=5, fill="x", expand=True)
-        
-        browse_download_btn = ctk.CTkButton(
-            download_folder_frame,
-            text="Browse",
-            command=self._on_browse_download_folder,
-            width=100,
-            font=ctk.CTkFont(size=11)
-        )
-        browse_download_btn.pack(side="left", padx=5)
-        
-        # Output folder
-        output_folder_frame = ctk.CTkFrame(folder_frame)
-        output_folder_frame.pack(pady=5, padx=10, fill="x")
-        
-        output_folder_label = ctk.CTkLabel(
-            output_folder_frame,
-            text="Output Folder:",
-            font=ctk.CTkFont(size=11)
-        )
-        output_folder_label.pack(side="left", padx=10)
-        
-        self.settings_output_folder_entry = ctk.CTkEntry(
-            output_folder_frame,
-            width=300,
-            font=ctk.CTkFont(size=11)
-        )
-        self.settings_output_folder_entry.insert(0, self.settings.get("default_output_folder", "processed_reports"))
-        self.settings_output_folder_entry.pack(side="left", padx=5, fill="x", expand=True)
-        
-        browse_output_btn = ctk.CTkButton(
-            output_folder_frame,
-            text="Browse",
-            command=self._on_browse_output_folder,
-            width=100,
-            font=ctk.CTkFont(size=11)
-        )
-        browse_output_btn.pack(side="left", padx=5)
+        self.settings_raw_reports_entry = add_dir_row(folder_frame, "Raw reports", "raw_reports_dir", "raw_reports")
+        self.settings_processed_reports_entry = add_dir_row(folder_frame, "Processed reports", "processed_reports_dir", "processed_reports")
+        self.settings_merged_reports_entry = add_dir_row(folder_frame, "Merged reports", "merged_reports_dir", "merged_reports")
+        self.settings_ready_reports_entry = add_dir_row(folder_frame, "Ready reports (YoY)", "ready_reports_dir", "ready_reports")
         
         # Save settings button
         save_settings_frame = ctk.CTkFrame(self.settings_tab)
@@ -1187,6 +1154,9 @@ class AdsReportFetcherApp:
             hover_color="darkgreen"
         )
         save_settings_btn.pack(pady=10, padx=20, fill="x")
+
+        # Campaign Rules Manager (pack last with expand so it fills remaining space; scrolls if needed)
+        self._create_campaign_rules_section()
 
     def _create_campaign_rules_section(self) -> None:
         """Build Campaign Rules Manager UI and load mappings.json."""
@@ -1321,8 +1291,12 @@ class AdsReportFetcherApp:
                 self._mappings_data = {str(k): str(v) for k, v in (data or {}).items()}
             else:
                 self._mappings_data = {}
-        except Exception as e:
-            self.logger.error(f"Error loading mappings: {e}", exc_info=True)
+        except json.JSONDecodeError as e:
+            self.logger.error(f"mappings.json is corrupted (invalid JSON): {e}", exc_info=True)
+            self._mappings_data = {}
+            self.status_text.set("mappings.json was corrupted; using empty rules. Backup or delete and restart.")
+        except OSError as e:
+            self.logger.error(f"Error reading mappings.json: {e}", exc_info=True)
             self._mappings_data = {}
     
     def _save_mappings_file(self) -> None:
@@ -1542,24 +1516,19 @@ class AdsReportFetcherApp:
         self.logger.info(f"Theme mode changed to: {choice}")
         self.status_text.set(f"Theme changed to {choice} mode")
     
-    def _on_browse_download_folder(self) -> None:
-        """Browse for download folder."""
-        folder = filedialog.askdirectory(title="Select Download Folder")
+    def _on_browse_folder(self, entry: ctk.CTkEntry) -> None:
+        """Browse for a directory and put its path into the given entry."""
+        folder = filedialog.askdirectory(title="Select directory")
         if folder:
-            self.settings_download_folder_entry.delete(0, "end")
-            self.settings_download_folder_entry.insert(0, folder)
-    
-    def _on_browse_output_folder(self) -> None:
-        """Browse for output folder."""
-        folder = filedialog.askdirectory(title="Select Output Folder")
-        if folder:
-            self.settings_output_folder_entry.delete(0, "end")
-            self.settings_output_folder_entry.insert(0, folder)
+            entry.delete(0, "end")
+            entry.insert(0, folder)
     
     def _on_save_all_settings(self) -> None:
-        """Save all settings including folders."""
-        self.settings["default_download_folder"] = self.settings_download_folder_entry.get().strip()
-        self.settings["default_output_folder"] = self.settings_output_folder_entry.get().strip()
+        """Save all settings including report directories."""
+        self.settings["raw_reports_dir"] = self.settings_raw_reports_entry.get().strip() or "raw_reports"
+        self.settings["processed_reports_dir"] = self.settings_processed_reports_entry.get().strip() or "processed_reports"
+        self.settings["merged_reports_dir"] = self.settings_merged_reports_entry.get().strip() or "merged_reports"
+        self.settings["ready_reports_dir"] = self.settings_ready_reports_entry.get().strip() or "ready_reports"
         self._save_settings()
         self.status_text.set("All settings saved successfully")
         self.logger.info("All settings saved")
@@ -1865,9 +1834,15 @@ class AdsReportFetcherApp:
                     """Callback to get user input for campaign classification."""
                     return self._show_funnel_dialog(campaign_name)
                 
+                raw_dir = self.settings.get("raw_reports_dir", "raw_reports")
+                processed_dir = self.settings.get("processed_reports_dir", "processed_reports")
+                merged_dir = self.settings.get("merged_reports_dir", "merged_reports")
+                ready_dir = self.settings.get("ready_reports_dir", "ready_reports")
                 processor = ReportProcessor(
-                    input_dir="raw_reports",
-                    output_dir="processed_reports",
+                    input_dir=raw_dir,
+                    output_dir=processed_dir,
+                    merged_dir=merged_dir,
+                    ready_dir=ready_dir,
                     status_callback=status_callback,
                     user_input_callback=user_input_callback
                 )
@@ -1938,16 +1913,18 @@ class AdsReportFetcherApp:
         pinterest_ready = pinterest_selected and self.date_range_locked and bool((self.pinterest_account_id.get() or "").strip()) and pinterest_config_exists
 
         # Check data status (raw platform dirs, merged_reports, ready_reports)
-        raw_dir = Path("raw_reports")
+        raw_dir = Path(self.settings.get("raw_reports_dir", "raw_reports"))
+        merged_dir = Path(self.settings.get("merged_reports_dir", "merged_reports"))
+        ready_dir = Path(self.settings.get("ready_reports_dir", "ready_reports"))
         has_data = False
         if raw_dir.exists():
             for d in raw_dir.iterdir():
                 if d.is_dir() and any(d.glob("*.csv")):
                     has_data = True
                     break
-        if not has_data and Path("merged_reports").exists() and any(Path("merged_reports").glob("*.csv")):
+        if not has_data and merged_dir.exists() and any(merged_dir.glob("*.csv")):
             has_data = True
-        if not has_data and Path("ready_reports").exists() and any(Path("ready_reports").glob("*.csv")):
+        if not has_data and ready_dir.exists() and any(ready_dir.glob("*.csv")):
             has_data = True
 
         # At least one selected platform must be ready (data may exist; we allow run and overwrite)
@@ -2085,22 +2062,22 @@ class AdsReportFetcherApp:
                 
                 # Wait for this platform to complete
                 if platform_name == "Google Ads":
-                    self.google_fetch_complete.wait(timeout=3600)
+                    self.google_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
                     self.google_fetch_complete.clear()
                 elif platform_name == "Meta Ads":
-                    self.meta_fetch_complete.wait(timeout=3600)
+                    self.meta_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
                     self.meta_fetch_complete.clear()
                 elif platform_name == "Microsoft Ads":
-                    self.ms_fetch_complete.wait(timeout=3600)
+                    self.ms_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
                     self.ms_fetch_complete.clear()
                 elif platform_name == "TikTok Ads":
-                    self.tiktok_fetch_complete.wait(timeout=3600)
+                    self.tiktok_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
                     self.tiktok_fetch_complete.clear()
                 elif platform_name == "Reddit Ads":
-                    self.reddit_fetch_complete.wait(timeout=3600)
+                    self.reddit_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
                     self.reddit_fetch_complete.clear()
                 elif platform_name == "Pinterest Ads":
-                    self.pinterest_fetch_complete.wait(timeout=3600)
+                    self.pinterest_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
                     self.pinterest_fetch_complete.clear()
 
                 if not self.batch_fetch_active:
@@ -2127,9 +2104,15 @@ class AdsReportFetcherApp:
                         """Callback to get user input for campaign classification."""
                         return self._show_funnel_dialog(campaign_name)
                     
+                    raw_dir = self.settings.get("raw_reports_dir", "raw_reports")
+                    processed_dir = self.settings.get("processed_reports_dir", "processed_reports")
+                    merged_dir = self.settings.get("merged_reports_dir", "merged_reports")
+                    ready_dir = self.settings.get("ready_reports_dir", "ready_reports")
                     processor = ReportProcessor(
-                        input_dir="raw_reports",
-                        output_dir="processed_reports",
+                        input_dir=raw_dir,
+                        output_dir=processed_dir,
+                        merged_dir=merged_dir,
+                        ready_dir=ready_dir,
                         status_callback=status_callback,
                         user_input_callback=user_input_callback
                     )
@@ -2166,6 +2149,7 @@ class AdsReportFetcherApp:
             self.root.after(0, lambda: self.pipeline_status_label.configure(text="Pipeline Error"))
         finally:
             self.batch_fetch_active = False
+            self.root.after(0, lambda: self.run_full_pipeline_button.configure(state="normal"))
             self.root.after(0, self._update_checklist_statuses)
             # Hide progress bar after delay
             self.root.after(3000, lambda: self.pipeline_progress_frame.pack_forget())
@@ -2216,14 +2200,15 @@ class AdsReportFetcherApp:
             def update_status(message: str) -> None:
                 self.root.after(0, lambda msg=message: self.status_text.set(msg))
 
+            raw_base = self.settings.get("raw_reports_dir", "raw_reports")
+            out_dir = Path(raw_base) / "microsoft"
             fetcher = MicrosoftAdsFetcher(
                 customer_id=customer_id,
-                output_dir="raw_reports/microsoft",
+                output_dir=str(out_dir),
                 status_callback=update_status,
                 progress_callback=None,
                 cancel_flag=None,
             )
-            out_dir = Path("raw_reports/microsoft")
             out_dir.mkdir(parents=True, exist_ok=True)
             saved = 0
             # Current range
@@ -2286,14 +2271,15 @@ class AdsReportFetcherApp:
             def update_status(message: str) -> None:
                 self.root.after(0, lambda msg=message: self.status_text.set(msg))
 
+            raw_base = self.settings.get("raw_reports_dir", "raw_reports")
+            out_dir = Path(raw_base) / "reddit"
             fetcher = RedditAdsFetcher(
                 account_id=account_id,
-                output_dir="raw_reports/reddit",
+                output_dir=str(out_dir),
                 status_callback=update_status,
                 progress_callback=None,
                 cancel_flag=None,
             )
-            out_dir = Path("raw_reports/reddit")
             out_dir.mkdir(parents=True, exist_ok=True)
             saved = 0
             # Current range
@@ -2353,8 +2339,12 @@ class AdsReportFetcherApp:
         
         deleted_count = 0
         
-        # Target directories
-        directories = [Path("raw_reports"), Path("processed_reports"), Path("merged_reports"), Path("ready_reports")]
+        # Target directories (from settings)
+        raw_dir = Path(self.settings.get("raw_reports_dir", "raw_reports"))
+        processed_dir = Path(self.settings.get("processed_reports_dir", "processed_reports"))
+        merged_dir = Path(self.settings.get("merged_reports_dir", "merged_reports"))
+        ready_dir = Path(self.settings.get("ready_reports_dir", "ready_reports"))
+        directories = [raw_dir, processed_dir, merged_dir, ready_dir]
         
         for directory in directories:
             if not directory.exists():
@@ -2532,14 +2522,15 @@ class AdsReportFetcherApp:
                     return
                 self.root.after(0, lambda msg=message: self.status_text.set(msg))
 
+            raw_base = self.settings.get("raw_reports_dir", "raw_reports")
+            out_dir = Path(raw_base) / "google"
             fetcher = AdsApiFetcher(
                 customer_id=customer_id_clean,
-                output_dir="raw_reports/google",
+                output_dir=str(out_dir),
                 status_callback=update_status,
                 progress_callback=None,
                 cancel_flag=self.cancel_event
             )
-            out_dir = Path("raw_reports/google")
             out_dir.mkdir(parents=True, exist_ok=True)
             saved = 0
             # Current range
@@ -2595,7 +2586,8 @@ class AdsReportFetcherApp:
                     return
                 self.root.after(0, lambda msg=message: self.status_text.set(msg))
 
-            out_dir = Path("raw_reports/meta")
+            raw_base = self.settings.get("raw_reports_dir", "raw_reports")
+            out_dir = Path(raw_base) / "meta"
             out_dir.mkdir(parents=True, exist_ok=True)
             saved = 0
             max_retries = 10
@@ -2605,7 +2597,7 @@ class AdsReportFetcherApp:
                 """Fetch one range; returns DataFrame or None. Raises MetaTokenExpiredError on token expiry."""
                 f = MetaAdsFetcher(
                     ad_account_id=account_id_clean,
-                    output_dir="raw_reports/meta",
+                    output_dir=str(out_dir),
                     status_callback=update_status,
                     progress_callback=None,
                     cancel_flag=self.meta_cancel_event
@@ -2651,7 +2643,7 @@ class AdsReportFetcherApp:
                     
                     # Reset and wait for user to update token
                     self.meta_token_updated.clear()
-                    self.meta_token_updated.wait(timeout=300)  # 5 minute timeout
+                    self.meta_token_updated.wait(timeout=DIALOG_WAIT_SECONDS)
                     
                     if not self.meta_token_updated.is_set():
                         self.logger.warning("Token update timeout")
@@ -2704,7 +2696,8 @@ class AdsReportFetcherApp:
             self.status_text.set("Cannot process files while fetching is in progress")
             return
         
-        google_dir = Path("raw_reports/google")
+        raw_base = Path(self.settings.get("raw_reports_dir", "raw_reports"))
+        google_dir = raw_base / "google"
         if not google_dir.exists() or not any(google_dir.glob("*.csv")):
             self.status_text.set("No Google Ads files found to process")
             return
@@ -2722,9 +2715,15 @@ class AdsReportFetcherApp:
             def user_input_callback(campaign_name: str) -> str:
                 return self._show_funnel_dialog(campaign_name)
             
+            raw_dir = self.settings.get("raw_reports_dir", "raw_reports")
+            processed_dir = self.settings.get("processed_reports_dir", "processed_reports")
+            merged_dir = self.settings.get("merged_reports_dir", "merged_reports")
+            ready_dir = self.settings.get("ready_reports_dir", "ready_reports")
             processor = ReportProcessor(
-                input_dir="raw_reports",
-                output_dir="processed_reports",
+                input_dir=raw_dir,
+                output_dir=processed_dir,
+                merged_dir=merged_dir,
+                ready_dir=ready_dir,
                 status_callback=status_callback,
                 user_input_callback=user_input_callback
             )
@@ -2766,7 +2765,8 @@ class AdsReportFetcherApp:
             self.status_text.set("Cannot process files while fetching is in progress")
             return
         
-        meta_dir = Path("raw_reports/meta")
+        raw_base = Path(self.settings.get("raw_reports_dir", "raw_reports"))
+        meta_dir = raw_base / "meta"
         if not meta_dir.exists() or not any(meta_dir.glob("*.csv")):
             self.status_text.set("No Meta Ads files found to process")
             return
@@ -2784,9 +2784,15 @@ class AdsReportFetcherApp:
             def user_input_callback(campaign_name: str) -> str:
                 return self._show_funnel_dialog(campaign_name)
             
+            raw_dir = self.settings.get("raw_reports_dir", "raw_reports")
+            processed_dir = self.settings.get("processed_reports_dir", "processed_reports")
+            merged_dir = self.settings.get("merged_reports_dir", "merged_reports")
+            ready_dir = self.settings.get("ready_reports_dir", "ready_reports")
             processor = ReportProcessor(
-                input_dir="raw_reports",
-                output_dir="processed_reports",
+                input_dir=raw_dir,
+                output_dir=processed_dir,
+                merged_dir=merged_dir,
+                ready_dir=ready_dir,
                 status_callback=status_callback,
                 user_input_callback=user_input_callback
             )
@@ -2958,7 +2964,7 @@ class AdsReportFetcherApp:
             dialog.bind('<Escape>', lambda e: on_cancel())
         
         self.root.after(0, show_dialog)
-        dialog_done.wait(timeout=300)  # 5 minute timeout
+        dialog_done.wait(timeout=DIALOG_WAIT_SECONDS)
         
         return result["token"]
 
@@ -2968,8 +2974,15 @@ class AdsReportFetcherApp:
             yaml_path = _APP_DIR / "meta-ads.yaml"
             if not yaml_path.exists():
                 return False, "meta-ads.yaml not found", None
-            with open(yaml_path, "r", encoding="utf-8") as f:
-                config = yaml.safe_load(f) or {}
+            try:
+                with open(yaml_path, "r", encoding="utf-8") as f:
+                    config = yaml.safe_load(f) or {}
+            except yaml.YAMLError as e:
+                self.logger.error(f"meta-ads.yaml is corrupted (invalid YAML): {e}", exc_info=True)
+                return False, "meta-ads.yaml is corrupted; backup or delete and re-run setup.", None
+            except OSError as e:
+                self.logger.error(f"Error reading meta-ads.yaml: {e}", exc_info=True)
+                return False, f"Could not read meta-ads.yaml: {e}", None
             app_id = config.get("app_id") or ""
             app_secret = config.get("app_secret") or ""
             if not app_id or not app_secret:
@@ -3030,8 +3043,15 @@ class AdsReportFetcherApp:
                 return False, "Token looks like pasted text; enter only the Meta access token"
 
             # Read current config
-            with open(yaml_path, "r", encoding="utf-8") as f:
-                config = yaml.safe_load(f) or {}
+            try:
+                with open(yaml_path, "r", encoding="utf-8") as f:
+                    config = yaml.safe_load(f) or {}
+            except yaml.YAMLError as e:
+                self.logger.error(f"meta-ads.yaml is corrupted (invalid YAML): {e}", exc_info=True)
+                return False, "meta-ads.yaml is corrupted; backup or delete and re-run setup_meta_auth.py."
+            except OSError as e:
+                self.logger.error(f"Error reading meta-ads.yaml: {e}", exc_info=True)
+                return False, f"Could not read meta-ads.yaml: {e}"
 
             # Update token
             config["access_token"] = t
@@ -3163,45 +3183,51 @@ class AdsReportFetcherApp:
             dialog.wait_window()
         
         self.root.after(0, show_dialog)
-        dialog_done.wait(timeout=300)
+        dialog_done.wait(timeout=DIALOG_WAIT_SECONDS)
         
         return result["choice"]
     
     def _load_settings(self) -> Dict:
         """Load settings from config.json file (under app dir)."""
+        defaults = {
+            "default_google_favorite": "ML",
+            "default_meta_favorite": "ML",
+            "default_ms_favorite": None,
+            "default_tiktok_favorite": None,
+            "default_reddit_favorite": None,
+            "default_pinterest_favorite": None,
+            "theme_mode": "dark",
+            "default_download_folder": "raw_reports",
+            "default_output_folder": "processed_reports",
+            "raw_reports_dir": "raw_reports",
+            "processed_reports_dir": "processed_reports",
+            "merged_reports_dir": "merged_reports",
+            "ready_reports_dir": "ready_reports",
+        }
         try:
             if self.settings_file.exists():
                 with open(self.settings_file, 'r', encoding='utf-8') as f:
-                    return json.load(f)
-            else:
-                return {
-                    "default_google_favorite": "ML",
-                    "default_meta_favorite": "ML",
-                    "default_ms_favorite": None,
-                    "default_tiktok_favorite": None,
-                    "default_reddit_favorite": None,
-                    "default_pinterest_favorite": None,
-                    "theme_mode": "dark",
-                    "default_download_folder": "raw_reports",
-                    "default_output_folder": "processed_reports"
-                }
-        except Exception as e:
-            # Logger might not be initialized yet, use print
+                    loaded = json.load(f)
+                # Merge with defaults so new keys (e.g. raw_reports_dir) are present when saving
+                merged = defaults.copy()
+                if isinstance(loaded, dict):
+                    merged.update(loaded)
+                return merged
+            return defaults.copy()
+        except json.JSONDecodeError as e:
             try:
-                self.logger.error(f"Error loading settings: {e}", exc_info=True)
-            except:
-                print(f"Error loading settings: {e}")
-            return {
-                "default_google_favorite": "ML",
-                "default_meta_favorite": "ML",
-                "default_ms_favorite": None,
-                "default_tiktok_favorite": None,
-                "default_reddit_favorite": None,
-                "default_pinterest_favorite": None,
-                "theme_mode": "dark",
-                "default_download_folder": "raw_reports",
-                "default_output_folder": "processed_reports"
-            }
+                self.logger.error(f"config.json is corrupted (invalid JSON): {e}", exc_info=True)
+            except Exception:
+                print(f"config.json is corrupted: {e}")
+            self._config_corrupted_msg = "config.json was corrupted; using defaults. Backup or delete and restart."
+            return defaults.copy()
+        except OSError as e:
+            try:
+                self.logger.error(f"Error reading config.json: {e}", exc_info=True)
+            except Exception:
+                print(f"Error reading config.json: {e}")
+            self._config_corrupted_msg = "Could not read config.json; using defaults."
+            return defaults.copy()
     
     def _load_favorites(self) -> None:
         """Load favorites from JSON file."""
@@ -3211,8 +3237,13 @@ class AdsReportFetcherApp:
                     self.favorites = json.load(f)
             else:
                 self.favorites = []
-        except Exception as e:
-            self.logger.error(f"Error loading favorites: {e}", exc_info=True)
+        except json.JSONDecodeError as e:
+            self.logger.error(f"customer_favorites.json is corrupted (invalid JSON): {e}", exc_info=True)
+            self.favorites = []
+            if hasattr(self, "status_text"):
+                self.status_text.set("customer_favorites.json was corrupted; using empty list. Backup or delete and restart.")
+        except OSError as e:
+            self.logger.error(f"Error reading customer_favorites.json: {e}", exc_info=True)
             self.favorites = []
     
     def _save_favorites(self) -> None:
@@ -3491,8 +3522,13 @@ class AdsReportFetcherApp:
                     self.meta_favorites = json.load(f)
             else:
                 self.meta_favorites = []
-        except Exception as e:
-            self.logger.error(f"Error loading Meta favorites: {e}", exc_info=True)
+        except json.JSONDecodeError as e:
+            self.logger.error(f"meta_favorites.json is corrupted (invalid JSON): {e}", exc_info=True)
+            self.meta_favorites = []
+            if hasattr(self, "status_text"):
+                self.status_text.set("meta_favorites.json was corrupted; using empty list. Backup or delete and restart.")
+        except OSError as e:
+            self.logger.error(f"Error reading meta_favorites.json: {e}", exc_info=True)
             self.meta_favorites = []
     
     def _save_meta_favorites(self) -> None:
@@ -3510,8 +3546,13 @@ class AdsReportFetcherApp:
                     self.ms_favorites = json.load(f)
             else:
                 self.ms_favorites = []
-        except Exception as e:
-            self.logger.error(f"Error loading MS favorites: {e}", exc_info=True)
+        except json.JSONDecodeError as e:
+            self.logger.error(f"ms_favorites.json is corrupted (invalid JSON): {e}", exc_info=True)
+            self.ms_favorites = []
+            if hasattr(self, "status_text"):
+                self.status_text.set("ms_favorites.json was corrupted; using empty list. Backup or delete and restart.")
+        except OSError as e:
+            self.logger.error(f"Error reading ms_favorites.json: {e}", exc_info=True)
             self.ms_favorites = []
     
     def _save_ms_favorites(self) -> None:
@@ -3528,8 +3569,11 @@ class AdsReportFetcherApp:
                     self.tiktok_favorites = json.load(f)
             else:
                 self.tiktok_favorites = []
-        except Exception as e:
-            self.logger.error(f"Error loading TikTok favorites: {e}", exc_info=True)
+        except json.JSONDecodeError as e:
+            self.logger.error(f"tiktok_favorites.json is corrupted (invalid JSON): {e}", exc_info=True)
+            self.tiktok_favorites = []
+        except OSError as e:
+            self.logger.error(f"Error reading tiktok_favorites.json: {e}", exc_info=True)
             self.tiktok_favorites = []
     
     def _save_tiktok_favorites(self) -> None:
@@ -3546,8 +3590,11 @@ class AdsReportFetcherApp:
                     self.reddit_favorites = json.load(f)
             else:
                 self.reddit_favorites = []
-        except Exception as e:
-            self.logger.error(f"Error loading Reddit favorites: {e}", exc_info=True)
+        except json.JSONDecodeError as e:
+            self.logger.error(f"reddit_favorites.json is corrupted (invalid JSON): {e}", exc_info=True)
+            self.reddit_favorites = []
+        except OSError as e:
+            self.logger.error(f"Error reading reddit_favorites.json: {e}", exc_info=True)
             self.reddit_favorites = []
     
     def _save_reddit_favorites(self) -> None:
@@ -3564,8 +3611,11 @@ class AdsReportFetcherApp:
                     self.pinterest_favorites = json.load(f)
             else:
                 self.pinterest_favorites = []
-        except Exception as e:
-            self.logger.error(f"Error loading Pinterest favorites: {e}", exc_info=True)
+        except json.JSONDecodeError as e:
+            self.logger.error(f"pinterest_favorites.json is corrupted (invalid JSON): {e}", exc_info=True)
+            self.pinterest_favorites = []
+        except OSError as e:
+            self.logger.error(f"Error reading pinterest_favorites.json: {e}", exc_info=True)
             self.pinterest_favorites = []
     
     def _save_pinterest_favorites(self) -> None:

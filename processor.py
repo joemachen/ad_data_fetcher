@@ -139,20 +139,30 @@ RANGE_FILENAME_PATTERN = re.compile(r'^(\d{4})-(\d{2})-(\d{2})_(\d{4})-(\d{2})-(
 class ReportProcessor:
     """Processes raw platform CSV files into standardized INTERNAL_SCHEMA format."""
     
-    def __init__(self, input_dir: str = "raw_reports", output_dir: str = "processed_reports", 
-                 status_callback: Optional[Callable[[str], None]] = None,
-                 user_input_callback: Optional[Callable[[str], str]] = None):
+    def __init__(
+        self,
+        input_dir: str = "raw_reports",
+        output_dir: str = "processed_reports",
+        merged_dir: str = "merged_reports",
+        ready_dir: str = "ready_reports",
+        status_callback: Optional[Callable[[str], None]] = None,
+        user_input_callback: Optional[Callable[[str], str]] = None,
+    ):
         """
         Initialize the ReportProcessor.
-        
+
         Args:
             input_dir: Directory containing raw CSV files to process (default: raw_reports)
             output_dir: Directory to save processed files (default: processed_reports)
+            merged_dir: Directory for merged CSVs (default: merged_reports)
+            ready_dir: Directory for YoY ready reports (default: ready_reports)
             status_callback: Optional callback function(message: str) to report status updates
             user_input_callback: Optional callback function(campaign_name: str) -> str to get user input
         """
         self.input_dir = Path(input_dir)
         self.output_dir = Path(output_dir)
+        self.merged_dir = Path(merged_dir)
+        self.ready_dir = Path(ready_dir)
         self.status_callback = status_callback
         self.user_input_callback = user_input_callback
         
@@ -196,8 +206,11 @@ class ReportProcessor:
             else:
                 self.campaign_mappings = {}
                 self.logger.info(f"Mappings file {self.mappings_file} not found, starting with empty mappings")
-        except Exception as e:
-            self.logger.error(f"Error loading mappings: {e}", exc_info=True)
+        except json.JSONDecodeError as e:
+            self.logger.error(f"mappings.json is corrupted (invalid JSON): {e}", exc_info=True)
+            self.campaign_mappings = {}
+        except OSError as e:
+            self.logger.error(f"Error reading mappings file: {e}", exc_info=True)
             self.campaign_mappings = {}
     
     def _save_mappings(self) -> None:
@@ -526,8 +539,7 @@ class ReportProcessor:
             self._update_status("Starting merge of platform data...")
             self.logger.info("Starting merge of platform data")
             
-            merged_dir = Path("merged_reports")
-            merged_dir.mkdir(parents=True, exist_ok=True)
+            self.merged_dir.mkdir(parents=True, exist_ok=True)
             
             # Collect all unique YYYY-MM-DD_YYYY-MM-DD.csv from any platform subfolder
             filenames = set()
@@ -574,7 +586,7 @@ class ReportProcessor:
                     for msg in validation_messages:
                         self.logger.warning(msg)
                     
-                    output_path = merged_dir / filename
+                    output_path = self.merged_dir / filename
                     merged_df.to_csv(output_path, index=False)
                     merged_count += 1
                     counts_str = ", ".join(f"{k}: {v} rows" for k, v in sorted(row_counts.items()))
@@ -607,15 +619,14 @@ class ReportProcessor:
         """
         try:
             self._update_status("Building YoY reports...")
-            self.logger.info("Building YoY reports from merged_reports")
-            merged_dir = Path("merged_reports")
-            if not merged_dir.exists():
+            self.logger.info("Building YoY reports from %s", self.merged_dir)
+            if not self.merged_dir.exists():
                 self._update_status("No merged_reports directory")
                 self.logger.info("No merged_reports directory; skipping YoY")
                 return
             # Group merged filenames by range_id (MM-DD_MM-DD) and year (from first YYYY in filename)
             range_to_files: Dict[str, Dict[int, str]] = {}  # range_id -> {year: filename}
-            for csv_path in merged_dir.glob("*.csv"):
+            for csv_path in self.merged_dir.glob("*.csv"):
                 parsed = self._parse_range_from_filename(csv_path.name)
                 if not parsed:
                     continue
@@ -626,8 +637,7 @@ class ReportProcessor:
                 range_to_files[range_id][year] = csv_path.name
             key_cols = ['Campaign', 'Platform', 'Channel', 'Funnel Stage']
             metric_cols = ['Impressions', 'Clicks', 'Cost', 'Revenue', 'Conversions']
-            ready_dir = Path("ready_reports")
-            ready_dir.mkdir(parents=True, exist_ok=True)
+            self.ready_dir.mkdir(parents=True, exist_ok=True)
             built = 0
             for range_id, year_to_filename in range_to_files.items():
                 years = sorted(year_to_filename.keys())
@@ -638,8 +648,8 @@ class ReportProcessor:
                     y1, y2 = years[i], years[i + 1]
                     if y2 - y1 != 1:
                         continue
-                    fn1 = merged_dir / year_to_filename[y1]
-                    fn2 = merged_dir / year_to_filename[y2]
+                    fn1 = self.merged_dir / year_to_filename[y1]
+                    fn2 = self.merged_dir / year_to_filename[y2]
                     if not fn1.exists() or not fn2.exists():
                         continue
                     try:
@@ -675,16 +685,16 @@ class ReportProcessor:
                     merged = merged[[c for c in final_cols if c in merged.columns]]
                     # Output: ready_2025-01-05_2025-01-20_vs_2024.csv (current range vs prior year)
                     out_name = f"ready_{year_to_filename[y2].replace('.csv', '')}_vs_{y1}.csv"
-                    out_path = ready_dir / out_name
+                    out_path = self.ready_dir / out_name
                     merged.to_csv(out_path, index=False)
                     self._update_status(f"YoY report saved: {out_path.name}")
                     self.logger.info(f"YoY report saved: {out_path} ({len(merged)} rows)")
                     built += 1
             if built == 0:
                 self._update_status("No YoY pairs found (need same date range in two consecutive years)")
-                self.logger.info("No YoY pairs found; skipping ready_reports")
+                self.logger.info("No YoY pairs found; skipping %s", self.ready_dir)
             else:
-                self._update_status(f"YoY complete: {built} report(s) saved to ready_reports/")
+                self._update_status(f"YoY complete: {built} report(s) saved to {self.ready_dir}/")
         except Exception as e:
             error_msg = f"Error building YoY reports: {e}"
             self.logger.error(error_msg, exc_info=True)

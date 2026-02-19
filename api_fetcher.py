@@ -4,12 +4,17 @@ Fetches report data using the Google Ads API instead of browser automation.
 """
 
 import logging
+import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional, List, Tuple, Callable
 import pandas as pd
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
+
+# Retries for transient API errors (rate limit, 5xx)
+MAX_RETRIES = 3
+RETRY_BACKOFF_BASE = 2  # seconds
 
 
 class AdsApiFetcher:
@@ -112,9 +117,22 @@ class AdsApiFetcher:
                 ORDER BY segments.date, campaign.name
             """
             
-            # Execute query
+            # Execute query with retries for transient errors
             ga_service = self.client.get_service("GoogleAdsService")
-            response = ga_service.search(customer_id=self.customer_id, query=query)
+            for attempt in range(MAX_RETRIES):
+                try:
+                    response = ga_service.search(customer_id=self.customer_id, query=query)
+                    break
+                except GoogleAdsException as e:
+                    code = (e.error.code().name if hasattr(e.error, "code") else "") or ""
+                    if "USER_PERMISSION_DENIED" in code or "PERMISSION_DENIED" in code:
+                        raise
+                    if attempt < MAX_RETRIES - 1:
+                        delay = RETRY_BACKOFF_BASE ** (attempt + 1)
+                        self.logger.warning(f"Google Ads API transient error (attempt {attempt + 1}/{MAX_RETRIES}), retrying in {delay}s: {code}")
+                        time.sleep(delay)
+                    else:
+                        raise
             
             # Collect data
             rows = []

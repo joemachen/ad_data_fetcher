@@ -182,5 +182,11 @@
   "YT - Frequency - Non Skippable - EN": "Top",
   "YT - Frequency - Non Skippable - FR": "Top",
   "YT - Frequency - Non Skippable - ROC - EN": "Top",
-  "YT - Frequency - Non Skippable - ROC - FR": "Top"
+  "YT - Frequency - Non Skippable - ROC - FR": "Top",
+  "NB_Search_Control_AI-Max_OFF": "Top",
+  "NB_Search_Treatment_AI-Max_ON": "Top",
+  "Traffic Campaign CA": "Top",
+  "Retargeting Campaign CA": "Bottom",
+  "Traffic Campaign USA": "Top",
+  "Retargeting Campaign USA": "Bottom"
 }

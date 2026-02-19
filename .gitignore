@@ -58,6 +58,11 @@ app_debug.log
 browser_context/
 user_data/
 
+# --- Test and lint ---
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
 # --- OS and editor ---
 .DS_Store
 Thumbs.db
