@@ -166,16 +166,6 @@ class ReportProcessor:
         self.status_callback = status_callback
         self.user_input_callback = user_input_callback
         
-        # Setup logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %I:%M:%S %p',
-            handlers=[
-                logging.FileHandler('app_debug.log'),
-                logging.StreamHandler()
-            ]
-        )
         self.logger = logging.getLogger(__name__)
         
         # Create output directory if it doesn't exist

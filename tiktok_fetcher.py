@@ -59,31 +59,3 @@ class TikTokAdsFetcher:
         self._update_status(f"Fetching {start_str} to {end_str}...")
         # TODO: Call TikTok API; return DataFrame with campaign_name, stat_cost, conversion, show_rev, etc.
         return None
-
-    def fetch_monthly_reports(self, start_date: datetime, end_date: datetime) -> List[Tuple[datetime, bool]]:
-        """Fetch reports for each month; save to {month}_{year}.csv."""
-        results = []
-        current = datetime(start_date.year, start_date.month, 1)
-        end = datetime(end_date.year, end_date.month, 1)
-        months = []
-        while current <= end:
-            months.append(current)
-            current = datetime(current.year + (1 if current.month == 12 else 0), (current.month % 12) + 1, 1)
-        for idx, month_date in enumerate(months):
-            if self.cancel_flag and self.cancel_flag.is_set():
-                break
-            month_start = datetime(month_date.year, month_date.month, 1)
-            month_end = month_start + timedelta(days=32)
-            month_end = month_end.replace(day=1) - timedelta(days=1)
-            df = self.fetch_month_data(month_start, month_end)
-            if df is not None and not df.empty:
-                fn = f"{month_start.strftime('%b').lower()}_{month_start.year}.csv"
-                out = self.output_dir / fn
-                df.to_csv(out, index=False)
-                self.logger.info(f"Saved report to: {out}")
-                results.append((month_date, True))
-            else:
-                results.append((month_date, False))
-            if self.progress_callback:
-                self.progress_callback(idx + 1, len(months))
-        return results

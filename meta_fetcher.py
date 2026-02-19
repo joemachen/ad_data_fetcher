@@ -16,11 +16,10 @@ from facebook_business.adobjects.adaccount import AdAccount
 from facebook_business.adobjects.adsinsights import AdsInsights
 from facebook_business.exceptions import FacebookRequestError
 
+from constants import META_RETENTION_MONTHS
+
 # Directory containing this module (and meta-ads.yaml) so path works regardless of CWD
 _APP_DIR = Path(__file__).resolve().parent
-
-# Meta API only supports data for the last 37 months (Error 3018 for older data)
-META_RETENTION_MONTHS = 37
 
 
 class MetaTokenExpiredError(Exception):
@@ -55,16 +54,6 @@ class MetaAdsFetcher:
         # Initialize Meta API client once per pipeline run; same client is reused for all months.
         # Re-initializing per month can look suspicious to Meta's security filters.
         
-        # Setup logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %I:%M:%S %p',
-            handlers=[
-                logging.FileHandler('app_debug.log'),
-                logging.StreamHandler()
-            ]
-        )
         self.logger = logging.getLogger(__name__)
         
         self._init_api()
@@ -272,97 +261,3 @@ class MetaAdsFetcher:
                 self._update_status(f"Error: {error_msg}")
                 return None
         return None
-    
-    def fetch_monthly_reports(self, start_date: datetime, end_date: datetime) -> List[Tuple[datetime, bool]]:
-        """
-        Fetch reports for each month in the date range.
-        
-        Args:
-            start_date: Start date of the range
-            end_date: End date of the range
-        
-        Returns:
-            List of tuples (month_date, success_status)
-        """
-        results = []
-        meta_cutoff = (datetime.now() - relativedelta(months=META_RETENTION_MONTHS)).replace(day=1)
-        
-        try:
-            # Generate list of months to process
-            current = datetime(start_date.year, start_date.month, 1)
-            end = datetime(end_date.year, end_date.month, 1)
-            
-            months_to_process = []
-            while current <= end:
-                months_to_process.append(current)
-                # Move to next month
-                if current.month == 12:
-                    current = datetime(current.year + 1, 1, 1)
-                else:
-                    current = datetime(current.year, current.month + 1, 1)
-            
-            self._update_status(f"Processing {len(months_to_process)} month(s)...")
-            
-            # Process each month (1s delay between months to stay under Meta per-second rate limits)
-            for idx, month_date in enumerate(months_to_process):
-                if self.cancel_flag and self.cancel_flag.is_set():
-                    self.logger.info("Processing cancelled by user")
-                    self._update_status("Cancelled by user")
-                    break
-                if idx > 0:
-                    time.sleep(1)
-                month_start = datetime(month_date.year, month_date.month, 1)
-                if month_start < meta_cutoff:
-                    month_str = month_start.strftime("%B %Y")
-                    self.logger.info(f"Skipping {month_str} - outside Meta retention window")
-                    results.append((month_date, False))
-                    if self.progress_callback:
-                        self.progress_callback(idx + 1, len(months_to_process))
-                    continue
-                try:
-                    # Calculate month start and end
-                    if month_date.month == 12:
-                        month_end = datetime(month_date.year + 1, 1, 1) - timedelta(days=1)
-                    else:
-                        month_end = datetime(month_date.year, month_date.month + 1, 1) - timedelta(days=1)
-                    
-                    month_str = month_start.strftime('%B %Y')
-                    self.logger.info(f"Processing month: {month_str}")
-                    self._update_status(f"Fetching {month_str}...")
-                    
-                    # Fetch data for this month
-                    df = self.fetch_month_data(month_start, month_end)
-                    
-                    if df is not None and not df.empty:
-                        # Generate output filename (format: jan_2025.csv, feb_2025.csv, etc.)
-                        month_abbr = month_start.strftime('%b').lower()  # jan, feb, mar, etc.
-                        output_filename = f"{month_abbr}_{month_start.year}.csv"
-                        output_path = self.output_dir / output_filename
-                        
-                        # Save to CSV
-                        df.to_csv(output_path, index=False)
-                        self.logger.info(f"Saved report to: {output_path}")
-                        results.append((month_date, True))
-                    else:
-                        self.logger.warning(f"No data for {month_str}")
-                        results.append((month_date, False))
-                    
-                    # Update progress
-                    if self.progress_callback:
-                        self.progress_callback(idx + 1, len(months_to_process))
-                    
-                except MetaTokenExpiredError:
-                    # Let token expiration errors propagate up immediately - don't catch here
-                    raise
-                except Exception as e:
-                    self.logger.error(f"Error processing month {month_date.strftime('%B %Y')}: {e}", exc_info=True)
-                    results.append((month_date, False))
-            
-            return results
-            
-        except MetaTokenExpiredError:
-            # Re-raise token expiration errors so they can be handled by the GUI
-            raise
-        except Exception as e:
-            self.logger.error(f"Fatal error in fetch_monthly_reports: {e}", exc_info=True)
-            return results

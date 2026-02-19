@@ -76,7 +76,7 @@ File naming: `YYYY-MM-DD_YYYY-MM-DD.csv`. Processor only considers this range pa
 - **Data**: `pandas`, `pyyaml`; standard library `logging`, `threading`, `queue`, `pathlib`, `json`, `urllib`.
 - **Utilities**: `python-dateutil`.
 
-Setup scripts: `setup_auth.py`, `setup_meta_auth.py`, `setup_ms_auth.py`, `update_mcc_id.py` (run directly with Python). Run: `run.bat` (or `run_debug.bat` for console), `stop_app.bat` to stop instances. Dependencies in `requirements.txt`. Version is in `main.py` as `__version__` and shown in the window title.
+Setup scripts: `setup_auth.py`, `setup_meta_auth.py`, `setup_ms_auth.py`, `update_mcc_id.py` (run directly with Python). Run: `run.bat` or `run_debug.bat` (no console; only app window in taskbar), `stop_app.bat` to stop instances. Dependencies in `requirements.txt`. Version is in `main.py` as `__version__` and shown in the window title.
 
 ---
 

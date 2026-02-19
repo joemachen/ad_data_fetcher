@@ -7,7 +7,7 @@ import logging
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Optional, List, Tuple, Callable
+from typing import Optional, Callable
 import pandas as pd
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
@@ -38,16 +38,6 @@ class AdsApiFetcher:
         self.progress_callback = progress_callback
         self.cancel_flag = cancel_flag
         
-        # Setup logging
-        logging.basicConfig(
-            level=logging.INFO,
-            format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
-            datefmt='%Y-%m-%d %I:%M:%S %p',
-            handlers=[
-                logging.FileHandler('app_debug.log'),
-                logging.StreamHandler()
-            ]
-        )
         self.logger = logging.getLogger(__name__)
         
         # Initialize Google Ads client
@@ -55,9 +45,10 @@ class AdsApiFetcher:
         self._init_client()
     
     def _init_client(self) -> None:
-        """Initialize Google Ads API client from google-ads.yaml."""
+        """Initialize Google Ads API client from google-ads.yaml (in app directory)."""
         try:
-            yaml_path = Path("google-ads.yaml")
+            _app_dir = Path(__file__).resolve().parent
+            yaml_path = _app_dir / "google-ads.yaml"
             if not yaml_path.exists():
                 raise FileNotFoundError(
                     "google-ads.yaml not found. Please run setup_auth.py first to create it."
@@ -187,83 +178,3 @@ class AdsApiFetcher:
             self.logger.error(error_msg, exc_info=True)
             self._update_status(f"Error: {error_msg}")
             return None
-    
-    def fetch_monthly_reports(self, start_date: datetime, end_date: datetime) -> List[Tuple[datetime, bool]]:
-        """
-        Fetch reports for each month in the date range.
-        
-        Args:
-            start_date: Start date of the range
-            end_date: End date of the range
-        
-        Returns:
-            List of tuples (month_date, success_status)
-        """
-        results = []
-        
-        try:
-            # Generate list of months to process
-            current = datetime(start_date.year, start_date.month, 1)
-            end = datetime(end_date.year, end_date.month, 1)
-            
-            months_to_process = []
-            while current <= end:
-                months_to_process.append(current)
-                # Move to next month
-                if current.month == 12:
-                    current = datetime(current.year + 1, 1, 1)
-                else:
-                    current = datetime(current.year, current.month + 1, 1)
-            
-            self._update_status(f"Processing {len(months_to_process)} month(s)...")
-            
-            # Process each month
-            for idx, month_date in enumerate(months_to_process):
-                # Check for cancellation
-                if self.cancel_flag and self.cancel_flag.is_set():
-                    self.logger.info("Processing cancelled by user")
-                    self._update_status("Cancelled by user")
-                    break
-                
-                try:
-                    # Calculate month start and end
-                    month_start = datetime(month_date.year, month_date.month, 1)
-                    if month_date.month == 12:
-                        month_end = datetime(month_date.year + 1, 1, 1) - timedelta(days=1)
-                    else:
-                        month_end = datetime(month_date.year, month_date.month + 1, 1) - timedelta(days=1)
-                    
-                    month_str = month_start.strftime('%B %Y')
-                    self.logger.info(f"Processing month: {month_str}")
-                    self._update_status(f"Fetching {month_str}...")
-                    
-                    # Fetch data for this month
-                    df = self.fetch_month_data(month_start, month_end)
-                    
-                    if df is not None and not df.empty:
-                        # Generate output filename (format: jan_2025.csv, feb_2025.csv, etc.)
-                        month_abbr = month_start.strftime('%b').lower()  # jan, feb, mar, etc.
-                        output_filename = f"{month_abbr}_{month_start.year}.csv"
-                        output_path = self.output_dir / output_filename
-                        
-                        # Save to CSV
-                        df.to_csv(output_path, index=False)
-                        self.logger.info(f"Saved report to: {output_path}")
-                        results.append((month_date, True))
-                    else:
-                        self.logger.warning(f"No data for {month_str}")
-                        results.append((month_date, False))
-                    
-                    # Update progress
-                    if self.progress_callback:
-                        self.progress_callback(idx + 1, len(months_to_process))
-                    
-                except Exception as e:
-                    self.logger.error(f"Error processing month {month_date.strftime('%B %Y')}: {e}", exc_info=True)
-                    results.append((month_date, False))
-            
-            return results
-            
-        except Exception as e:
-            self.logger.error(f"Fatal error in fetch_monthly_reports: {e}", exc_info=True)
-            return results

@@ -4,7 +4,7 @@ Suggestions and recommendations to make the app more useful, efficient, futurepr
 
 ---
 
-## Where we are (as of v1.0.1)
+## Where we are (as of v1.0.2)
 
 | Phase | Status | Notes |
 |-------|--------|--------|
@@ -149,6 +149,6 @@ Suggestions and recommendations to make the app more useful, efficient, futurepr
    Pytest for processor (`tests/test_processor.py`), ruff + mypy in `pyproject.toml`, constants for timeouts/retries (`constants.py`).
 
 4. **Phase 4 – Scale & polish** (partial)  
-   Configurable output dir ✅ (config.json + Settings UI). Per-platform pipeline progress ✅ (v1.0.1). Export/import settings still open. Split `main.py` deferred. See [CHANGELOG.md](CHANGELOG.md) for release notes.
+   Configurable output dir ✅ (config.json + Settings UI). Per-platform pipeline progress ✅ (v1.0.1). Cleanup in v1.0.2 (dead code, logging, constants, launcher). Export/import settings still open. Split `main.py` deferred. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 Use this list as a checklist; re-prioritize based on how you use the app and who else might use it.

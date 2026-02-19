@@ -226,38 +226,3 @@ class MicrosoftAdsFetcher:
                     self._update_status(f"Error: {e}")
                     return None
         return None
-
-    def fetch_monthly_reports(self, start_date: datetime, end_date: datetime) -> List[Tuple[datetime, bool]]:
-        """Fetch reports for each month in range; save to {month}_{year}.csv. 1s delay between months."""
-        results = []
-        current = datetime(start_date.year, start_date.month, 1)
-        end = datetime(end_date.year, end_date.month, 1)
-        months = []
-        while current <= end:
-            months.append(current)
-            if current.month == 12:
-                current = datetime(current.year + 1, 1, 1)
-            else:
-                current = datetime(current.year, current.month + 1, 1)
-        for idx, month_date in enumerate(months):
-            if self.cancel_flag and self.cancel_flag.is_set():
-                break
-            if idx > 0:
-                time.sleep(1)
-            month_start = datetime(month_date.year, month_date.month, 1)
-            if month_start.month == 12:
-                month_end = datetime(month_start.year + 1, 1, 1) - timedelta(days=1)
-            else:
-                month_end = datetime(month_start.year, month_start.month + 1, 1) - timedelta(days=1)
-            df = self.fetch_month_data(month_start, month_end)
-            if df is not None and not df.empty:
-                fn = f"{month_start.strftime('%b').lower()}_{month_start.year}.csv"
-                out = self.output_dir / fn
-                df.to_csv(out, index=False)
-                self.logger.info(f"Saved report to: {out}")
-                results.append((month_date, True))
-            else:
-                results.append((month_date, False))
-            if self.progress_callback:
-                self.progress_callback(idx + 1, len(months))
-        return results

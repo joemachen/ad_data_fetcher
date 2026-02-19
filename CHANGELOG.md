@@ -4,6 +4,26 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ---
 
+## [1.0.2] — 2026-02-01
+
+### Removed
+
+- **Dead code:** `fetch_monthly_reports` removed from all six fetchers (`api_fetcher`, `meta_fetcher`, `microsoft_fetcher`, `reddit_fetcher`, `tiktok_fetcher`, `pinterest_fetcher`). The app uses only `fetch_month_data`; the pipeline drives date ranges from `main.py`.
+- **Redundant logging:** `logging.basicConfig` and duplicate `FileHandler`/`StreamHandler` setup removed from `api_fetcher.py`, `meta_fetcher.py`, and `processor.py`. Logging is configured once by the main app; these modules use `logging.getLogger(__name__)` only.
+
+### Changed
+
+- **Constants:** `META_RETENTION_MONTHS` (37) moved to `constants.py`; `main.py` and `meta_fetcher.py` import it from there.
+- **Google Ads config path:** `api_fetcher.py` now loads `google-ads.yaml` from the app directory (`Path(__file__).resolve().parent`) so behavior does not depend on CWD.
+- **Launcher:** `run_debug.bat` now uses `pythonw.exe` so only the app window appears in the taskbar (no console). `run.bat` and `run_debug.bat` both launch without a console.
+
+### Documentation
+
+- **TECHNICAL_OVERVIEW.md:** Launcher description updated (both run.bat and run_debug.bat, no console).
+- **ROADMAP.md:** "Where we are" and summary updated to v1.0.2 where relevant.
+
+---
+
 ## [1.0.1] — 2026-02-01
 
 ### Added

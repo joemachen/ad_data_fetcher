@@ -31,18 +31,14 @@ from meta_fetcher import MetaAdsFetcher, MetaTokenExpiredError
 from microsoft_fetcher import MicrosoftAdsFetcher
 from reddit_fetcher import RedditAdsFetcher
 from processor import ReportProcessor
-from constants import PIPELINE_FETCH_WAIT_SECONDS, DIALOG_WAIT_SECONDS
+from constants import PIPELINE_FETCH_WAIT_SECONDS, DIALOG_WAIT_SECONDS, META_RETENTION_MONTHS
 
 # Directory containing main.py; config and credentials live here so paths don't depend on CWD
 _APP_DIR = Path(__file__).resolve().parent
-__version__ = "1.0.1"
+__version__ = "1.0.2"
 
 # Uniform width for all platform ID/account input fields (combobox)
 ID_FIELD_WIDTH = 400
-
-# Meta Ads API only supports data for the last 37 months (Error 3018 for older data)
-META_RETENTION_MONTHS = 37
-
 
 def _parse_id_from_favorite_display(display: str) -> str:
     """Extract ID from combobox display string 'Name (ID)' or return as-is if no parens."""
