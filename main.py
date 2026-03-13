@@ -30,11 +30,11 @@ from api_fetcher import AdsApiFetcher
 from meta_fetcher import MetaAdsFetcher, MetaTokenExpiredError
 from microsoft_fetcher import MicrosoftAdsFetcher
 from reddit_fetcher import RedditAdsFetcher
+from tiktok_fetcher import TikTokAdsFetcher
 from processor import ReportProcessor
 from constants import PIPELINE_FETCH_WAIT_SECONDS, DIALOG_WAIT_SECONDS, META_RETENTION_MONTHS
 
-# Directory containing main.py; config and credentials live here so paths don't depend on CWD
-_APP_DIR = Path(__file__).resolve().parent
+from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
 __version__ = "1.0.2"
 
 # Uniform width for all platform ID/account input fields (combobox)
@@ -2059,10 +2059,10 @@ class AdsReportFetcherApp:
             if pinterest_ready:
                 fetch_sequence.append(("Pinterest", "Pinterest Ads", self._run_pinterest_fetch_in_batch))
 
-            # Per-platform progress: each platform has total_ranges (1 or 2); stubs (TikTok, Pinterest) use 1
+            # Per-platform progress: each platform has total_ranges (1 or 2); Pinterest stub uses 1
             total_ranges = 2 if self.main_pull_prior_year_var.get() else 1
             def _ranges_for(short: str) -> int:
-                return 1 if short in ("TikTok", "Pinterest") else total_ranges
+                return 1 if short == "Pinterest" else total_ranges
             self._pipeline_platform_order = [s[0] for s in fetch_sequence]
             self._pipeline_platform_progress = {s[0]: (0, _ranges_for(s[0])) for s in fetch_sequence}
             self.root.after(0, self._update_pipeline_platform_status)
@@ -2291,11 +2291,76 @@ class AdsReportFetcherApp:
             self.ms_fetch_complete.set()
 
     def _run_tiktok_fetch_in_batch(self) -> None:
-        """Run TikTok Ads fetch as part of batch. Stub: set completion; wire tiktok_fetcher when ready."""
-        self.logger.info("Pipeline: TikTok Ads fetch (stub)")
+        """Run TikTok Ads fetch as part of batch in a background thread."""
+        self.logger.info("Pipeline: TikTok Ads fetch starting")
         self.root.after(0, lambda: self.status_text.set("Pipeline: Fetching TikTok Ads..."))
-        self._report_pipeline_platform_progress("TikTok", 1, 1)
-        self.tiktok_fetch_complete.set()
+        thread = threading.Thread(target=self._run_tiktok_fetch_thread, daemon=True)
+        thread.start()
+
+    def _run_tiktok_fetch_thread(self) -> None:
+        """Run TikTok Ads fetcher in a background thread; signals tiktok_fetch_complete when done."""
+        try:
+            start_date, end_date = self._get_main_date_range()
+            advertiser_id = (self.tiktok_account_id.get() or "").strip().replace("-", "").replace(" ", "")
+            if not advertiser_id:
+                self.root.after(0, lambda: self.status_text.set("Error: TikTok Advertiser ID missing"))
+                return
+            self.logger.info(f"Starting TikTok Ads fetch for Advertiser ID: {_mask_id_for_log(advertiser_id)}")
+
+            def update_status(message: str) -> None:
+                self.root.after(0, lambda msg=message: self.status_text.set(msg))
+
+            raw_base = self.settings.get("raw_reports_dir", "raw_reports")
+            out_dir = Path(raw_base) / "tiktok"
+            fetcher = TikTokAdsFetcher(
+                advertiser_id=advertiser_id,
+                output_dir=str(out_dir),
+                status_callback=update_status,
+                progress_callback=None,
+                cancel_flag=None,
+            )
+            out_dir.mkdir(parents=True, exist_ok=True)
+            saved = 0
+            pipeline_total = 2 if self.main_pull_prior_year_var.get() else 1
+            if getattr(self, "_current_platform_key", None) == "TikTok":
+                self._report_pipeline_platform_progress("TikTok", 0, pipeline_total)
+            # Current range
+            df = fetcher.fetch_month_data(start_date, end_date)
+            if df is not None and not df.empty:
+                fn = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
+                out = out_dir / fn
+                df.to_csv(out, index=False)
+                self.logger.info(f"TikTok Ads: saved {out}")
+                saved += 1
+            else:
+                self.logger.info(f"TikTok Ads: no data for {start_date.date()} to {end_date.date()}")
+            if getattr(self, "_current_platform_key", None) == "TikTok":
+                self._report_pipeline_platform_progress("TikTok", 1, pipeline_total)
+            # Prior year range (if checkbox)
+            if self.main_pull_prior_year_var.get():
+                prior_start = start_date - relativedelta(years=1)
+                prior_end = end_date - relativedelta(years=1)
+                df_prior = fetcher.fetch_month_data(prior_start, prior_end)
+                if df_prior is not None and not df_prior.empty:
+                    fn_prior = f"{prior_start.strftime('%Y-%m-%d')}_{prior_end.strftime('%Y-%m-%d')}.csv"
+                    out_prior = out_dir / fn_prior
+                    df_prior.to_csv(out_prior, index=False)
+                    self.logger.info(f"TikTok Ads: saved prior year {out_prior}")
+                    saved += 1
+                else:
+                    self.logger.info(f"TikTok Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
+                if getattr(self, "_current_platform_key", None) == "TikTok":
+                    self._report_pipeline_platform_progress("TikTok", 2, pipeline_total)
+            self.root.after(0, lambda: self.status_text.set(
+                f"TikTok Ads fetch complete: {saved} range(s) saved"
+            ))
+            self.logger.info(f"TikTok Ads fetch complete: {saved} range(s) saved")
+        except Exception as e:
+            error_msg = f"TikTok Ads error: {e}"
+            self.logger.error(error_msg, exc_info=True)
+            self.root.after(0, lambda: self.status_text.set(error_msg))
+        finally:
+            self.tiktok_fetch_complete.set()
 
     def _run_reddit_fetch_in_batch(self) -> None:
         """Run Reddit Ads fetch as part of batch in a background thread."""

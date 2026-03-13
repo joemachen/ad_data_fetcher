@@ -1,0 +1,124 @@
+name: Build and Release Windows EXE
+
+# Trigger: push a version tag like v1.0.3
+#   git tag v1.0.3
+#   git push origin v1.0.3
+on:
+  push:
+    tags:
+      - "v*.*.*"
+
+permissions:
+  contents: write   # required to create a GitHub Release and upload assets
+
+jobs:
+  build-windows:
+    name: Build Windows EXE
+    runs-on: windows-latest
+
+    steps:
+      # ------------------------------------------------------------------ #
+      # 1. Source
+      # ------------------------------------------------------------------ #
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ------------------------------------------------------------------ #
+      # 2. Python
+      # ------------------------------------------------------------------ #
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      # ------------------------------------------------------------------ #
+      # 3. Dependencies
+      # ------------------------------------------------------------------ #
+      - name: Install runtime dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install PyInstaller
+        run: pip install pyinstaller>=6.0
+
+      # ------------------------------------------------------------------ #
+      # 4. Build
+      # ------------------------------------------------------------------ #
+      - name: Build with PyInstaller
+        run: pyinstaller ads_report_fetcher.spec --noconfirm
+
+      # Sanity-check: exe must exist
+      - name: Verify executable exists
+        shell: pwsh
+        run: |
+          if (-not (Test-Path "dist\AdsReportFetcher\AdsReportFetcher.exe")) {
+            Write-Error "Build failed: AdsReportFetcher.exe not found in dist\"
+            exit 1
+          }
+          Write-Host "Build succeeded."
+
+      # ------------------------------------------------------------------ #
+      # 5. Package
+      # ------------------------------------------------------------------ #
+      - name: Create release ZIP
+        shell: pwsh
+        run: |
+          $tag = "${{ github.ref_name }}"
+          $zipName = "AdsReportFetcher-$tag-windows.zip"
+
+          # Add a README so users know where to put their YAML files
+          @"
+          Ads Report Fetcher $tag — Windows Build
+          =========================================
+
+          1. Unzip this archive to a folder of your choice.
+          2. Place your credential YAML files in the same folder as
+             AdsReportFetcher.exe:
+               - google-ads.yaml
+               - meta-ads.yaml
+               - microsoft-ads.yaml
+               - reddit-ads.yaml
+               (Run the setup_*_auth.py scripts from the source repo to
+                generate these files.)
+          3. Double-click AdsReportFetcher.exe to launch.
+
+          Logs are written to app_debug.log in the same folder.
+          "@ | Out-File -FilePath "dist\AdsReportFetcher\INSTALL.txt" -Encoding utf8
+
+          Compress-Archive `
+            -Path "dist\AdsReportFetcher\*" `
+            -DestinationPath $zipName `
+            -Force
+
+          Write-Host "Created $zipName"
+
+      # ------------------------------------------------------------------ #
+      # 6. GitHub Release
+      # ------------------------------------------------------------------ #
+      - name: Create GitHub Release and upload ZIP
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        shell: pwsh
+        run: |
+          $tag  = "${{ github.ref_name }}"
+          $zip  = "AdsReportFetcher-$tag-windows.zip"
+          $body = @"
+          ## Ads Report Fetcher $tag
+
+          ### Installation
+          1. Download and unzip **$zip**.
+          2. Place your \`*.yaml\` credential files next to \`AdsReportFetcher.exe\`.
+          3. Double-click \`AdsReportFetcher.exe\` to launch.
+
+          > **First time?** Run the \`setup_*_auth.py\` scripts from the
+          > [source repository](https://github.com/${{ github.repository }})
+          > to generate your credential files.
+
+          ### What's new
+          See [CHANGELOG](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
+          "@
+
+          gh release create $tag `
+            --title "Ads Report Fetcher $tag" `
+            --notes $body `
+            $zip

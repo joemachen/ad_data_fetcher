@@ -13,7 +13,7 @@ from typing import Optional, List, Tuple, Callable
 import pandas as pd
 import yaml
 
-_APP_DIR = Path(__file__).resolve().parent
+from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
 
 # Redirect URI used during setup (Web app flow); must match Azure app registration
 MS_REDIRECT_URI = "http://localhost:8400"
