@@ -200,11 +200,13 @@ class RedditAdsFetcher:
             data = raw.get("data") if isinstance(raw, dict) else None
             if isinstance(data, dict):
                 self.logger.info(
-                    f"Reddit /api/v3/me data keys: {list(data.keys())}; "
-                    f"full data (for hierarchy): {json.dumps(data, default=str)[:2000]}"
+                    "Reddit /api/v3/me data keys: %s; businesses present: %s; profile_id present: %s",
+                    list(data.keys()),
+                    "businesses" in data,
+                    bool(data.get("id") or data.get("profile_id")),
                 )
             else:
-                self.logger.info(f"Reddit /api/v3/me data type: {type(data).__name__}; raw sample: {json.dumps(raw, default=str)[:500]}")
+                self.logger.info("Reddit /api/v3/me data type: %s", type(data).__name__)
             return raw
         except Exception as e:
             self.logger.debug(f"Reddit /api/v3/me failed: {e}")
@@ -529,7 +531,7 @@ class RedditAdsFetcher:
                     return rows
                 if raw is not None and raw != [] and raw != {}:
                     summary = list(raw.keys())[:15] if isinstance(raw, dict) else f"list(len={len(raw)})"
-                    self.logger.info(f"Reddit API returned data but no report rows; response keys: {summary}; sample: {json.dumps(raw)[:300]}")
+                    self.logger.info(f"Reddit API returned data but no report rows; response keys: {summary}")
         # Try POST report with JSON body (some APIs use POST for analytics)
         body = json.dumps({
             "start_date": start_str,
@@ -606,11 +608,10 @@ class RedditAdsFetcher:
             amount_spent = self._to_float(
                 item.get("spend") or item.get("SPEND") or item.get("amount_spent") or item.get("cost") or 0
             )
-            # Reddit Ads API returns SPEND in micro-currency (1e-6); convert to dollars for display
+            # Reddit Ads API returns SPEND in micro-currency (1/1,000,000 of a dollar).
+            # Any real spend value will be >= 1 micro-dollar, so divide to get dollars.
             if amount_spent and amount_spent >= 1:
                 amount_spent = amount_spent / 1_000_000
-            elif amount_spent and amount_spent > 0 and amount_spent < 1e-6:
-                amount_spent = amount_spent * 1_000_000
             impressions = self._to_float(
                 item.get("impressions") or item.get("IMPRESSIONS") or 0
             )
