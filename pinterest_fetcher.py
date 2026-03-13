@@ -55,7 +55,11 @@ class PinterestAdsFetcher:
         """Fetch campaign-level data. Stub: implement with Pinterest Marketing API."""
         start_str = start_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
-        self.logger.info(f"Fetching Pinterest Ads data for {start_str} to {end_str} (stub)")
-        self._update_status(f"Fetching {start_str} to {end_str}...")
+        self.logger.warning(
+            "Pinterest Ads fetch_month_data is not yet implemented; returning None for %s to %s. "
+            "Implement the Pinterest Marketing API call and remove this warning.",
+            start_str, end_str,
+        )
+        self._update_status("Pinterest Ads: not yet implemented, skipping.")
         # TODO: Call Pinterest API; return DataFrame with campaign_name, spend_in_micro_dollar, total_conversions
         return None

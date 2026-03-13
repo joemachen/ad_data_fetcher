@@ -55,7 +55,11 @@ class TikTokAdsFetcher:
         """Fetch campaign-level data. Stub: implement with TikTok Marketing API."""
         start_str = start_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
-        self.logger.info(f"Fetching TikTok Ads data for {start_str} to {end_str} (stub)")
-        self._update_status(f"Fetching {start_str} to {end_str}...")
+        self.logger.warning(
+            "TikTok Ads fetch_month_data is not yet implemented; returning None for %s to %s. "
+            "Implement the TikTok Marketing API call and remove this warning.",
+            start_str, end_str,
+        )
+        self._update_status("TikTok Ads: not yet implemented, skipping.")
         # TODO: Call TikTok API; return DataFrame with campaign_name, stat_cost, conversion, show_rev, etc.
         return None

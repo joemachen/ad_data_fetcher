@@ -18,6 +18,8 @@ from facebook_business.exceptions import FacebookRequestError
 
 from constants import META_RETENTION_MONTHS
 
+META_RETRY_BACKOFF_BASE = 2  # seconds; delay = base ** attempt (2s, 4s, 8s)
+
 # Directory containing this module (and meta-ads.yaml) so path works regardless of CWD
 _APP_DIR = Path(__file__).resolve().parent
 
@@ -242,11 +244,12 @@ class MetaAdsFetcher:
                 # Rate limit (17) or API unknown (1): pause 5s and retry
                 if error_code in (17, 1):
                     if attempt < max_retries_rate_limit:
+                        delay = META_RETRY_BACKOFF_BASE ** (attempt + 1)
                         self.logger.warning(
-                            f"Meta API error {error_code} (rate limit or unknown). Pausing 5s and retrying ({attempt + 1}/{max_retries_rate_limit})..."
+                            f"Meta API error {error_code} (rate limit or unknown). Pausing {delay}s and retrying ({attempt + 1}/{max_retries_rate_limit})..."
                         )
-                        self._update_status(f"Rate limit/API delay (code {error_code}). Pausing 5s, retrying...")
-                        time.sleep(5)
+                        self._update_status(f"Rate limit/API delay (code {error_code}). Pausing {delay}s, retrying...")
+                        time.sleep(delay)
                         continue
                     self.logger.error(f"Meta API error {error_code} after {max_retries_rate_limit} retries")
                     self._update_status(f"Error: Meta API error {error_code} after retries")
