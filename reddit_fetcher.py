@@ -23,7 +23,7 @@ from typing import Optional, List, Tuple, Callable, Dict, Any
 import pandas as pd
 import yaml
 
-_APP_DIR = Path(__file__).resolve().parent
+from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
 
 REDDIT_USER_AGENT = "AdsReportFetcher/1.0 (Desktop; Python)"
 REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"

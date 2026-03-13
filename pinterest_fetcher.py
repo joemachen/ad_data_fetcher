@@ -11,7 +11,7 @@ from typing import Optional, List, Tuple, Callable
 import pandas as pd
 import yaml
 
-_APP_DIR = Path(__file__).resolve().parent
+from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
 
 
 class PinterestAdsFetcher:

@@ -19,9 +19,7 @@ from facebook_business.exceptions import FacebookRequestError
 from constants import META_RETENTION_MONTHS
 
 META_RETRY_BACKOFF_BASE = 2  # seconds; delay = base ** attempt (2s, 4s, 8s)
-
-# Directory containing this module (and meta-ads.yaml) so path works regardless of CWD
-_APP_DIR = Path(__file__).resolve().parent
+from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
 
 
 class MetaTokenExpiredError(Exception):

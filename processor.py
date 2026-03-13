@@ -13,8 +13,7 @@ import json
 import threading
 from datetime import datetime
 
-# Directory containing this module (mappings.json lives here)
-_APP_DIR = Path(__file__).resolve().parent
+from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
 
 
 # --- Standardized Schema (platform-agnostic internal format) ---
@@ -96,9 +95,11 @@ PLATFORM_CONFIG: Dict[str, Dict[str, Any]] = {
     'tiktok': {
         'column_mapping': {
             'campaign_name': 'Campaign',
-            'stat_cost': 'Cost',
+            'spend': 'Cost',
+            'impressions': 'Impressions',
+            'clicks': 'Clicks',
             'conversion': 'Conversions',
-            'show_rev': 'Revenue',
+            'revenue': 'Revenue',
         },
         'display_name': 'TikTok Ads',
         'channel': 'Paid Social',
