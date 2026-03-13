@@ -1,0 +1,29 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "app",
+      "runtimeExecutable": "D:\\Projects\\Ads_Report_Fetcher\\venv\\Scripts\\python.exe",
+      "runtimeArgs": ["main.py"],
+      "port": 8765
+    },
+    {
+      "name": "tests",
+      "runtimeExecutable": "D:\\Projects\\Ads_Report_Fetcher\\venv\\Scripts\\python.exe",
+      "runtimeArgs": ["-m", "pytest", "tests/", "-v"],
+      "port": 8766
+    },
+    {
+      "name": "reddit-auth-setup",
+      "runtimeExecutable": "D:\\Projects\\Ads_Report_Fetcher\\venv\\Scripts\\python.exe",
+      "runtimeArgs": ["setup_reddit_auth.py"],
+      "port": 8765
+    },
+    {
+      "name": "ms-auth-setup",
+      "runtimeExecutable": "D:\\Projects\\Ads_Report_Fetcher\\venv\\Scripts\\python.exe",
+      "runtimeArgs": ["setup_ms_auth.py"],
+      "port": 8400
+    }
+  ]
+}
