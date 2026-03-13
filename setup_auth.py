@@ -37,13 +37,19 @@ def get_user_credentials() -> dict:
     print("\nOptional: If you use a Manager Account (MCC) to access sub-accounts,")
     print("enter your MCC ID (10-digit number). You can add/update this later.")
     print("Leave blank if not using an MCC account.")
-    mcc_id = input("MCC ID (login_customer_id): ").strip()
-    
+    mcc_id_raw = input("MCC ID (login_customer_id): ").strip()
+    mcc_id = mcc_id_raw.replace("-", "").replace(" ", "") if mcc_id_raw else ""
+    if mcc_id and (not mcc_id.isdigit() or len(mcc_id) != 10):
+        raise ValueError(
+            f"MCC ID must be a 10-digit number (got '{mcc_id_raw}'). "
+            "Find it in Google Ads Manager → Admin → Account information."
+        )
+
     return {
         'client_id': client_id,
         'client_secret': client_secret,
         'developer_token': developer_token,
-        'mcc_id': mcc_id.replace("-", "") if mcc_id else ""
+        'mcc_id': mcc_id,
     }
 
 
