@@ -36,6 +36,17 @@ except ImportError:
 # Column names our processor expects for Microsoft (processor.PLATFORM_CONFIG['microsoft'])
 OUTPUT_COLUMNS = ["Campaign", "Impressions", "Clicks", "Spend", "AllConversions", "AllRevenue"]
 
+# Bing Ads SDK CSV files use human-readable headers that differ from the API enum names.
+# Map every known variant to the OUTPUT_COLUMNS name expected downstream.
+_CSV_COLUMN_MAP: dict = {
+    "Campaign Name":   "Campaign",
+    "CampaignName":    "Campaign",
+    "All revenue":     "AllRevenue",
+    "All Revenue":     "AllRevenue",
+    "All conversions": "AllConversions",
+    "All Conversions": "AllConversions",
+}
+
 # Retries for transient API errors (rate limit, 5xx)
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 2  # seconds
@@ -200,14 +211,16 @@ class MicrosoftAdsFetcher:
                 if df.empty:
                     self.logger.warning(f"No rows for {start_str} to {end_str}")
                     return None
-                # Normalize column names to match processor: CampaignName -> Campaign
+                # Normalize column names: Bing Ads CSV headers use display names (e.g.
+                # "All revenue") rather than API enum names (e.g. "AllRevenue").
+                self.logger.debug("Microsoft Ads CSV columns received: %s", list(df.columns))
                 rename = {}
                 for c in df.columns:
                     c2 = str(c).strip()
-                    if c2 == "Campaign Name" or c2 == "CampaignName":
-                        rename[c] = "Campaign"
+                    if c2 in _CSV_COLUMN_MAP:
+                        rename[c] = _CSV_COLUMN_MAP[c2]
                     elif c2 in OUTPUT_COLUMNS:
-                        rename[c] = c2
+                        rename[c] = c2  # already matches, normalise any surrounding whitespace
                 df = df.rename(columns=rename)
                 for col in OUTPUT_COLUMNS:
                     if col not in df.columns:
