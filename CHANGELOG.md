@@ -4,6 +4,32 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ---
 
+## [1.0.3] — 2026-04-05
+
+### Added
+
+- **CI workflow** (`.github/workflows/ci.yml`): runs `pytest` and `ruff` on every push/PR to `main`. Release workflow now also runs tests before building the EXE so a broken test cannot produce a release artifact.
+- **Expanded test suite**: 8 → 26 tests. New classes cover `process_file()` (column mapping, schema fill, month/year from filename), `determine_funnel()` (Brand/Branded auto-rules, mappings lookup, DELETE/SKIP callbacks), `merge_platform_data()`, and `build_yoy_reports()` (consecutive-year pairing, column order, non-consecutive skip). All fixtures redirect `mappings.json` writes to `tmp_path` for isolation.
+- **`utils.py`**: `_parse_id_from_favorite_display` and `_mask_id_for_log` extracted from `main.py`.
+- **`log_handler.py`**: `GUILogHandler` extracted from `main.py`.
+- **`config_manager.py`**: `ConfigManager` class owns all JSON file I/O (`config.json`, `*_favorites.json`). `main.py` delegates to it, removing ~400 lines of duplicated boilerplate.
+
+### Changed
+
+- **Reddit token auto-refresh**: `_api_request` now clears the cached access token and retries transparently on a first 401 (expired token). No YAML write-back needed — Reddit's `refresh_token` is permanent.
+- **Settings tab scrolling**: entire Settings tab content is now wrapped in a `CTkScrollableFrame` so the Campaign Rules Manager list no longer clips at the bottom of the window.
+- **Pinterest/TikTok platform cards**: "API not yet connected" italic label added to both cards. Pinterest checkbox is blocked from selection (API stub — no fetch code yet).
+
+### Removed
+
+- **`run_debug.bat`**: removed (identical to `run.bat`; use `run.bat` to launch).
+
+### Fixed
+
+- Hardcoded production domain removed from `PLATFORM_STATUS.md` and `TECHNICAL_OVERVIEW.md`; replaced with generic OAuth redirect URI instructions.
+
+---
+
 ## [1.0.2] — 2026-02-01
 
 ### Removed

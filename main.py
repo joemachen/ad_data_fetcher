@@ -36,7 +36,7 @@ from constants import PIPELINE_FETCH_WAIT_SECONDS, DIALOG_WAIT_SECONDS, META_RET
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
 from utils import _parse_id_from_favorite_display, _mask_id_for_log
-__version__ = "1.0.2"
+__version__ = "1.0.3"
 
 # Uniform width for all platform ID/account input fields (combobox)
 ID_FIELD_WIDTH = 400

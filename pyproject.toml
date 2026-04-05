@@ -1,6 +1,6 @@
 [project]
 name = "ads-report-fetcher"
-version = "1.0.2"
+version = "1.0.3"
 description = "Multi-platform ads report fetcher and processor"
 readme = "README.md"
 requires-python = ">=3.10"
