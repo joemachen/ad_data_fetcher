@@ -8,7 +8,7 @@ For a quick **platform status and next steps** (what works, what’s pending, se
 
 ## Key Features
 
-- **Multi-platform fetch**: Google Ads, Meta Ads, Microsoft Ads, TikTok Ads, Reddit Ads, and Pinterest Ads. A single global date range (Control Panel) and per-platform Customer/Account ID inputs. **Google**, **Meta**, **Microsoft**, and **Reddit** fetchers are wired; TikTok and Pinterest are stubs (pipeline completes without fetching).
+- **Multi-platform fetch**: Google Ads, Meta Ads, Microsoft Ads, TikTok Ads, Reddit Ads, and Pinterest Ads. A single global date range (Control Panel) and per-platform Customer/Account ID inputs. **Google**, **Meta**, **Microsoft**, **Reddit**, and **TikTok** fetchers are wired; Pinterest is a stub (pipeline completes without fetching).
 - **Favorites**: Saved customer/account favorites for all six platforms (Google, Meta, Microsoft, TikTok, Reddit, Pinterest), editable in the Settings tab.
 - **Pipeline actions**:
   - **New Fetch**: Unlocks date range and inputs so a new fetch can be configured (enabled after a fetch completes).
@@ -24,7 +24,7 @@ For a quick **platform status and next steps** (what works, what’s pending, se
 ## Architecture
 
 - **GUI**: Single-window CustomTkinter app. **Header**: New Fetch, Run Fetch, Process All Data, Clear All Data, data-status label; below it a **Status** label and pipeline progress when running. **Tabs**: **Main** (date range picker, Confirm/Unlock, “Also pull same range previous year” checkbox below, then platform cards in two rows and Live Log), **Accounts** (default account per platform), **Settings** (theme, Report directories — four editable paths with Browse, Save All Settings, then Campaign Rules Manager; default favorites, Meta token, favorites editor). Default window size 960×1150 so both platform rows and Live Log are visible. All long-running work runs in background threads; UI updates are scheduled on the main thread.
-- **Fetch**: Google via **Google Ads API** (`api_fetcher.py`); Meta via **Meta Ads API** (`meta_fetcher.py`); Microsoft via **Bing Ads Reporting API** (`microsoft_fetcher.py`; requires `developer_token` in `microsoft-ads.yaml`; OAuth Web app flow with client_secret and redirect `http://localhost:8400`); Reddit via **Reddit Ads API v3** (`reddit_fetcher.py`, config in `reddit-ads.yaml`: client_id, client_secret, refresh_token; run `setup_reddit_auth.py` once; campaign names resolved via campaigns list; SPEND/revenue in dollars). TikTok and Pinterest are stubs in `main.py`.
+- **Fetch**: Google via **Google Ads API** (`api_fetcher.py`); Meta via **Meta Ads API** (`meta_fetcher.py`); Microsoft via **Bing Ads Reporting API** (`microsoft_fetcher.py`; requires `developer_token` in `microsoft-ads.yaml`; OAuth Web app flow with client_secret and redirect `http://localhost:8400`); Reddit via **Reddit Ads API v3** (`reddit_fetcher.py`, config in `reddit-ads.yaml`; run `setup_reddit_auth.py` once); TikTok via **TikTok Marketing API v1.3** (`tiktok_fetcher.py`, config in `tiktok-ads.yaml`: client_key, client_secret, access_token, refresh_token; run `setup_tiktok_auth.py`; OAuth redirect URI registered in TikTok developer console; report/integrated/get; token refresh for 24h expiry). Pinterest is a stub in `main.py`.
 - **Process**: `processor.py` is platform-agnostic. Defines **INTERNAL_SCHEMA** and **PLATFORM_CONFIG** (column mapping + display name + channel per platform). Raw CSVs in the configured raw dir (default `raw_reports/{platform}/`) are mapped, funnel stage applied (via `mappings.json`), then validated/filled and written to the configured processed dir (default `processed_reports/{platform}/`).
 - **Merge**: Processor discovers files by **date-range** pattern `YYYY-MM-DD_YYYY-MM-DD.csv` in the configured raw/processed dirs. Merges current-range and (if present) prior-year range into unified CSVs in the configured merged dir (default `merged_reports/`); builds YoY ready reports in the configured ready dir (default `ready_reports/`) as `ready_{current_range}_vs_{prior_year}.csv` with columns: Campaign, Platform, Channel, Funnel Stage, then per metric newer-year then older-year (e.g. `Impressions (2026)`, `Impressions (2025)`).
 - **Config and state**: All config paths are resolved from the app directory (`_APP_DIR`, same folder as `main.py`): `config.json`, `*_favorites.json`, `mappings.json`, `*-ads.yaml`. Output directories (`raw_reports_dir`, `processed_reports_dir`, `merged_reports_dir`, `ready_reports_dir`) are in `config.json` and editable in **Settings → Report directories**. Restrictive file permissions (0o600) are applied on first write for `config.json` and `meta-ads.yaml`.
@@ -37,7 +37,7 @@ For a quick **platform status and next steps** (what works, what’s pending, se
 | **api_fetcher.py** | Google Ads API client. Loads `google-ads.yaml`, runs GAQL for campaign metrics by date range, saves to `raw_reports/google/` as `YYYY-MM-DD_YYYY-MM-DD.csv`. |
 | **meta_fetcher.py** | Meta Ads API client. Loads `meta-ads.yaml` (app_id, app_secret, access_token), calls Insights API, saves to `raw_reports/meta/`. Raises `MetaTokenExpiredError` on token expiry. |
 | **microsoft_fetcher.py** | Microsoft Ads fetcher. Uses bingads SDK; loads `microsoft-ads.yaml`; Campaign Performance Report by date range; saves to `raw_reports/microsoft/`. |
-| **tiktok_fetcher.py** | TikTok Ads fetcher (skeleton). Not imported by main; pipeline stub only. |
+| **tiktok_fetcher.py** | TikTok Marketing API v1.3 client. Loads `tiktok-ads.yaml`; OAuth token refresh; report/integrated/get; saves to `raw_reports/tiktok/`. |
 | **reddit_fetcher.py** | Reddit Ads fetcher. OAuth2 (adsread); loads `reddit-ads.yaml`; calls Reddit Ads API v2 report; saves to `raw_reports/reddit/` with campaign_name, amount_spent, conversion. |
 | **pinterest_fetcher.py** | Pinterest Ads fetcher (skeleton). Not imported by main; pipeline stub only. |
 | **processor.py** | Platform-agnostic. INTERNAL_SCHEMA, PLATFORM_CONFIG, reads raw CSVs, maps columns, applies funnel (mappings.json + auto-rules), writes processed CSVs, merges into `merged_reports/`. |
@@ -76,7 +76,7 @@ File naming: `YYYY-MM-DD_YYYY-MM-DD.csv`. Processor only considers this range pa
 - **Data**: `pandas`, `pyyaml`; standard library `logging`, `threading`, `queue`, `pathlib`, `json`, `urllib`.
 - **Utilities**: `python-dateutil`.
 
-Setup scripts: `setup_auth.py`, `setup_meta_auth.py`, `setup_ms_auth.py`, `update_mcc_id.py` (run directly with Python). Run: `run.bat` or `run_debug.bat` (no console; only app window in taskbar), `stop_app.bat` to stop instances. Dependencies in `requirements.txt`. Version is in `main.py` as `__version__` and shown in the window title.
+Setup scripts: `setup_auth.py`, `setup_meta_auth.py`, `setup_ms_auth.py`, `setup_tiktok_auth.py`, `setup_reddit_auth.py`, `update_mcc_id.py` (run directly with Python). Run: `run.bat` or `run_debug.bat` (no console; only app window in taskbar), `stop_app.bat` to stop instances. Dependencies in `requirements.txt`. Version is in `main.py` as `__version__` and shown in the window title.
 
 ---
 

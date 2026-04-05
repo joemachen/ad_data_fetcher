@@ -16,6 +16,7 @@ Desktop app to pull advertising performance data from multiple platforms (Google
      - **Meta**: run `setup_meta_auth.py`, add `meta-ads.yaml` (or use in-app token in Settings/Meta tab).  
      - **Microsoft**: run `setup_ms_auth.py` (Web app: client_id, client_secret, redirect URI `http://localhost:8400`), add `refresh_token` and **developer_token** to `microsoft-ads.yaml`. Get developer token at ads.microsoft.com → Tools → API → Developer token.  
      - **Reddit**: run Reddit auth setup, add `reddit-ads.yaml`, then set account in Accounts.  
+     - **TikTok**: add `tiktok-ads.yaml` (client_key, client_secret), run `setup_tiktok_auth.py`, then set Advertiser ID in Accounts.  
    - Use **Run Fetch** to fetch, process, and merge.
 
 3. **Output**  

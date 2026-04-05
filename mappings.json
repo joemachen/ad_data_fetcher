@@ -188,5 +188,9 @@
   "Traffic Campaign CA": "Top",
   "Retargeting Campaign CA": "Bottom",
   "Traffic Campaign USA": "Top",
-  "Retargeting Campaign USA": "Bottom"
+  "Retargeting Campaign USA": "Bottom",
+  "Branded - Canada - MS": "Bottom",
+  "Branded - US - MS": "Bottom",
+  "Traffic Max - Prospecting - US ": "Top",
+  "Traffic Max - Prospecting - CA": "Top"
 }

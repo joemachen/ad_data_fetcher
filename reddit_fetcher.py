@@ -93,9 +93,9 @@ class RedditAdsFetcher:
                 self.logger.warning(f"Status callback error: {e}")
         self.logger.info(f"Status: {message}")
 
-    def _get_access_token(self) -> str:
+    def _get_access_token(self, force_refresh: bool = False) -> str:
         """Refresh and return Bearer access token."""
-        if self._access_token:
+        if self._access_token and not force_refresh:
             return self._access_token
         # Support both client_id/client_secret and app_id/app_secret in YAML
         client_id = (self.config.get("client_id") or self.config.get("app_id") or "").strip()
@@ -165,6 +165,13 @@ class RedditAdsFetcher:
                     return json.loads(resp.read().decode())
             except urllib.error.HTTPError as e:
                 last_error = e
+                if e.code == 401 and attempt == 0:
+                    self.logger.info(
+                        "Reddit API 401 on attempt %s — access token may have expired; refreshing and retrying",
+                        attempt + 1,
+                    )
+                    self._access_token = None  # force _get_access_token() to fetch a fresh token
+                    continue
                 if e.code in RETRYABLE_HTTP_CODES and attempt < MAX_RETRIES - 1:
                     delay = RETRY_BACKOFF_BASE ** (attempt + 1)
                     self.logger.warning(

@@ -8,7 +8,7 @@ Quick reference for what works, what’s pending, and what to do next.
 | **Meta Ads**   | ✅ Working | None. Ensure token in Settings / meta-ads.yaml. |
 | **Microsoft Ads** | ✅ Working | Requires **developer_token** in `microsoft-ads.yaml` (ads.microsoft.com → Tools → API → Developer token). OAuth: Web app flow — `setup_ms_auth.py` with client_id, client_secret, redirect `http://localhost:8400`. See [MICROSOFT_ADS_ADMIN_SETUP.md](MICROSOFT_ADS_ADMIN_SETUP.md). |
 | **Reddit Ads** | ✅ Working | Run setup_reddit_auth; add reddit-ads.yaml. Campaign names and Cost/Revenue in fetcher. If 401, request allowlisting. Contact Reddit (Ads/Business support) to request **reporting API allowlisting** for app “Ad Data Fetcher” or your Ads account. After access is granted, run pipeline again; no code change needed. |
-| **TikTok Ads**  | 📋 Stub   | Fetcher is a stub. To enable: add `tiktok-ads.yaml` (see [TikTok setup](#tiktok-ads-setup)), implement API calls in `tiktok_fetcher.py` using TikTok Marketing API. Processor already has column mapping for TikTok. |
+| **TikTok Ads**  | ✅ Working | Add `tiktok-ads.yaml` (client_key, client_secret); run `setup_tiktok_auth.py` to get tokens. See [TikTok setup](#tiktok-ads-setup). |
 | **Pinterest Ads** | 📋 Stub | Fetcher is a stub. To enable: add `pinterest-ads.yaml` (see [Pinterest setup](#pinterest-ads-setup)), implement API calls in `pinterest_fetcher.py` using Pinterest Ads API. Processor already has column mapping for Pinterest. |
 
 ---
@@ -28,11 +28,11 @@ Quick reference for what works, what’s pending, and what to do next.
 
 ---
 
-## TikTok Ads (stub)
+## TikTok Ads
 
-- **Config file:** `tiktok-ads.yaml` (e.g. access_token, app_id, app_secret — see [TikTok Marketing API](https://business-api.tiktok.com/portal/docs)).
-- **Processor:** Already maps TikTok columns (campaign_name, stat_cost, conversion, show_rev) to internal schema.
-- **To enable:** Add credentials to `tiktok-ads.yaml`; implement `TikTokAdsFetcher.fetch_month_data()` in `tiktok_fetcher.py` using TikTok Marketing API reporting endpoints.
+- **Config file:** `tiktok-ads.yaml` (client_key, client_secret, access_token, refresh_token, redirect_uri). See [TikTok Marketing API](https://business-api.tiktok.com/portal/docs).
+- **Setup:** Add client_key and client_secret to `tiktok-ads.yaml`, then run `python setup_tiktok_auth.py`. Authorize in the browser, then copy the full redirect URL from your browser's address bar and paste it into the prompt. The URL will contain an `auth_code` parameter — the script extracts it automatically. The script exchanges it for access_token and refresh_token. Tokens expire in 24 hours; the fetcher refreshes automatically.
+- **Processor:** Maps TikTok columns (campaign_name, spend, impressions, clicks, conversion, revenue) to internal schema.
 
 ---
 
@@ -44,4 +44,4 @@ Quick reference for what works, what’s pending, and what to do next.
 
 ---
 
-*Last updated: v1.0.0 — Google, Meta, Microsoft (with developer_token), Reddit working; TikTok/Pinterest stubs.*
+*Last updated: v1.0.2 — Google, Meta, Microsoft (with developer_token), Reddit, TikTok working; Pinterest stub.*

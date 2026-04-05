@@ -35,29 +35,11 @@ from processor import ReportProcessor
 from constants import PIPELINE_FETCH_WAIT_SECONDS, DIALOG_WAIT_SECONDS, META_RETENTION_MONTHS
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
+from utils import _parse_id_from_favorite_display, _mask_id_for_log
 __version__ = "1.0.2"
 
 # Uniform width for all platform ID/account input fields (combobox)
 ID_FIELD_WIDTH = 400
-
-def _parse_id_from_favorite_display(display: str) -> str:
-    """Extract ID from combobox display string 'Name (ID)' or return as-is if no parens."""
-    if not display or not isinstance(display, str):
-        return (display or "").strip()
-    s = display.strip()
-    if " (" in s and s.endswith(")"):
-        return s[s.rindex(" (") + 2:-1].strip()
-    return s
-
-
-def _mask_id_for_log(id_str: str, tail: int = 4) -> str:
-    """Return a safe string for logging (e.g. ...1234). Never log full IDs or tokens."""
-    if not id_str or not isinstance(id_str, str):
-        return "***"
-    s = id_str.strip()
-    if len(s) <= tail:
-        return "***"
-    return "..." + s[-tail:]
 
 
 class AdsReportFetcherApp:
@@ -77,8 +59,12 @@ class AdsReportFetcherApp:
         self.logger = logging.getLogger(__name__)
         
         # Config and favorites under app dir so behavior doesn't depend on CWD
-        self.settings_file = _APP_DIR / "config.json"
-        self.settings = self._load_settings()
+        from config_manager import ConfigManager
+        self._config_mgr = ConfigManager(_APP_DIR)
+        self.settings_file = self._config_mgr.settings_file
+        self.settings = self._config_mgr.load_settings()
+        if self._config_mgr.corrupted_msg:
+            self._config_corrupted_msg = self._config_mgr.corrupted_msg
         theme_mode = self.settings.get("theme_mode", "dark")
         ctk.set_appearance_mode(theme_mode)
         ctk.set_default_color_theme("blue")
@@ -148,28 +134,19 @@ class AdsReportFetcherApp:
         self.meta_date_range_locked = False
         # Note: output_dir is no longer used - each platform has its own directory
         
-        # Favorites (Google Ads)
+        # Favorites — file paths kept for any legacy references; data loaded via ConfigManager
         self.favorites_file = _APP_DIR / "customer_favorites.json"
-        self.favorites: List[Dict[str, str]] = []
-        self._load_favorites()
-        
-        # Meta Ads Favorites
         self.meta_favorites_file = _APP_DIR / "meta_favorites.json"
-        self.meta_favorites: List[Dict[str, str]] = []
-        self._load_meta_favorites()
-        # Microsoft, TikTok, Reddit, Pinterest Favorites
         self.ms_favorites_file = _APP_DIR / "ms_favorites.json"
-        self.ms_favorites: List[Dict[str, str]] = []
-        self._load_ms_favorites()
         self.tiktok_favorites_file = _APP_DIR / "tiktok_favorites.json"
-        self.tiktok_favorites: List[Dict[str, str]] = []
-        self._load_tiktok_favorites()
         self.reddit_favorites_file = _APP_DIR / "reddit_favorites.json"
-        self.reddit_favorites: List[Dict[str, str]] = []
-        self._load_reddit_favorites()
         self.pinterest_favorites_file = _APP_DIR / "pinterest_favorites.json"
-        self.pinterest_favorites: List[Dict[str, str]] = []
-        self._load_pinterest_favorites()
+        self.favorites: List[Dict[str, str]] = self._config_mgr.load_favorites("google")
+        self.meta_favorites: List[Dict[str, str]] = self._config_mgr.load_favorites("meta")
+        self.ms_favorites: List[Dict[str, str]] = self._config_mgr.load_favorites("ms")
+        self.tiktok_favorites: List[Dict[str, str]] = self._config_mgr.load_favorites("tiktok")
+        self.reddit_favorites: List[Dict[str, str]] = self._config_mgr.load_favorites("reddit")
+        self.pinterest_favorites: List[Dict[str, str]] = self._config_mgr.load_favorites("pinterest")
         
         # Create widgets
         self._create_widgets()
@@ -196,18 +173,7 @@ class AdsReportFetcherApp:
     
     def _setup_gui_logging(self) -> None:
         """Setup logging to also output to the GUI log box. Handler only enqueues; main thread drains (avoids Tk deadlock from worker threads)."""
-        class GUILogHandler(logging.Handler):
-            def __init__(self, log_queue):
-                super().__init__()
-                self.log_queue = log_queue
-
-            def emit(self, record):
-                try:
-                    msg = self.format(record)
-                    self.log_queue.put_nowait(msg)
-                except Exception:
-                    self.handleError(record)
-
+        from log_handler import GUILogHandler
         gui_handler = GUILogHandler(self._log_queue)
         gui_handler.setFormatter(logging.Formatter('%(asctime)s - %(levelname)s - %(message)s', datefmt='%Y-%m-%d %I:%M:%S %p'))
         gui_handler.setLevel(logging.INFO)
@@ -356,10 +322,7 @@ class AdsReportFetcherApp:
         else:
             self.tiktok_card_status_label.configure(text=_status_text(tiktok_ready, bool((self.tiktok_account_id.get() or "").strip())), text_color=_status_color(tiktok_ready))
         self.reddit_card_status_label.configure(text=_status_text(reddit_ready, bool((self.reddit_account_id.get() or "").strip())), text_color=_status_color(reddit_ready))
-        if not pinterest_config_exists:
-            self.pinterest_card_status_label.configure(text="Setup pending" if (self.pinterest_account_id.get() or "").strip() else "ID Missing", text_color="gray")
-        else:
-            self.pinterest_card_status_label.configure(text=_status_text(pinterest_ready, bool((self.pinterest_account_id.get() or "").strip())), text_color=_status_color(pinterest_ready))
+        self.pinterest_card_status_label.configure(text="Coming soon", text_color="gray")
 
         # Data guardrail: update label next to Clear All Data (top)
         raw_base = Path(self.settings.get("raw_reports_dir", "raw_reports"))
@@ -666,7 +629,8 @@ class AdsReportFetcherApp:
         self.tiktok_account_id_combobox = ctk.CTkComboBox(self.tiktok_card, variable=self.tiktok_id_display, values=tk_values, width=CARD_COMBO_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_tiktok_id_combobox_select)
         self.tiktok_account_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
         self.tiktok_card_status_label = ctk.CTkLabel(self.tiktok_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray")
-        self.tiktok_card_status_label.pack(anchor="w", padx=10, pady=(0, 10))
+        self.tiktok_card_status_label.pack(anchor="w", padx=10, pady=(0, 2))
+        ctk.CTkLabel(self.tiktok_card, text="API not yet connected", font=ctk.CTkFont(size=9, slant="italic"), text_color="#888888").pack(anchor="w", padx=10, pady=(0, 8))
         self._set_tiktok_id_display_from_id()
         self.tiktok_id_display.trace_add("write", lambda *a: self._sync_tiktok_id_from_display())
 
@@ -684,7 +648,8 @@ class AdsReportFetcherApp:
         self.pinterest_account_id_combobox = ctk.CTkComboBox(self.pinterest_card, variable=self.pinterest_id_display, values=pt_values, width=CARD_COMBO_WIDTH, height=28, font=ctk.CTkFont(size=11), state="normal", command=self._on_pinterest_id_combobox_select)
         self.pinterest_account_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
         self.pinterest_card_status_label = ctk.CTkLabel(self.pinterest_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray")
-        self.pinterest_card_status_label.pack(anchor="w", padx=10, pady=(0, 10))
+        self.pinterest_card_status_label.pack(anchor="w", padx=10, pady=(0, 2))
+        ctk.CTkLabel(self.pinterest_card, text="API not yet connected", font=ctk.CTkFont(size=9, slant="italic"), text_color="#888888").pack(anchor="w", padx=10, pady=(0, 8))
         self._set_pinterest_id_display_from_id()
         self.pinterest_id_display.trace_add("write", lambda *a: self._sync_pinterest_id_from_display())
 
@@ -847,6 +812,9 @@ class AdsReportFetcherApp:
             (self.source_pinterest_var, self.pinterest_card, self.pinterest_account_id_combobox, "pinterest"),
         ]
         for var, card, combobox, key in platform_cards:
+            if key == "pinterest" and var.get():
+                # Pinterest is a stub — prevent selection until API is connected
+                var.set(False)
             checked = var.get()
             combobox.configure(state="normal" if checked else "disabled")
             if checked:
@@ -1083,8 +1051,13 @@ class AdsReportFetcherApp:
         self._mappings_data: Dict[str, str] = {}
         self._mappings_file = _APP_DIR / "mappings.json"
 
+        # Outer scrollable container — lets the entire Settings tab scroll vertically
+        # when content (especially the Campaign Rules list) exceeds the window height.
+        self._settings_scroll = ctk.CTkScrollableFrame(self.settings_tab, fg_color="transparent")
+        self._settings_scroll.pack(fill="both", expand=True, padx=0, pady=0)
+
         # Theme mode section (pack first so it stays visible at top)
-        theme_frame = ctk.CTkFrame(self.settings_tab)
+        theme_frame = ctk.CTkFrame(self._settings_scroll)
         theme_frame.pack(pady=10, padx=20, fill="x")
         
         theme_label = ctk.CTkLabel(
@@ -1109,7 +1082,7 @@ class AdsReportFetcherApp:
         self.settings_theme_menu.pack(side="left", padx=10)
         
         # Report directories section (used by fetch, process, merge, YoY)
-        folder_frame = ctk.CTkFrame(self.settings_tab)
+        folder_frame = ctk.CTkFrame(self._settings_scroll)
         folder_frame.pack(pady=10, padx=20, fill="x")
         
         folder_label = ctk.CTkLabel(
@@ -1141,7 +1114,7 @@ class AdsReportFetcherApp:
         self.settings_ready_reports_entry = add_dir_row(folder_frame, "Ready reports (YoY)", "ready_reports_dir", "ready_reports")
         
         # Save settings button
-        save_settings_frame = ctk.CTkFrame(self.settings_tab)
+        save_settings_frame = ctk.CTkFrame(self._settings_scroll)
         save_settings_frame.pack(pady=20, padx=20, fill="x")
         
         save_settings_btn = ctk.CTkButton(
@@ -1160,8 +1133,8 @@ class AdsReportFetcherApp:
 
     def _create_campaign_rules_section(self) -> None:
         """Build Campaign Rules Manager UI and load mappings.json."""
-        rules_frame = ctk.CTkFrame(self.settings_tab)
-        rules_frame.pack(pady=10, padx=20, fill="both", expand=True)
+        rules_frame = ctk.CTkFrame(self._settings_scroll)
+        rules_frame.pack(pady=10, padx=20, fill="x", expand=False)
 
         # Sticky header: title, New Rule, Campaign Filter, and Save/Export stay at top; only the list scrolls
         sticky_header = ctk.CTkFrame(rules_frame, fg_color="transparent")
@@ -1266,18 +1239,11 @@ class AdsReportFetcherApp:
             fg_color="gray", hover_color="darkgray"
         ).pack(side="left", padx=0)
         
-        # Rules list: only this part scrolls; sticky header stays pinned above
+        # Rules list: fixed-height scrollable area; outer _settings_scroll handles the tab-level scroll
         rules_list_container = ctk.CTkFrame(rules_frame, fg_color="transparent")
-        rules_list_container.pack(pady=(6, 10), padx=10, fill="both", expand=True)
-        self.mappings_rules_scroll = ctk.CTkScrollableFrame(rules_list_container, height=200, fg_color="transparent")
-        self.mappings_rules_scroll.pack(fill="both", expand=True)
-
-        def _on_rules_list_container_configure(event) -> None:
-            h = max(100, event.height)
-            if self.mappings_rules_scroll.winfo_exists() and self.mappings_rules_scroll.cget("height") != h:
-                self.mappings_rules_scroll.configure(height=h)
-
-        rules_list_container.bind("<Configure>", _on_rules_list_container_configure)
+        rules_list_container.pack(pady=(6, 10), padx=10, fill="x", expand=False)
+        self.mappings_rules_scroll = ctk.CTkScrollableFrame(rules_list_container, height=300, fg_color="transparent")
+        self.mappings_rules_scroll.pack(fill="x", expand=False)
 
         self._load_mappings_file()
         self._mappings_refresh_list()
@@ -1471,10 +1437,7 @@ class AdsReportFetcherApp:
     def _save_settings(self) -> None:
         """Save settings to config.json file (under app dir)."""
         try:
-            with open(self.settings_file, 'w', encoding='utf-8') as f:
-                json.dump(self.settings, f, indent=2, ensure_ascii=False)
-            self._restrict_file_permissions(self.settings_file)
-            self.logger.info("Settings saved successfully")
+            self._config_mgr.save_settings(self.settings)
         except Exception as e:
             self.logger.error(f"Error saving settings: {e}", exc_info=True)
     
@@ -3321,71 +3284,16 @@ class AdsReportFetcherApp:
         return result["choice"]
     
     def _load_settings(self) -> Dict:
-        """Load settings from config.json file (under app dir)."""
-        defaults = {
-            "default_google_favorite": "ML",
-            "default_meta_favorite": "ML",
-            "default_ms_favorite": None,
-            "default_tiktok_favorite": None,
-            "default_reddit_favorite": None,
-            "default_pinterest_favorite": None,
-            "theme_mode": "dark",
-            "default_download_folder": "raw_reports",
-            "default_output_folder": "processed_reports",
-            "raw_reports_dir": "raw_reports",
-            "processed_reports_dir": "processed_reports",
-            "merged_reports_dir": "merged_reports",
-            "ready_reports_dir": "ready_reports",
-        }
-        try:
-            if self.settings_file.exists():
-                with open(self.settings_file, 'r', encoding='utf-8') as f:
-                    loaded = json.load(f)
-                # Merge with defaults so new keys (e.g. raw_reports_dir) are present when saving
-                merged = defaults.copy()
-                if isinstance(loaded, dict):
-                    merged.update(loaded)
-                return merged
-            return defaults.copy()
-        except json.JSONDecodeError as e:
-            try:
-                self.logger.error(f"config.json is corrupted (invalid JSON): {e}", exc_info=True)
-            except Exception:
-                print(f"config.json is corrupted: {e}")
-            self._config_corrupted_msg = "config.json was corrupted; using defaults. Backup or delete and restart."
-            return defaults.copy()
-        except OSError as e:
-            try:
-                self.logger.error(f"Error reading config.json: {e}", exc_info=True)
-            except Exception:
-                print(f"Error reading config.json: {e}")
-            self._config_corrupted_msg = "Could not read config.json; using defaults."
-            return defaults.copy()
+        """Load settings from config.json. Delegates to ConfigManager."""
+        return self._config_mgr.load_settings()
     
     def _load_favorites(self) -> None:
-        """Load favorites from JSON file."""
-        try:
-            if self.favorites_file.exists():
-                with open(self.favorites_file, 'r', encoding='utf-8') as f:
-                    self.favorites = json.load(f)
-            else:
-                self.favorites = []
-        except json.JSONDecodeError as e:
-            self.logger.error(f"customer_favorites.json is corrupted (invalid JSON): {e}", exc_info=True)
-            self.favorites = []
-            if hasattr(self, "status_text"):
-                self.status_text.set("customer_favorites.json was corrupted; using empty list. Backup or delete and restart.")
-        except OSError as e:
-            self.logger.error(f"Error reading customer_favorites.json: {e}", exc_info=True)
-            self.favorites = []
+        """Load Google favorites. Delegates to ConfigManager."""
+        self.favorites = self._config_mgr.load_favorites("google")
     
     def _save_favorites(self) -> None:
         """Save favorites to JSON file."""
-        try:
-            with open(self.favorites_file, 'w', encoding='utf-8') as f:
-                json.dump(self.favorites, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.logger.error(f"Error saving favorites: {e}", exc_info=True)
+        self._config_mgr.save_favorites("google", self.favorites)
     
     def _update_favorites_menu(self) -> None:
         """Update the Google ID combobox and settings menus."""
@@ -3648,115 +3556,40 @@ class AdsReportFetcherApp:
             self.logger.info(f"Deleted Google Ads favorite: {current_selection}")
     
     def _load_meta_favorites(self) -> None:
-        """Load Meta Ads favorites from JSON file."""
-        try:
-            if self.meta_favorites_file.exists():
-                with open(str(self.meta_favorites_file), 'r', encoding='utf-8') as f:
-                    self.meta_favorites = json.load(f)
-            else:
-                self.meta_favorites = []
-        except json.JSONDecodeError as e:
-            self.logger.error(f"meta_favorites.json is corrupted (invalid JSON): {e}", exc_info=True)
-            self.meta_favorites = []
-            if hasattr(self, "status_text"):
-                self.status_text.set("meta_favorites.json was corrupted; using empty list. Backup or delete and restart.")
-        except OSError as e:
-            self.logger.error(f"Error reading meta_favorites.json: {e}", exc_info=True)
-            self.meta_favorites = []
+        """Load Meta favorites. Delegates to ConfigManager."""
+        self.meta_favorites = self._config_mgr.load_favorites("meta")
     
     def _save_meta_favorites(self) -> None:
         """Save Meta Ads favorites to JSON file."""
-        try:
-            with open(str(self.meta_favorites_file), 'w', encoding='utf-8') as f:
-                json.dump(self.meta_favorites, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.logger.error(f"Error saving Meta favorites: {e}", exc_info=True)
+        self._config_mgr.save_favorites("meta", self.meta_favorites)
     
     def _load_ms_favorites(self) -> None:
-        try:
-            if self.ms_favorites_file.exists():
-                with open(self.ms_favorites_file, 'r', encoding='utf-8') as f:
-                    self.ms_favorites = json.load(f)
-            else:
-                self.ms_favorites = []
-        except json.JSONDecodeError as e:
-            self.logger.error(f"ms_favorites.json is corrupted (invalid JSON): {e}", exc_info=True)
-            self.ms_favorites = []
-            if hasattr(self, "status_text"):
-                self.status_text.set("ms_favorites.json was corrupted; using empty list. Backup or delete and restart.")
-        except OSError as e:
-            self.logger.error(f"Error reading ms_favorites.json: {e}", exc_info=True)
-            self.ms_favorites = []
+        """Load Microsoft favorites. Delegates to ConfigManager."""
+        self.ms_favorites = self._config_mgr.load_favorites("ms")
     
     def _save_ms_favorites(self) -> None:
-        try:
-            with open(self.ms_favorites_file, 'w', encoding='utf-8') as f:
-                json.dump(self.ms_favorites, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.logger.error(f"Error saving MS favorites: {e}", exc_info=True)
+        self._config_mgr.save_favorites("ms", self.ms_favorites)
     
     def _load_tiktok_favorites(self) -> None:
-        try:
-            if self.tiktok_favorites_file.exists():
-                with open(self.tiktok_favorites_file, 'r', encoding='utf-8') as f:
-                    self.tiktok_favorites = json.load(f)
-            else:
-                self.tiktok_favorites = []
-        except json.JSONDecodeError as e:
-            self.logger.error(f"tiktok_favorites.json is corrupted (invalid JSON): {e}", exc_info=True)
-            self.tiktok_favorites = []
-        except OSError as e:
-            self.logger.error(f"Error reading tiktok_favorites.json: {e}", exc_info=True)
-            self.tiktok_favorites = []
+        """Load TikTok favorites. Delegates to ConfigManager."""
+        self.tiktok_favorites = self._config_mgr.load_favorites("tiktok")
     
     def _save_tiktok_favorites(self) -> None:
-        try:
-            with open(self.tiktok_favorites_file, 'w', encoding='utf-8') as f:
-                json.dump(self.tiktok_favorites, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.logger.error(f"Error saving TikTok favorites: {e}", exc_info=True)
+        self._config_mgr.save_favorites("tiktok", self.tiktok_favorites)
     
     def _load_reddit_favorites(self) -> None:
-        try:
-            if self.reddit_favorites_file.exists():
-                with open(self.reddit_favorites_file, 'r', encoding='utf-8') as f:
-                    self.reddit_favorites = json.load(f)
-            else:
-                self.reddit_favorites = []
-        except json.JSONDecodeError as e:
-            self.logger.error(f"reddit_favorites.json is corrupted (invalid JSON): {e}", exc_info=True)
-            self.reddit_favorites = []
-        except OSError as e:
-            self.logger.error(f"Error reading reddit_favorites.json: {e}", exc_info=True)
-            self.reddit_favorites = []
+        """Load Reddit favorites. Delegates to ConfigManager."""
+        self.reddit_favorites = self._config_mgr.load_favorites("reddit")
     
     def _save_reddit_favorites(self) -> None:
-        try:
-            with open(self.reddit_favorites_file, 'w', encoding='utf-8') as f:
-                json.dump(self.reddit_favorites, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.logger.error(f"Error saving Reddit favorites: {e}", exc_info=True)
+        self._config_mgr.save_favorites("reddit", self.reddit_favorites)
     
     def _load_pinterest_favorites(self) -> None:
-        try:
-            if self.pinterest_favorites_file.exists():
-                with open(self.pinterest_favorites_file, 'r', encoding='utf-8') as f:
-                    self.pinterest_favorites = json.load(f)
-            else:
-                self.pinterest_favorites = []
-        except json.JSONDecodeError as e:
-            self.logger.error(f"pinterest_favorites.json is corrupted (invalid JSON): {e}", exc_info=True)
-            self.pinterest_favorites = []
-        except OSError as e:
-            self.logger.error(f"Error reading pinterest_favorites.json: {e}", exc_info=True)
-            self.pinterest_favorites = []
+        """Load Pinterest favorites. Delegates to ConfigManager."""
+        self.pinterest_favorites = self._config_mgr.load_favorites("pinterest")
     
     def _save_pinterest_favorites(self) -> None:
-        try:
-            with open(self.pinterest_favorites_file, 'w', encoding='utf-8') as f:
-                json.dump(self.pinterest_favorites, f, indent=2, ensure_ascii=False)
-        except Exception as e:
-            self.logger.error(f"Error saving Pinterest favorites: {e}", exc_info=True)
+        self._config_mgr.save_favorites("pinterest", self.pinterest_favorites)
     
     def _update_meta_favorites_menu(self) -> None:
         """Update the Meta ID combobox and settings menus."""
