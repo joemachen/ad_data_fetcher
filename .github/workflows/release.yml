@@ -121,8 +121,10 @@ jobs:
           See [CHANGELOG](https://github.com/${{ github.repository }}/blob/main/CHANGELOG.md) for details.
           "@
 
+          # Delete existing release for this tag if one exists (safe to ignore failure)
+          gh release delete $tag --yes 2>$null
+
           gh release create $tag `
             --title "Ads Report Fetcher $tag" `
             --notes $body `
-            --clobber `
             $zip
