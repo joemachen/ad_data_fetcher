@@ -124,4 +124,5 @@ jobs:
           gh release create $tag `
             --title "Ads Report Fetcher $tag" `
             --notes $body `
+            --clobber `
             $zip
