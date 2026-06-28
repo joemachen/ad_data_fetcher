@@ -23,6 +23,7 @@ import pandas as pd
 import yaml
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
+from utils import TokenExpiredError
 
 TIKTOK_REDIRECT_URI = "https://mabelslabels.com/tiktok-callback"
 TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
@@ -122,7 +123,7 @@ class TikTokAdsFetcher:
             except urllib.error.HTTPError as e:
                 err_body = (e.fp.read().decode() if e.fp else "")[:300]
                 self.logger.error(f"TikTok token refresh failed: {e.code} {err_body}")
-                raise RuntimeError(f"TikTok token refresh failed: {e.code}. Re-run setup_tiktok_auth.py.") from e
+                raise TokenExpiredError(f"TikTok token refresh failed: {e.code}. Re-run setup_tiktok_auth.py.", platform="TikTok") from e
             except Exception as e:
                 self.logger.error(f"TikTok token refresh failed: {e}", exc_info=True)
                 raise RuntimeError(f"TikTok token refresh failed: {e}") from e
@@ -158,7 +159,7 @@ class TikTokAdsFetcher:
                     if attempt < MAX_RETRIES - 1:
                         time.sleep(RETRY_BACKOFF_BASE)
                         continue
-                    raise RuntimeError("TikTok 401 Unauthorized. Token may have expired. Re-run setup_tiktok_auth.py.") from e
+                    raise TokenExpiredError("TikTok 401 Unauthorized. Token may have expired. Re-run setup_tiktok_auth.py.", platform="TikTok") from e
                 if e.code in RETRYABLE_HTTP_CODES and attempt < MAX_RETRIES - 1:
                     delay = RETRY_BACKOFF_BASE ** (attempt + 1)
                     self.logger.warning("TikTok API %s (attempt %s/%s), retrying in %ss", e.code, attempt + 1, MAX_RETRIES, delay)

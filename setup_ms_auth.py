@@ -154,15 +154,38 @@ def main() -> int:
         return 1
 
     refresh_token = tokens.refresh_token
+
+    # Write the refresh token back to microsoft-ads.yaml automatically, preserving existing
+    # keys (client_id, client_secret, developer_token, ...) — consistent with the Reddit and
+    # TikTok setup scripts.
+    app_dir = Path(__file__).resolve().parent
+    yaml_path = app_dir / "microsoft-ads.yaml"
+    saved = False
+    try:
+        config = load_config(yaml_path)
+        config["client_id"] = client_id
+        if client_secret:
+            config["client_secret"] = client_secret
+        config["refresh_token"] = refresh_token
+        with open(yaml_path, "w", encoding="utf-8") as f:
+            yaml.dump(config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        saved = True
+    except Exception as e:
+        print(f"Could not write microsoft-ads.yaml automatically: {e}")
+
     print()
     print("=" * 60)
-    print("Success. Copy the refresh token below into your config.")
+    if saved:
+        print("Success. microsoft-ads.yaml has been updated with your refresh_token.")
+    else:
+        print("Success. Copy the refresh token below into your config.")
     print("=" * 60)
     print()
     print(refresh_token)
     print()
-    print("Add this to microsoft-ads.yaml (or your config) as refresh_token.")
-    print()
+    if not saved:
+        print("Add this to microsoft-ads.yaml (or your config) as refresh_token.")
+        print()
     return 0
 
 

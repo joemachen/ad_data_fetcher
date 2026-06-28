@@ -14,6 +14,7 @@ import pandas as pd
 import yaml
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
+from utils import TokenExpiredError
 
 # Redirect URI used during setup (Web app flow); must match Azure app registration
 MS_REDIRECT_URI = "http://localhost:8400"
@@ -87,6 +88,15 @@ class MicrosoftAdsFetcher:
             self.config = yaml.safe_load(f) or {}
         self.logger.info("Microsoft Ads config loaded")
 
+    def _save_config_safe(self) -> None:
+        """Write self.config back to microsoft-ads.yaml (best-effort; never aborts a fetch)."""
+        try:
+            yaml_path = _APP_DIR / "microsoft-ads.yaml"
+            with open(yaml_path, "w", encoding="utf-8") as f:
+                yaml.dump(self.config, f, default_flow_style=False, allow_unicode=True, sort_keys=False)
+        except Exception as e:
+            self.logger.warning("Could not save refreshed refresh_token to microsoft-ads.yaml: %s", e)
+
     def _update_status(self, message: str) -> None:
         if self.status_callback:
             try:
@@ -130,12 +140,20 @@ class MicrosoftAdsFetcher:
             tokens = auth.request_oauth_tokens_by_refresh_token(refresh_token)
         except Exception as e:
             self.logger.error(f"Failed to refresh Microsoft Ads token: {e}", exc_info=True)
-            raise RuntimeError(
-                "Could not get access token from refresh_token. Re-run setup_ms_auth.py to get a new refresh token."
+            raise TokenExpiredError(
+                "Could not get access token from refresh_token. Re-run setup_ms_auth.py to get a new refresh token.",
+                platform="Microsoft",
             ) from e
         if not tokens or not getattr(tokens, "access_token", None):
-            raise RuntimeError("No access_token in response. Re-run setup_ms_auth.py.")
+            raise TokenExpiredError("No access_token in response. Re-run setup_ms_auth.py.", platform="Microsoft")
         # request_oauth_tokens_by_refresh_token already set auth._oauth_tokens; no setter to assign
+        # Microsoft rotates the refresh token on every refresh. Persist the new one so the
+        # 90-day inactivity window resets each run instead of being pinned to the original issue date.
+        new_refresh = getattr(tokens, "refresh_token", None)
+        if new_refresh and new_refresh != refresh_token:
+            self.config["refresh_token"] = new_refresh
+            self._save_config_safe()
+            self.logger.info("Microsoft Ads refresh_token rotated and saved")
         account_id = int(self.customer_id) if self.customer_id.isdigit() else 0
         if account_id <= 0:
             raise ValueError("Microsoft Ads customer_id must be a positive numeric account ID.")

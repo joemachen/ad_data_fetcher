@@ -3,6 +3,18 @@ Shared utility functions for Ads Report Fetcher.
 """
 
 
+class TokenExpiredError(Exception):
+    """Raised by a fetcher when auth fails because the OAuth token is expired/invalid.
+
+    Carries the platform name so the GUI can surface a per-platform "Re-authenticate"
+    action. Detecting this typed exception is more reliable than matching error strings.
+    """
+
+    def __init__(self, message: str = "", platform: str = ""):
+        super().__init__(message)
+        self.platform = platform
+
+
 def _parse_id_from_favorite_display(display: str) -> str:
     """Extract ID from combobox display string 'Name (ID)' or return as-is if no parens."""
     if not display or not isinstance(display, str):

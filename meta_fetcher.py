@@ -20,11 +20,18 @@ from constants import META_RETENTION_MONTHS
 
 META_RETRY_BACKOFF_BASE = 2  # seconds; delay = base ** attempt (2s, 4s, 8s)
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
+from utils import TokenExpiredError
 
 
-class MetaTokenExpiredError(Exception):
-    """Exception raised when Meta access token has expired."""
-    pass
+class MetaTokenExpiredError(TokenExpiredError):
+    """Exception raised when Meta access token has expired.
+
+    Subclasses the shared TokenExpiredError so the GUI's unified re-auth handler catches
+    Meta alongside the other platforms. Defaults platform to "Meta".
+    """
+
+    def __init__(self, message: str = ""):
+        super().__init__(message, platform="Meta")
 
 
 class MetaAdsFetcher:

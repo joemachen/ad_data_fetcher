@@ -4,6 +4,24 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ---
 
+## [1.1.0] — 2026-06-28
+
+### Added
+
+- **Per-platform "Re-authenticate" button**: when a fetch fails because an OAuth token expired, a 🔑 Re-authenticate button appears on that platform's card (Microsoft, Reddit, TikTok, Meta). Clicking it opens a console running the matching `setup_*_auth` script so the user can log in / paste the callback URL, then re-run the fetch. The button hides on the next successful fetch.
+- **Setup launchers** (`setup_ms_auth.bat`, `setup_reddit_auth.bat`, `setup_tiktok_auth.bat`, `setup_meta_auth.bat`): visible-console wrappers that activate the venv and run the corresponding setup script. Works when running from source; in the packaged EXE the button shows an explanatory message instead (setup scripts are not bundled).
+- **`utils.TokenExpiredError`**: typed exception carrying the platform name so the GUI can reliably detect token expiry (instead of matching error strings). Raised by the Microsoft/Reddit/TikTok fetchers; `MetaTokenExpiredError` now subclasses it.
+- **`tests/test_microsoft_fetcher.py`**: covers Microsoft refresh-token rotation persistence, no-op when unchanged, soft-fail on write error, and `TokenExpiredError` on expiry.
+
+### Changed
+
+- **Microsoft refresh-token rotation**: `_ensure_auth` now writes the rotated `refresh_token` back to `microsoft-ads.yaml` after each refresh, resetting the 90-day inactivity window every run instead of pinning it to the original issue date (the cause of the `AADSTS700082` failure).
+- **`setup_ms_auth.py`**: writes the new `refresh_token` to `microsoft-ads.yaml` automatically (preserving existing keys) instead of only printing it.
+- **`setup_meta_auth.py`**: on re-auth, reuses the stored `app_id`/`app_secret` and prompts only for a new access token, preserving other keys on write.
+- **Meta token-expiry UX**: the inline "paste new token" frame is replaced by the unified Re-authenticate button.
+
+---
+
 ## [1.0.3] — 2026-04-05
 
 ### Added

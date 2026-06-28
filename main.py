@@ -7,8 +7,8 @@ import customtkinter as ctk
 import logging
 import os
 import queue
+import sys
 import threading
-import time
 from datetime import datetime, timedelta
 from pathlib import Path
 from dateutil.relativedelta import relativedelta
@@ -22,9 +22,6 @@ try:
 except ImportError:
     Calendar = None  # optional: fallback to dropdowns if not installed
 import json
-import urllib.error
-import urllib.parse
-import urllib.request
 import yaml
 from api_fetcher import AdsApiFetcher
 from meta_fetcher import MetaAdsFetcher, MetaTokenExpiredError
@@ -35,8 +32,8 @@ from processor import ReportProcessor
 from constants import PIPELINE_FETCH_WAIT_SECONDS, DIALOG_WAIT_SECONDS, META_RETENTION_MONTHS
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
-from utils import _parse_id_from_favorite_display, _mask_id_for_log
-__version__ = "1.0.3"
+from utils import _parse_id_from_favorite_display, _mask_id_for_log, TokenExpiredError
+__version__ = "1.1.0"
 
 # Uniform width for all platform ID/account input fields (combobox)
 ID_FIELD_WIDTH = 400
@@ -110,7 +107,6 @@ class AdsReportFetcherApp:
         self.tiktok_id_display = ctk.StringVar(value="")
         self.reddit_id_display = ctk.StringVar(value="")
         self.pinterest_id_display = ctk.StringVar(value="")
-        self.meta_token_input = ctk.StringVar(value="")
         self.status_text = ctk.StringVar(value="Ready")
         if getattr(self, "_config_corrupted_msg", None):
             self.status_text.set(self._config_corrupted_msg)
@@ -125,7 +121,6 @@ class AdsReportFetcherApp:
         self.tiktok_fetch_complete = threading.Event()
         self.reddit_fetch_complete = threading.Event()
         self.pinterest_fetch_complete = threading.Event()
-        self.meta_token_updated = threading.Event()
         # Per-platform pipeline progress: short_name -> (current, total) ranges; order for display
         self._pipeline_platform_progress: Dict[str, Tuple[int, int]] = {}
         self._pipeline_platform_order: List[str] = []
@@ -575,6 +570,10 @@ class AdsReportFetcherApp:
             cb.pack(anchor="w", padx=10, pady=(10, 6))
             return card
 
+        # Per-platform "Re-authenticate" buttons (hidden until a token-expiry error surfaces).
+        # Populated below as each card is built; keyed by platform name.
+        self._reauth_buttons: Dict[str, ctk.CTkButton] = {}
+
         # Row 0: Google (0,0), Meta (0,1), MS Ads (0,2)
         self.google_card = _make_card(cards_grid, 0, 0, "Google Ads", self.source_google_var)
         google_values = [f"{f['name']} ({f['customer_id']})" for f in self.favorites] if self.favorites else []
@@ -601,16 +600,9 @@ class AdsReportFetcherApp:
         )
         self.meta_retention_warning_label.pack(anchor="w", padx=10, pady=(0, 4))
         self.meta_retention_warning_label.pack_forget()
-        self.meta_token_frame = ctk.CTkFrame(self.meta_card, fg_color="transparent")
-        ctk.CTkLabel(self.meta_token_frame, text="Meta Access Token Expired. Enter new token:", font=ctk.CTkFont(size=10, weight="bold"), text_color="#FF6B6B").pack(anchor="w", padx=0, pady=(2, 2))
-        token_row = ctk.CTkFrame(self.meta_token_frame, fg_color="transparent")
-        token_row.pack(pady=(0, 4), fill="x")
-        self.meta_token_entry = ctk.CTkEntry(token_row, textvariable=self.meta_token_input, placeholder_text="Paste new token", width=200, height=28)
-        self.meta_token_entry.pack(side="left", padx=(0, 6), fill="x", expand=True)
-        self.meta_token_update_btn = ctk.CTkButton(token_row, text="Update Token", command=self._on_meta_token_update_clicked, width=100, height=28, font=ctk.CTkFont(size=10, weight="bold"), fg_color="green", hover_color="darkgreen")
-        self.meta_token_update_btn.pack(side="left", padx=0)
-        self.meta_token_frame.pack(fill="x", padx=10, pady=(0, 6))
-        self.meta_token_frame.pack_forget()
+        # Token-expiry is handled by the unified per-platform Re-authenticate button
+        # (replaces the former inline "paste new token" frame).
+        self._make_reauth_button(self.meta_card, "Meta")
         self._set_meta_id_display_from_id()
         self.meta_id_display.trace_add("write", lambda *a: self._sync_meta_id_from_display())
 
@@ -620,6 +612,7 @@ class AdsReportFetcherApp:
         self.ms_customer_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
         self.ms_card_status_label = ctk.CTkLabel(self.ms_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray")
         self.ms_card_status_label.pack(anchor="w", padx=10, pady=(0, 10))
+        self._make_reauth_button(self.ms_card, "Microsoft")
         self._set_ms_id_display_from_id()
         self.ms_id_display.trace_add("write", lambda *a: self._sync_ms_id_from_display())
 
@@ -631,6 +624,7 @@ class AdsReportFetcherApp:
         self.tiktok_card_status_label = ctk.CTkLabel(self.tiktok_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray")
         self.tiktok_card_status_label.pack(anchor="w", padx=10, pady=(0, 2))
         ctk.CTkLabel(self.tiktok_card, text="API not yet connected", font=ctk.CTkFont(size=9, slant="italic"), text_color="#888888").pack(anchor="w", padx=10, pady=(0, 8))
+        self._make_reauth_button(self.tiktok_card, "TikTok")
         self._set_tiktok_id_display_from_id()
         self.tiktok_id_display.trace_add("write", lambda *a: self._sync_tiktok_id_from_display())
 
@@ -640,6 +634,7 @@ class AdsReportFetcherApp:
         self.reddit_account_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
         self.reddit_card_status_label = ctk.CTkLabel(self.reddit_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray")
         self.reddit_card_status_label.pack(anchor="w", padx=10, pady=(0, 10))
+        self._make_reauth_button(self.reddit_card, "Reddit")
         self._set_reddit_id_display_from_id()
         self.reddit_id_display.trace_add("write", lambda *a: self._sync_reddit_id_from_display())
 
@@ -2188,6 +2183,81 @@ class AdsReportFetcherApp:
         thread = threading.Thread(target=self._run_ms_fetch_thread, daemon=True)
         thread.start()
 
+    # ------------------------------------------------------------------ #
+    # Re-authentication (token expiry) helpers
+    # ------------------------------------------------------------------ #
+    # Map platform name -> setup launcher .bat (run from source; opens a console for login).
+    _SETUP_BAT = {
+        "Microsoft": "setup_ms_auth.bat",
+        "Reddit": "setup_reddit_auth.bat",
+        "TikTok": "setup_tiktok_auth.bat",
+        "Meta": "setup_meta_auth.bat",
+    }
+
+    def _make_reauth_button(self, card: "ctk.CTkFrame", platform: str) -> None:
+        """Create a hidden per-platform 'Re-authenticate' button on the given card."""
+        btn = ctk.CTkButton(
+            card,
+            text="🔑 Re-authenticate",
+            command=lambda p=platform: self._launch_setup_auth(p),
+            width=140,
+            height=28,
+            font=ctk.CTkFont(size=10, weight="bold"),
+            fg_color="#B8860B",
+            hover_color="#996F09",
+        )
+        # Created but not packed; revealed only on a token-expiry error.
+        self._reauth_buttons[platform] = btn
+
+    def _show_reauth_button(self, platform: str) -> None:
+        """Reveal the platform's Re-authenticate button (thread-safe)."""
+        btn = self._reauth_buttons.get(platform)
+        if btn is not None:
+            self.root.after(0, lambda: btn.pack(anchor="w", padx=10, pady=(0, 8)))
+
+    def _hide_reauth_button(self, platform: str) -> None:
+        """Hide the platform's Re-authenticate button (thread-safe)."""
+        btn = self._reauth_buttons.get(platform)
+        if btn is not None:
+            self.root.after(0, btn.pack_forget)
+
+    def _launch_setup_auth(self, platform: str) -> None:
+        """Open a console running the platform's setup_*_auth script so the user can re-auth.
+
+        Only works when running from source (the packaged exe excludes setup scripts and has
+        no bundled Python); in the frozen exe we show an informational message instead.
+        """
+        bat_name = self._SETUP_BAT.get(platform)
+        if not bat_name:
+            messagebox.showerror("Re-authenticate", f"No setup launcher configured for {platform}.")
+            return
+        if getattr(sys, "frozen", False):
+            messagebox.showinfo(
+                "Re-authenticate",
+                f"{platform} re-authentication must be run from the source install.\n\n"
+                f"The packaged app does not bundle the setup scripts. Run "
+                f"{bat_name} from the source folder (where your *.yaml configs live), "
+                "then re-run the fetch.",
+            )
+            return
+        bat_path = _APP_DIR / bat_name
+        if not bat_path.exists():
+            messagebox.showerror(
+                "Re-authenticate",
+                f"Could not find {bat_name} in:\n{_APP_DIR}\n\n"
+                "Re-run the setup script manually from a terminal.",
+            )
+            return
+        try:
+            os.startfile(str(bat_path))  # opens the .bat in its own console window
+            self.status_text.set(
+                f"Complete {platform} login in the terminal window, then re-run the fetch."
+            )
+            self.logger.info(f"Launched {bat_name} for {platform} re-authentication")
+        except Exception as e:
+            self.logger.error(f"Failed to launch {bat_name}: {e}", exc_info=True)
+            messagebox.showerror("Re-authenticate", f"Could not open {bat_name}:\n{e}")
+
     def _run_ms_fetch_thread(self) -> None:
         """Run Microsoft Ads fetcher in a background thread; signals ms_fetch_complete when done. Fetches by date range; optionally same range previous year."""
         try:
@@ -2242,10 +2312,17 @@ class AdsReportFetcherApp:
                     self.logger.info(f"Microsoft Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
                 if getattr(self, "_current_platform_key", None) == "Microsoft":
                     self._report_pipeline_platform_progress("Microsoft", 2, pipeline_total)
+            self._hide_reauth_button("Microsoft")
             self.root.after(0, lambda: self.status_text.set(
                 f"Microsoft Ads fetch complete: {saved} range(s) saved"
             ))
             self.logger.info(f"Microsoft Ads fetch complete: {saved} range(s) saved")
+        except TokenExpiredError:
+            self.logger.warning("Microsoft token expired — prompting re-auth")
+            self.root.after(0, lambda: self.status_text.set(
+                "Microsoft token expired. Click 'Re-authenticate' on the Microsoft card, then re-run the fetch."
+            ))
+            self._show_reauth_button("Microsoft")
         except Exception as e:
             error_msg = f"Microsoft Ads error: {e}"
             self.logger.error(error_msg, exc_info=True)
@@ -2314,10 +2391,17 @@ class AdsReportFetcherApp:
                     self.logger.info(f"TikTok Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
                 if getattr(self, "_current_platform_key", None) == "TikTok":
                     self._report_pipeline_platform_progress("TikTok", 2, pipeline_total)
+            self._hide_reauth_button("TikTok")
             self.root.after(0, lambda: self.status_text.set(
                 f"TikTok Ads fetch complete: {saved} range(s) saved"
             ))
             self.logger.info(f"TikTok Ads fetch complete: {saved} range(s) saved")
+        except TokenExpiredError:
+            self.logger.warning("TikTok token expired — prompting re-auth")
+            self.root.after(0, lambda: self.status_text.set(
+                "TikTok token expired. Click 'Re-authenticate' on the TikTok card, then re-run the fetch."
+            ))
+            self._show_reauth_button("TikTok")
         except Exception as e:
             error_msg = f"TikTok Ads error: {e}"
             self.logger.error(error_msg, exc_info=True)
@@ -2386,10 +2470,17 @@ class AdsReportFetcherApp:
                     self.logger.info(f"Reddit Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
                 if getattr(self, "_current_platform_key", None) == "Reddit":
                     self._report_pipeline_platform_progress("Reddit", 2, pipeline_total)
+            self._hide_reauth_button("Reddit")
             self.root.after(0, lambda: self.status_text.set(
                 f"Reddit Ads fetch complete: {saved} range(s) saved"
             ))
             self.logger.info(f"Reddit Ads fetch complete: {saved} range(s) saved")
+        except TokenExpiredError:
+            self.logger.warning("Reddit token expired — prompting re-auth")
+            self.root.after(0, lambda: self.status_text.set(
+                "Reddit token expired. Click 'Re-authenticate' on the Reddit card, then re-run the fetch."
+            ))
+            self._show_reauth_button("Reddit")
         except Exception as e:
             error_msg = f"Reddit Ads error: {e}"
             self.logger.error(error_msg, exc_info=True)
@@ -2531,49 +2622,6 @@ class AdsReportFetcherApp:
             self.status_text.set("Stopping Meta Ads fetch...")
             self.logger.info("Meta Ads stop requested by user")
     
-    def _on_meta_token_update_clicked(self) -> None:
-        """Handle Meta token update button click. Saves token in a background thread so the main thread never blocks on file I/O (avoids app freezing)."""
-        self.root.update_idletasks()
-        new_token = self.meta_token_input.get().strip()
-        if not new_token:
-            self.status_text.set("Error: Please enter a token")
-            return
-
-        # Disable button while checking/saving so user doesn't double-click
-        self.meta_token_update_btn.configure(state="disabled")
-        self.status_text.set("Checking token...")
-
-        def check_and_save_token_in_background() -> None:
-            try:
-                valid, check_err, _ = self._check_meta_token_with_api(new_token)
-                if not valid:
-                    def on_check_failed() -> None:
-                        self.meta_token_update_btn.configure(state="normal")
-                        self.status_text.set(f"Token invalid: {check_err or 'Unknown error'}")
-                    self.root.after(0, on_check_failed)
-                    return
-                self.root.after(0, lambda: self.status_text.set("Token valid. Saving..."))
-                ok, err = self._update_meta_token(new_token)
-                def on_done() -> None:
-                    self.meta_token_update_btn.configure(state="normal")
-                    if not ok:
-                        self.status_text.set(f"Error: {err or 'Failed to update token file'}")
-                        return
-                    self.meta_token_updated.set()
-                    self.meta_token_frame.pack_forget()
-                    self.meta_token_input.set("")
-                    self.status_text.set("Token valid and saved successfully")
-                    self.logger.info("Meta token updated from Meta tab input field")
-                self.root.after(0, on_done)
-            except Exception as e:
-                self.logger.error(f"Meta token update error: {e}", exc_info=True)
-                def on_fail() -> None:
-                    self.meta_token_update_btn.configure(state="normal")
-                    self.status_text.set(f"Error: {e}")
-                self.root.after(0, on_fail)
-
-        threading.Thread(target=check_and_save_token_in_background, daemon=True).start()
-    
     def _on_process_clicked(self) -> None:
         """Handle process button click."""
         if self.is_processing or self.meta_is_processing:
@@ -2682,8 +2730,6 @@ class AdsReportFetcherApp:
             pipeline_total = 2 if self.main_pull_prior_year_var.get() else 1
             if getattr(self, "_current_platform_key", None) == "Meta":
                 self._report_pipeline_platform_progress("Meta", 0, pipeline_total)
-            max_retries = 10
-            retry_count = 0
 
             def do_fetch(s_date: datetime, e_date: datetime) -> Optional[object]:
                 """Fetch one range; returns DataFrame or None. Raises MetaTokenExpiredError on token expiry."""
@@ -2696,7 +2742,8 @@ class AdsReportFetcherApp:
                 )
                 return f.fetch_month_data(s_date, e_date)
 
-            while retry_count < max_retries:
+            # Loop runs once: break on success, return if token expired (re-auth prompted).
+            while True:
                 try:
                     # Current range
                     df = do_fetch(start_date, end_date)
@@ -2727,47 +2774,17 @@ class AdsReportFetcherApp:
                     break  # Success, exit retry loop
 
                 except MetaTokenExpiredError:
-                    retry_count += 1
-                    self.logger.warning(f"Meta token expired (attempt {retry_count}/{max_retries})")
-                    
-                    # Show token input frame in Meta tab
+                    # Token expired: surface the unified Re-authenticate button on the Meta
+                    # card. The user re-auths via the console (writes meta-ads.yaml) and then
+                    # re-runs the fetch. No blocking wait here.
+                    self.logger.warning("Meta token expired — prompting re-auth")
                     self.root.after(0, lambda: self.status_text.set(
-                        f"Meta token expired (attempt {retry_count}). Please enter new token in Meta tab..."
+                        "Meta token expired. Click 'Re-authenticate' on the Meta card, then re-run the fetch."
                     ))
-                    self.root.after(0, lambda: self.meta_token_frame.pack(fill="x", pady=(6, 0)))
-                    self.root.after(0, lambda: self.meta_token_entry.focus_set())
-                    
-                    # Reset and wait for user to update token
-                    self.meta_token_updated.clear()
-                    self.meta_token_updated.wait(timeout=DIALOG_WAIT_SECONDS)
-                    
-                    if not self.meta_token_updated.is_set():
-                        self.logger.warning("Token update timeout")
-                        self.root.after(0, lambda: self.status_text.set(
-                            "Meta fetch cancelled: Token update timeout"
-                        ))
-                        self.root.after(0, lambda: self.meta_token_frame.pack_forget())
-                        return
-                    
-                    # User already saved the token via "Update Token" (which writes to meta-ads.yaml
-                    # and then clears the input). Do not read meta_token_input here—it is empty.
-                    # Retry by creating a new MetaAdsFetcher; it will load the updated token from meta-ads.yaml.
-                    self.logger.info(f"Token updated (attempt {retry_count}), retrying fetch...")
-                    self.root.after(0, lambda: self.status_text.set(
-                        f"Token updated. Retrying Meta fetch (attempt {retry_count})..."
-                    ))
-                    # Short delay so the YAML write is visible to the next reader (e.g. on network drives).
-                    time.sleep(0.25)
-                    continue  # Retry loop; new MetaAdsFetcher() will read meta-ads.yaml
-            
-            if retry_count >= max_retries:
-                self.logger.error(f"Max retries ({max_retries}) reached for token expiration")
-                self.root.after(0, lambda: self.status_text.set(
-                    f"Error: Failed to update Meta token after {max_retries} attempts"
-                ))
-                self.root.after(0, lambda: self.meta_token_frame.pack_forget())
-                return
-            
+                    self._show_reauth_button("Meta")
+                    return
+
+            self._hide_reauth_button("Meta")
             self.root.after(0, lambda: self.status_text.set(
                 f"Meta Ads fetch complete: {saved} range(s) saved"
             ))
@@ -3064,106 +3081,6 @@ class AdsReportFetcherApp:
         
         return result["token"]
 
-    def _check_meta_token_with_api(self, token: str) -> Tuple[bool, Optional[str], Optional[int]]:
-        """Validate Meta access token via Graph API debug_token. Returns (valid, error_message, expires_at)."""
-        try:
-            yaml_path = _APP_DIR / "meta-ads.yaml"
-            if not yaml_path.exists():
-                return False, "meta-ads.yaml not found", None
-            try:
-                with open(yaml_path, "r", encoding="utf-8") as f:
-                    config = yaml.safe_load(f) or {}
-            except yaml.YAMLError as e:
-                self.logger.error(f"meta-ads.yaml is corrupted (invalid YAML): {e}", exc_info=True)
-                return False, "meta-ads.yaml is corrupted; backup or delete and re-run setup.", None
-            except OSError as e:
-                self.logger.error(f"Error reading meta-ads.yaml: {e}", exc_info=True)
-                return False, f"Could not read meta-ads.yaml: {e}", None
-            app_id = config.get("app_id") or ""
-            app_secret = config.get("app_secret") or ""
-            if not app_id or not app_secret:
-                return False, "meta-ads.yaml missing app_id or app_secret", None
-            app_token = f"{app_id}|{app_secret}"
-            url = (
-                "https://graph.facebook.com/v18.0/debug_token"
-                f"?input_token={urllib.parse.quote(token.strip())}"
-                f"&access_token={urllib.parse.quote(app_token)}"
-            )
-            req = urllib.request.Request(url)
-            with urllib.request.urlopen(req, timeout=15) as resp:
-                data = json.loads(resp.read().decode())
-            info = data.get("data") or {}
-            if not info.get("is_valid"):
-                return False, "Token invalid or expired", None
-            expires_at = info.get("expires_at")
-            if expires_at and expires_at != 0:
-                exp_str = datetime.utcfromtimestamp(expires_at).strftime("%Y-%m-%d %H:%M UTC")
-                self.logger.info(f"Meta token valid until {exp_str}")
-            return True, None, expires_at if expires_at else None
-        except urllib.error.HTTPError as e:
-            body = e.read().decode() if e.fp else ""
-            try:
-                err = json.loads(body).get("error", {})
-                msg = err.get("message", body or str(e))
-            except Exception:
-                msg = body or str(e)
-            return False, f"Token check failed: {msg}", None
-        except urllib.error.URLError as e:
-            return False, f"Token check failed: {e.reason or str(e)}", None
-        except Exception as e:
-            self.logger.error(f"Token check error: {e}", exc_info=True)
-            return False, str(e), None
-    
-    def _update_meta_token(self, new_token: str) -> Tuple[bool, Optional[str]]:
-        """Update access_token in meta-ads.yaml file. Validates token before saving.
-        Returns (True, None) on success, (False, error_message) on failure."""
-        try:
-            yaml_path = _APP_DIR / "meta-ads.yaml"
-            if not yaml_path.exists():
-                self.logger.error("meta-ads.yaml not found")
-                return False, "meta-ads.yaml not found"
-
-            # Validate: token must be single-line and look like a real token (not pasted prose)
-            t = new_token.strip()
-            if not t:
-                self.logger.error("Token is empty")
-                return False, "Token is empty"
-            if "\n" in t or "\r" in t:
-                self.logger.error("Token must be a single line (no line breaks)")
-                return False, "Token must be a single line (no line breaks)"
-            if len(t) < 20 or len(t) > 2000:
-                self.logger.error("Token length looks wrong (expected 20–2000 characters)")
-                return False, "Token length looks wrong (expected 20–2000 characters)"
-            if any(x in t for x in ("Goal:", "Requirements:", "Implement ", "Pin the Log")):
-                self.logger.error("Token looks like pasted text; enter only the Meta access token")
-                return False, "Token looks like pasted text; enter only the Meta access token"
-
-            # Read current config
-            try:
-                with open(yaml_path, "r", encoding="utf-8") as f:
-                    config = yaml.safe_load(f) or {}
-            except yaml.YAMLError as e:
-                self.logger.error(f"meta-ads.yaml is corrupted (invalid YAML): {e}", exc_info=True)
-                return False, "meta-ads.yaml is corrupted; backup or delete and re-run setup_meta_auth.py."
-            except OSError as e:
-                self.logger.error(f"Error reading meta-ads.yaml: {e}", exc_info=True)
-                return False, f"Could not read meta-ads.yaml: {e}"
-
-            # Update token
-            config["access_token"] = t
-
-            # Write back (preserve other keys)
-            with open(yaml_path, "w", encoding="utf-8") as f:
-                yaml.dump(config, f, default_flow_style=False, sort_keys=False, allow_unicode=True)
-            self._restrict_file_permissions(Path(yaml_path))
-
-            self.logger.info("Meta access token updated in meta-ads.yaml")
-            return True, None
-
-        except Exception as e:
-            self.logger.error(f"Error updating meta-ads.yaml: {e}", exc_info=True)
-            return False, str(e)
-    
     def _show_funnel_dialog(self, campaign_name: str) -> str:
         """Show dialog to ask user for funnel stage classification."""
         result = {"choice": "Top"}

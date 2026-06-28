@@ -24,6 +24,7 @@ import pandas as pd
 import yaml
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
+from utils import TokenExpiredError
 
 REDDIT_USER_AGENT = "AdsReportFetcher/1.0 (Desktop; Python)"
 REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
@@ -132,10 +133,10 @@ class RedditAdsFetcher:
                     "Ensure client_id is the string under your app name, client_secret is the 'secret', and refresh_token is the full token from setup_reddit_auth.py. "
                     "Re-run 'python setup_reddit_auth.py' to get a new refresh_token and paste it into reddit-ads.yaml."
                 )
-            raise RuntimeError(f"Reddit token refresh failed: {e.code}. Re-run setup_reddit_auth.py to get a new refresh_token.") from e
+            raise TokenExpiredError(f"Reddit token refresh failed: {e.code}. Re-run setup_reddit_auth.py to get a new refresh_token.", platform="Reddit") from e
         token = body.get("access_token")
         if not token:
-            raise RuntimeError("No access_token in Reddit response. Re-run setup_reddit_auth.py.")
+            raise TokenExpiredError("No access_token in Reddit response. Re-run setup_reddit_auth.py.", platform="Reddit")
         self._access_token = token
         return token
 
