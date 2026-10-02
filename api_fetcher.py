@@ -39,7 +39,9 @@ class AdsApiFetcher:
         self.cancel_flag = cancel_flag
         
         self.logger = logging.getLogger(__name__)
-        
+        # Reason the last fetch_month_data call failed (None if it succeeded or found no data)
+        self.last_error: Optional[str] = None
+
         # Initialize Google Ads client
         self.client: Optional[GoogleAdsClient] = None
         self._init_client()
@@ -86,6 +88,7 @@ class AdsApiFetcher:
         Returns:
             DataFrame with report data or None if failed
         """
+        self.last_error = None
         try:
             # Format dates for GAQL query (YYYY-MM-DD)
             start_str = start_date.strftime("%Y-%m-%d")
@@ -170,11 +173,13 @@ class AdsApiFetcher:
                 error_msg += "\nCheck if your MCC ID is set correctly as login_customer_id in google-ads.yaml"
                 error_msg += "\nIf using a Manager Account (MCC), run update_mcc_id.py to set it."
             
+            self.last_error = error_msg
             self.logger.error(error_msg, exc_info=True)
             self._update_status(f"Error: {error_msg}")
             return None
         except Exception as e:
             error_msg = f"Failed to fetch data: {str(e)}"
+            self.last_error = error_msg
             self.logger.error(error_msg, exc_info=True)
             self._update_status(f"Error: {error_msg}")
             return None

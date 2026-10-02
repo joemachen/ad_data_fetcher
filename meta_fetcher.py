@@ -62,7 +62,9 @@ class MetaAdsFetcher:
         # Re-initializing per month can look suspicious to Meta's security filters.
         
         self.logger = logging.getLogger(__name__)
-        
+        # Reason the last fetch_month_data call failed (None if it succeeded or found no data)
+        self.last_error: Optional[str] = None
+
         self._init_api()
     
     def _init_api(self) -> None:
@@ -191,6 +193,7 @@ class MetaAdsFetcher:
         Only raises MetaTokenExpiredError when error code is 190.
         On error code 17 (rate limit) or 1 (API unknown), pauses 5 seconds and retries.
         """
+        self.last_error = None
         start_str = start_date.strftime('%Y-%m-%d')
         end_str = end_date.strftime('%Y-%m-%d')
         max_retries_rate_limit = 3  # Max retries for rate limit / API unknown
@@ -257,14 +260,23 @@ class MetaAdsFetcher:
                         time.sleep(delay)
                         continue
                     self.logger.error(f"Meta API error {error_code} after {max_retries_rate_limit} retries")
+                    self.last_error = (
+                        f"Meta API error {error_code} (rate limit / API unknown) after {max_retries_rate_limit} retries"
+                    )
                     self._update_status(f"Error: Meta API error {error_code} after retries")
                     return None
                 error_msg = f"Meta Ads API error: {e}"
+                try:
+                    api_message = e.api_error_message()
+                except Exception:
+                    api_message = None
+                self.last_error = f"Meta API error {error_code}: {api_message}" if api_message else error_msg
                 self.logger.error(error_msg, exc_info=True)
                 self._update_status(f"Error: {error_msg}")
                 return None
             except Exception as e:
                 error_msg = f"Failed to fetch data: {str(e)}"
+                self.last_error = error_msg
                 self.logger.error(error_msg, exc_info=True)
                 self._update_status(f"Error: {error_msg}")
                 return None

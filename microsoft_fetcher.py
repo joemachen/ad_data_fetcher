@@ -34,6 +34,11 @@ except ImportError:
     ReportingDownloadParameters = None
     _BINGADS_AVAILABLE = False
 
+try:
+    from suds import WebFault
+except ImportError:
+    WebFault = None
+
 # Column names our processor expects for Microsoft (processor.PLATFORM_CONFIG['microsoft'])
 OUTPUT_COLUMNS = ["Campaign", "Impressions", "Clicks", "Spend", "AllConversions", "AllRevenue"]
 
@@ -51,6 +56,50 @@ _CSV_COLUMN_MAP: dict = {
 # Retries for transient API errors (rate limit, 5xx)
 MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 2  # seconds
+
+
+def _as_list(value) -> list:
+    """suds returns a single object or a list for repeated elements; normalize to a list."""
+    if value is None:
+        return []
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def _fault_detail_errors(e: Exception) -> list:
+    """Return the error objects from a Bing Ads SOAP fault's detail (empty if none parsed).
+
+    Handles AdApiFaultDetail (Errors.AdApiError[]) and ApiFaultDetail
+    (OperationErrors.OperationError[] / BatchErrors.BatchError[]).
+    """
+    detail = getattr(getattr(e, "fault", None), "detail", None)
+    if detail is None:
+        return []
+    errors = []
+    for fault_name in ("AdApiFaultDetail", "ApiFaultDetail"):
+        fault = getattr(detail, fault_name, None)
+        if fault is None:
+            continue
+        for container, item in (
+            ("Errors", "AdApiError"),
+            ("OperationErrors", "OperationError"),
+            ("BatchErrors", "BatchError"),
+        ):
+            errors.extend(_as_list(getattr(getattr(fault, container, None), item, None)))
+    return errors
+
+
+def _format_ms_fault(e: Exception) -> str:
+    """Human-readable message for a Bing Ads error, including fault detail codes when present."""
+    parts = []
+    for err in _fault_detail_errors(e):
+        code = getattr(err, "Code", None)
+        error_code = getattr(err, "ErrorCode", None)
+        message = getattr(err, "Message", None) or ""
+        label = str(error_code or "")
+        if code is not None:
+            label = f"{label} ({code})".strip()
+        parts.append(f"{label}: {message}" if label else str(message))
+    return "; ".join(p for p in parts if p) or str(e)
 
 
 class MicrosoftAdsFetcher:
@@ -71,6 +120,7 @@ class MicrosoftAdsFetcher:
         self.progress_callback = progress_callback
         self.cancel_flag = cancel_flag
         self.logger = logging.getLogger(__name__)
+        self.last_error: Optional[str] = None
         if not _BINGADS_AVAILABLE:
             raise RuntimeError(
                 "bingads package is required for Microsoft Ads. Install with: pip install bingads"
@@ -198,10 +248,23 @@ class MicrosoftAdsFetcher:
 
     def fetch_month_data(self, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
         """Fetch campaign-level data for the date range; return DataFrame with Campaign, Impressions, Clicks, Spend, AllConversions, AllRevenue."""
+        self.last_error = None
         start_str = start_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
+        # Microsoft rejects a CustomDateRangeEnd later than today ("Invalid client data"),
+        # unlike Google/Meta/Reddit which accept future end dates. Clamp to today.
+        today = datetime.combine(datetime.now().date(), datetime.min.time())
+        if start_date > today:
+            self.last_error = f"Start date {start_str} is in the future; Microsoft Ads has no data yet."
+            self.logger.warning(self.last_error)
+            self._update_status(f"Error: {self.last_error}")
+            return None
+        if end_date > today:
+            self.logger.info(
+                f"Microsoft Ads: end date {end_str} is in the future; requesting through {today.strftime('%Y-%m-%d')}"
+            )
+            end_date = today
         self._update_status(f"Fetching Microsoft Ads {start_str} to {end_str}...")
-        last_error = None
         for attempt in range(MAX_RETRIES):
             try:
                 manager = ReportingServiceManager(
@@ -247,13 +310,18 @@ class MicrosoftAdsFetcher:
                 self.logger.info(f"Fetched {len(df)} campaigns for {start_str} to {end_str}")
                 return df
             except Exception as e:
-                last_error = e
-                if attempt < MAX_RETRIES - 1:
+                msg = _format_ms_fault(e)
+                # A SOAP fault with parsed error details is a request/data problem, not transient.
+                is_client_fault = WebFault is not None and isinstance(e, WebFault) and bool(_fault_detail_errors(e))
+                if attempt < MAX_RETRIES - 1 and not is_client_fault:
                     delay = RETRY_BACKOFF_BASE ** (attempt + 1)
-                    self.logger.warning(f"Microsoft Ads transient error (attempt {attempt + 1}/{MAX_RETRIES}), retrying in {delay}s: {e}")
+                    self.logger.warning(
+                        f"Microsoft Ads transient error (attempt {attempt + 1}/{MAX_RETRIES}), retrying in {delay}s: {msg}"
+                    )
                     time.sleep(delay)
                 else:
-                    self.logger.error(f"Microsoft Ads fetch failed: {e}", exc_info=True)
-                    self._update_status(f"Error: {e}")
+                    self.last_error = msg
+                    self.logger.error(f"Microsoft Ads fetch failed: {msg}", exc_info=True)
+                    self._update_status(f"Error: {msg}")
                     return None
         return None

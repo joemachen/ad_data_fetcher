@@ -73,6 +73,8 @@ class RedditAdsFetcher:
         self.progress_callback = progress_callback
         self.cancel_flag = cancel_flag
         self.logger = logging.getLogger(__name__)
+        # Reason the last fetch_month_data call failed (None if it succeeded or found no data)
+        self.last_error: Optional[str] = None
         self._load_config()
         self._access_token: Optional[str] = None
         self._v3_me_cached: Optional[Dict[str, Any]] = None
@@ -661,6 +663,7 @@ class RedditAdsFetcher:
             return 0.0
 
     def fetch_month_data(self, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
+        self.last_error = None
         start_str = start_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
         self._update_status(f"Fetching Reddit Ads {start_str} to {end_str}...")
@@ -676,7 +679,10 @@ class RedditAdsFetcher:
             df = df[OUTPUT_COLUMNS].copy()
             self.logger.info(f"Fetched {len(df)} campaigns for {start_str} to {end_str}")
             return df
+        except TokenExpiredError:
+            raise  # let the GUI show the Re-authenticate button
         except Exception as e:
+            self.last_error = str(e)
             self.logger.error(f"Reddit Ads fetch failed: {e}", exc_info=True)
             self._update_status(f"Error: {e}")
             return None

@@ -64,6 +64,8 @@ class TikTokAdsFetcher:
         self.progress_callback = progress_callback
         self.cancel_flag = cancel_flag
         self.logger = logging.getLogger(__name__)
+        # Reason the last fetch_month_data call failed (None if it succeeded or found no data)
+        self.last_error: Optional[str] = None
         self._load_config()
         self._access_token: Optional[str] = None
 
@@ -276,6 +278,7 @@ class TikTokAdsFetcher:
         return rows if rows else None
 
     def fetch_month_data(self, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
+        self.last_error = None
         start_str = start_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
         self._update_status(f"Fetching TikTok Ads {start_str} to {end_str}...")
@@ -291,7 +294,10 @@ class TikTokAdsFetcher:
             df = df[OUTPUT_COLUMNS].copy()
             self.logger.info("Fetched %s rows for %s to %s", len(df), start_str, end_str)
             return df
+        except TokenExpiredError:
+            raise  # let the GUI show the Re-authenticate button
         except Exception as e:
+            self.last_error = str(e)
             self.logger.error("TikTok Ads fetch failed: %s", e, exc_info=True)
             self._update_status(f"Error: {e}")
             return None

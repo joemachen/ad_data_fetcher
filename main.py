@@ -124,6 +124,8 @@ class AdsReportFetcherApp:
         # Per-platform pipeline progress: short_name -> (current, total) ranges; order for display
         self._pipeline_platform_progress: Dict[str, Tuple[int, int]] = {}
         self._pipeline_platform_order: List[str] = []
+        # Per-platform fetch errors collected during the Full Pipeline (shown in a summary at the end)
+        self._pipeline_errors: Dict[str, List[str]] = {}
         self._current_platform_key: Optional[str] = None
         self.date_range_locked = False
         self.meta_date_range_locked = False
@@ -1938,6 +1940,7 @@ class AdsReportFetcherApp:
         self.logger.info("Starting Full Pipeline...")
         self.logger.info(f"Platforms ready: Google={google_ready}, Meta={meta_ready}, MS={ms_ready}, TikTok={tiktok_ready}, Reddit={reddit_ready}, Pinterest={pinterest_ready}")
         self.status_text.set("Starting Full Pipeline...")
+        self._pipeline_errors = {}
         self.batch_fetch_active = True
         self.run_full_pipeline_button.configure(state="disabled")
         
@@ -1968,11 +1971,51 @@ class AdsReportFetcherApp:
             if pair is None:
                 continue
             cur, tot = pair
-            parts.append(f"{key}: {cur}/{tot}")
+            warn = "⚠ " if key in self._pipeline_errors else ""
+            parts.append(f"{key}: {warn}{cur}/{tot}")
         text = ", ".join(parts) if parts else ""
         if text:
             self.pipeline_status_label.configure(text=text)
-    
+
+    def _record_platform_error(self, platform_key: str, message: str) -> None:
+        """Surface a platform fetch failure in the UI (callers have already logged it).
+
+        During the Full Pipeline, errors are collected and shown in one summary dialog at the
+        end (and flagged with ⚠ in the per-platform progress label). For a single-platform
+        fetch the error dialog is shown immediately. Safe to call from worker threads.
+        """
+        if self.batch_fetch_active:
+            self._pipeline_errors.setdefault(platform_key, []).append(message)
+            self.root.after(0, self._update_pipeline_platform_status)
+        else:
+            self.root.after(0, lambda: messagebox.showerror(
+                f"{platform_key} Ads fetch failed",
+                f"{message}\n\nSee the log for full details.",
+            ))
+
+    def _note_empty_fetch(
+        self, platform_key: str, error: Optional[str], start_date: datetime, end_date: datetime, prior: bool = False
+    ) -> None:
+        """Handle a fetch that returned no DataFrame: record an error if the fetcher failed, else log 'no data'."""
+        label = f"{'prior year ' if prior else ''}{start_date.date()} to {end_date.date()}"
+        if error:
+            self._record_platform_error(platform_key, f"{label}: {error}")
+        else:
+            self.logger.info(f"{platform_key} Ads: no data for {label}")
+
+    def _show_pipeline_error_summary(self) -> None:
+        """Show one dialog listing every platform that failed during the pipeline (main thread)."""
+        lines = []
+        for platform_key, messages in self._pipeline_errors.items():
+            for msg in messages:
+                lines.append(f"• {platform_key}: {msg}")
+        messagebox.showwarning(
+            "Pipeline finished with errors",
+            "These platforms had errors. Reports were built without the failed data:\n\n"
+            + "\n\n".join(lines)
+            + "\n\nSee the log for full details.",
+        )
+
     def _execute_batch_fetch(self) -> None:
         """
         Execute the batch fetch sequence.
@@ -2125,11 +2168,16 @@ class AdsReportFetcherApp:
                     self.root.after(0, lambda: self.status_text.set("Pipeline: Building YoY reports..."))
                     processor.build_yoy_reports()
                     
-                    self.logger.info("Pipeline: Complete!")
-                    self.root.after(0, lambda: self.status_text.set("Pipeline Complete!"))
-                    self.root.after(0, lambda: (
+                    if self._pipeline_errors:
+                        done_msg = f"Pipeline complete with errors: {', '.join(self._pipeline_errors)}"
+                        self.logger.warning(f"Pipeline: {done_msg}")
+                    else:
+                        done_msg = "Pipeline Complete!"
+                        self.logger.info("Pipeline: Complete!")
+                    self.root.after(0, lambda m=done_msg: (
+                        self.status_text.set(m),
                         self.pipeline_progress_bar.set(1.0),
-                        self.pipeline_status_label.configure(text="Pipeline Complete!")
+                        self.pipeline_status_label.configure(text=m)
                     ))
                 except Exception as e:
                     error_msg = f"Error during processing: {str(e)}"
@@ -2147,8 +2195,12 @@ class AdsReportFetcherApp:
             self._current_platform_key = None
             self.root.after(0, lambda: self.run_full_pipeline_button.configure(state="normal"))
             self.root.after(0, self._update_checklist_statuses)
-            # Hide progress bar after delay
-            self.root.after(3000, lambda: self.pipeline_progress_frame.pack_forget())
+            if self._pipeline_errors:
+                # Keep the progress row (with ⚠ markers) visible until the next run
+                self.root.after(0, self._show_pipeline_error_summary)
+            else:
+                # Hide progress bar after delay
+                self.root.after(3000, lambda: self.pipeline_progress_frame.pack_forget())
     
     def _run_google_fetch_in_batch(self) -> None:
         """Run Google Ads fetch as part of batch operation."""
@@ -2265,6 +2317,7 @@ class AdsReportFetcherApp:
             customer_id = (self.ms_customer_id.get() or "").strip().replace("-", "").replace(" ", "")
             if not customer_id:
                 self.root.after(0, lambda: self.status_text.set("Error: Microsoft Ads Customer ID missing"))
+                self._record_platform_error("Microsoft", "Customer ID missing")
                 return
             self.logger.info(f"Starting Microsoft Ads fetch for Customer ID: {_mask_id_for_log(customer_id)}")
 
@@ -2294,7 +2347,7 @@ class AdsReportFetcherApp:
                 self.logger.info(f"Microsoft Ads: saved {out}")
                 saved += 1
             else:
-                self.logger.info(f"Microsoft Ads: no data for {start_date.date()} to {end_date.date()}")
+                self._note_empty_fetch("Microsoft", fetcher.last_error, start_date, end_date)
             if getattr(self, "_current_platform_key", None) == "Microsoft":
                 self._report_pipeline_platform_progress("Microsoft", 1, pipeline_total)
             # Prior year range (if checkbox)
@@ -2309,7 +2362,7 @@ class AdsReportFetcherApp:
                     self.logger.info(f"Microsoft Ads: saved prior year {out_prior}")
                     saved += 1
                 else:
-                    self.logger.info(f"Microsoft Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
+                    self._note_empty_fetch("Microsoft", fetcher.last_error, prior_start, prior_end, prior=True)
                 if getattr(self, "_current_platform_key", None) == "Microsoft":
                     self._report_pipeline_platform_progress("Microsoft", 2, pipeline_total)
             self._hide_reauth_button("Microsoft")
@@ -2323,10 +2376,12 @@ class AdsReportFetcherApp:
                 "Microsoft token expired. Click 'Re-authenticate' on the Microsoft card, then re-run the fetch."
             ))
             self._show_reauth_button("Microsoft")
+            self._record_platform_error("Microsoft", "Token expired. Click 'Re-authenticate' on the Microsoft card.")
         except Exception as e:
             error_msg = f"Microsoft Ads error: {e}"
             self.logger.error(error_msg, exc_info=True)
             self.root.after(0, lambda: self.status_text.set(error_msg))
+            self._record_platform_error("Microsoft", str(e))
         finally:
             self.ms_fetch_complete.set()
 
@@ -2344,6 +2399,7 @@ class AdsReportFetcherApp:
             advertiser_id = (self.tiktok_account_id.get() or "").strip().replace("-", "").replace(" ", "")
             if not advertiser_id:
                 self.root.after(0, lambda: self.status_text.set("Error: TikTok Advertiser ID missing"))
+                self._record_platform_error("TikTok", "Advertiser ID missing")
                 return
             self.logger.info(f"Starting TikTok Ads fetch for Advertiser ID: {_mask_id_for_log(advertiser_id)}")
 
@@ -2373,7 +2429,7 @@ class AdsReportFetcherApp:
                 self.logger.info(f"TikTok Ads: saved {out}")
                 saved += 1
             else:
-                self.logger.info(f"TikTok Ads: no data for {start_date.date()} to {end_date.date()}")
+                self._note_empty_fetch("TikTok", fetcher.last_error, start_date, end_date)
             if getattr(self, "_current_platform_key", None) == "TikTok":
                 self._report_pipeline_platform_progress("TikTok", 1, pipeline_total)
             # Prior year range (if checkbox)
@@ -2388,7 +2444,7 @@ class AdsReportFetcherApp:
                     self.logger.info(f"TikTok Ads: saved prior year {out_prior}")
                     saved += 1
                 else:
-                    self.logger.info(f"TikTok Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
+                    self._note_empty_fetch("TikTok", fetcher.last_error, prior_start, prior_end, prior=True)
                 if getattr(self, "_current_platform_key", None) == "TikTok":
                     self._report_pipeline_platform_progress("TikTok", 2, pipeline_total)
             self._hide_reauth_button("TikTok")
@@ -2402,10 +2458,12 @@ class AdsReportFetcherApp:
                 "TikTok token expired. Click 'Re-authenticate' on the TikTok card, then re-run the fetch."
             ))
             self._show_reauth_button("TikTok")
+            self._record_platform_error("TikTok", "Token expired. Click 'Re-authenticate' on the TikTok card.")
         except Exception as e:
             error_msg = f"TikTok Ads error: {e}"
             self.logger.error(error_msg, exc_info=True)
             self.root.after(0, lambda: self.status_text.set(error_msg))
+            self._record_platform_error("TikTok", str(e))
         finally:
             self.tiktok_fetch_complete.set()
 
@@ -2423,6 +2481,7 @@ class AdsReportFetcherApp:
             account_id = (self.reddit_account_id.get() or "").strip()
             if not account_id:
                 self.root.after(0, lambda: self.status_text.set("Error: Reddit Account ID missing"))
+                self._record_platform_error("Reddit", "Account ID missing")
                 return
             self.logger.info(f"Starting Reddit Ads fetch for Account ID: {_mask_id_for_log(account_id)}")
 
@@ -2452,7 +2511,7 @@ class AdsReportFetcherApp:
                 self.logger.info(f"Reddit Ads: saved {out}")
                 saved += 1
             else:
-                self.logger.info(f"Reddit Ads: no data for {start_date.date()} to {end_date.date()}")
+                self._note_empty_fetch("Reddit", fetcher.last_error, start_date, end_date)
             if getattr(self, "_current_platform_key", None) == "Reddit":
                 self._report_pipeline_platform_progress("Reddit", 1, pipeline_total)
             # Prior year range (if checkbox)
@@ -2467,7 +2526,7 @@ class AdsReportFetcherApp:
                     self.logger.info(f"Reddit Ads: saved prior year {out_prior}")
                     saved += 1
                 else:
-                    self.logger.info(f"Reddit Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
+                    self._note_empty_fetch("Reddit", fetcher.last_error, prior_start, prior_end, prior=True)
                 if getattr(self, "_current_platform_key", None) == "Reddit":
                     self._report_pipeline_platform_progress("Reddit", 2, pipeline_total)
             self._hide_reauth_button("Reddit")
@@ -2481,10 +2540,12 @@ class AdsReportFetcherApp:
                 "Reddit token expired. Click 'Re-authenticate' on the Reddit card, then re-run the fetch."
             ))
             self._show_reauth_button("Reddit")
+            self._record_platform_error("Reddit", "Token expired. Click 'Re-authenticate' on the Reddit card.")
         except Exception as e:
             error_msg = f"Reddit Ads error: {e}"
             self.logger.error(error_msg, exc_info=True)
             self.root.after(0, lambda: self.status_text.set(error_msg))
+            self._record_platform_error("Reddit", str(e))
         finally:
             self.reddit_fetch_complete.set()
 
@@ -2675,7 +2736,7 @@ class AdsReportFetcherApp:
                 self.logger.info(f"Google Ads: saved {out}")
                 saved += 1
             else:
-                self.logger.info(f"Google Ads: no data for {start_date.date()} to {end_date.date()}")
+                self._note_empty_fetch("Google", fetcher.last_error, start_date, end_date)
             if getattr(self, "_current_platform_key", None) == "Google":
                 self._report_pipeline_platform_progress("Google", 1, pipeline_total)
             # Prior year range (if checkbox)
@@ -2690,7 +2751,7 @@ class AdsReportFetcherApp:
                     self.logger.info(f"Google Ads: saved prior year {out_prior}")
                     saved += 1
                 else:
-                    self.logger.info(f"Google Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
+                    self._note_empty_fetch("Google", fetcher.last_error, prior_start, prior_end, prior=True)
                 if getattr(self, "_current_platform_key", None) == "Google":
                     self._report_pipeline_platform_progress("Google", 2, pipeline_total)
             self.root.after(0, lambda: self.status_text.set(
@@ -2702,6 +2763,7 @@ class AdsReportFetcherApp:
             error_msg = f"Error: {str(e)}"
             self.logger.error(f"Error in Google Ads fetch: {e}", exc_info=True)
             self.root.after(0, lambda: self.status_text.set(error_msg))
+            self._record_platform_error("Google", str(e))
         finally:
             self.is_processing = False
             self.cancel_event.clear()
@@ -2731,8 +2793,9 @@ class AdsReportFetcherApp:
             if getattr(self, "_current_platform_key", None) == "Meta":
                 self._report_pipeline_platform_progress("Meta", 0, pipeline_total)
 
-            def do_fetch(s_date: datetime, e_date: datetime) -> Optional[object]:
-                """Fetch one range; returns DataFrame or None. Raises MetaTokenExpiredError on token expiry."""
+            def do_fetch(s_date: datetime, e_date: datetime) -> Tuple[Optional[object], Optional[str]]:
+                """Fetch one range; returns (DataFrame or None, error message or None).
+                Raises MetaTokenExpiredError on token expiry."""
                 f = MetaAdsFetcher(
                     ad_account_id=account_id_clean,
                     output_dir=str(out_dir),
@@ -2740,13 +2803,13 @@ class AdsReportFetcherApp:
                     progress_callback=None,
                     cancel_flag=self.meta_cancel_event
                 )
-                return f.fetch_month_data(s_date, e_date)
+                return f.fetch_month_data(s_date, e_date), f.last_error
 
             # Loop runs once: break on success, return if token expired (re-auth prompted).
             while True:
                 try:
                     # Current range
-                    df = do_fetch(start_date, end_date)
+                    df, fetch_error = do_fetch(start_date, end_date)
                     if df is not None and not df.empty:
                         fn = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
                         (out_dir / fn).parent.mkdir(parents=True, exist_ok=True)
@@ -2754,21 +2817,21 @@ class AdsReportFetcherApp:
                         self.logger.info(f"Meta Ads: saved {out_dir / fn}")
                         saved += 1
                     else:
-                        self.logger.info(f"Meta Ads: no data for {start_date.date()} to {end_date.date()}")
+                        self._note_empty_fetch("Meta", fetch_error, start_date, end_date)
                     if getattr(self, "_current_platform_key", None) == "Meta":
                         self._report_pipeline_platform_progress("Meta", 1, pipeline_total)
                     # Prior year range (if checkbox)
                     if self.main_pull_prior_year_var.get():
                         prior_start = start_date - relativedelta(years=1)
                         prior_end = end_date - relativedelta(years=1)
-                        df_prior = do_fetch(prior_start, prior_end)
+                        df_prior, prior_error = do_fetch(prior_start, prior_end)
                         if df_prior is not None and not df_prior.empty:
                             fn_prior = f"{prior_start.strftime('%Y-%m-%d')}_{prior_end.strftime('%Y-%m-%d')}.csv"
                             df_prior.to_csv(out_dir / fn_prior, index=False)
                             self.logger.info(f"Meta Ads: saved prior year {out_dir / fn_prior}")
                             saved += 1
                         else:
-                            self.logger.info(f"Meta Ads: no data for prior year {prior_start.date()} to {prior_end.date()}")
+                            self._note_empty_fetch("Meta", prior_error, prior_start, prior_end, prior=True)
                         if getattr(self, "_current_platform_key", None) == "Meta":
                             self._report_pipeline_platform_progress("Meta", 2, pipeline_total)
                     break  # Success, exit retry loop
@@ -2782,6 +2845,7 @@ class AdsReportFetcherApp:
                         "Meta token expired. Click 'Re-authenticate' on the Meta card, then re-run the fetch."
                     ))
                     self._show_reauth_button("Meta")
+                    self._record_platform_error("Meta", "Token expired. Click 'Re-authenticate' on the Meta card.")
                     return
 
             self._hide_reauth_button("Meta")
@@ -2796,6 +2860,7 @@ class AdsReportFetcherApp:
             error_msg = f"Error: {str(e)}"
             self.logger.error(f"Error in Meta Ads fetch: {e}", exc_info=True)
             self.root.after(0, lambda: self.status_text.set(error_msg))
+            self._record_platform_error("Meta", str(e))
         finally:
             self.meta_is_processing = False
             self.meta_cancel_event.clear()
