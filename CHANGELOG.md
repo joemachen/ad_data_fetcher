@@ -6,7 +6,30 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ## [Unreleased]
 
+### Added
+
+- **Pipeline results on the cards and in the status row.** Each Run Fetch now records what happened to every platform (`pipeline_results.py`).
+  - **Cards:** each platform card shows its outcome:
+    - green "✓ Saved 2 ranges";
+    - amber "No data for prior year (Sep 2025)" or "Skipped: microsoft-ads.yaml missing";
+    - red "Failed (current): Google Ads API error: UNAUTHENTICATED …", "timed out" or "Token expired", with a red border.
+  - **Summary:** the status row shows a colored summary (e.g. "Completed with 1 failure: Google Ads"), plus a **View log** button when anything failed or was skipped.
+  - **How failures are detected:** an ERROR logged while a range was being fetched means it failed; otherwise an empty result means "no data".
+  - **Previously unreported:** platforms skipped for missing config, fetch timeouts and processing errors are reported too.
+  - **Reset:** results clear on New Fetch, Unlock, Clear data or the next run.
+- **"Open ready reports ↗"** in the status row opens the ready-reports folder in Explorer (Finder / xdg-open elsewhere). It appears whenever that folder has CSVs.
+- **"Clear data…"** in the status row appears whenever report data exists. It deletes the CSVs in the raw, processed, merged and ready folders after confirmation, the same action as Settings → Data.
+
 ### Changed
+
+- **UI refresh, first pass:**
+  - **One design system:** colors, fonts and spacing now live in `ui_theme.py` as (light, dark) pairs, replacing about 30 inline colors. Light mode keeps working.
+  - **Toolbar:** a single row. Run Fetch is the only accent-colored button; New Fetch and Process All Data are outlined. The ☢ emoji and the neon green/red status text are gone.
+  - **Clear All Data** moved from the toolbar to a new **Settings → Data** section. It still asks for confirmation.
+  - **Date range:** the two full calendars are replaced by compact date fields with a drop-down calendar (`tkcalendar.DateEntry`, already a dependency). Preset chips (Month to date, Last month, Last 7 days, Last 30 days) come from the new `date_presets.py`. "Last N days" ends yesterday, like the ad platforms. The prior-year checkbox is now a YoY switch.
+  - **Live Log:** now a collapsible drawer. Collapsed, it shows a one-line ticker of the latest message, with errors in red and warnings in amber. The open/closed choice is remembered.
+  - **Window:** the default size dropped from 960×1150 to 960×820, so it fits a 1080p laptop screen.
+  - **Accounts:** Add, Edit and Delete are outlined buttons; Delete shows muted red text with a red tint on hover. Deletes still ask for confirmation.
 
 - **Shared retry logic for all fetchers** (`utils.retry_call`, `utils.backoff_delay`, `utils.http_retry_after`). Each fetcher used to have its own retry loop. Now they all share one helper. Retries now:
   - **Use jittered backoff**, so retries aren't synchronized.
@@ -21,6 +44,8 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ### Fixed
 
+- **"No existing data" while data existed:** the data check only looked at the Google and Meta raw folders plus merged and ready, so Microsoft/TikTok/Reddit-only or processed-only data went unnoticed, and Clear/Process stayed disabled. It now checks every CSV in all four folders.
+- **New Fetch left the date pickers disabled:** it re-enabled only the fallback month/year dropdowns, not the calendars. Locking, unlocking and New Fetch now share one helper that enables or disables all the date controls together.
 - **YoY ready-report column order**: metrics are now interleaved side-by-side per metric (`Impressions (2026)`, `Impressions (2025)`, `Clicks (2026)`, `Clicks (2025)`, …) instead of one block per year, matching TECHNICAL_OVERVIEW. Ordering is handled by the new `processor.interleave_period_columns()`, which parses `<Metric> (<period>)` headers dynamically, with no hardcoded years, and supports any number of periods.
 - **CI lint**: `ruff check .` now passes. CI was failing at the lint step on `main`, so tests never ran. The existing findings were fixed with ruff's auto-fixer, range-limited `ruff format` on over-long lines, and a handful of manual edits: removed unused variables, moved a constant below imports in `meta_fetcher.py`, replaced a bare `except` in `update_mcc_id.py`. Apart from those manual edits, behavior is unchanged (verified by comparing syntax trees). CI now pins `ruff==0.15.20`, and the ruff settings moved to `[tool.ruff.lint]`, with `[tool.ruff.format] quote-style = "preserve"`.
 - **Google Ads fetch failing with `501 GRPC target method can't be resolved`** (and `No module named 'pkg_resources'` on newer setuptools): `google-ads` raised from `~=22.0` (API v13–v15, which Google has shut off) to `~=33.0` (API v23–v25). The new version doesn't import `pkg_resources`. Every GAQL field the fetcher uses exists in v25.

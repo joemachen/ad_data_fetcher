@@ -8,7 +8,7 @@ import os
 import queue
 import sys
 import threading
-import tkinter as tk
+import time
 import tkinter.filedialog as filedialog
 import tkinter.messagebox as messagebox
 import tkinter.scrolledtext as scrolledtext
@@ -20,16 +20,19 @@ import customtkinter as ctk
 from dateutil.relativedelta import relativedelta
 
 try:
-    from tkcalendar import Calendar
+    from tkcalendar import DateEntry
 except ImportError:
-    Calendar = None  # optional: fallback to dropdowns if not installed
+    DateEntry = None  # optional: fallback to month/year dropdowns if not installed
 import json
 
+import ui_theme as ui
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
 from api_fetcher import AdsApiFetcher
 from constants import DIALOG_WAIT_SECONDS, META_RETENTION_MONTHS, PIPELINE_FETCH_WAIT_SECONDS
+from date_presets import PRESETS, preset_range
 from meta_fetcher import MetaAdsFetcher, MetaTokenExpiredError
 from microsoft_fetcher import MicrosoftAdsFetcher
+from pipeline_results import FAILED, OK, ErrorCapture, PipelineReport, RangeResult
 from processor import ReportProcessor
 from reddit_fetcher import RedditAdsFetcher
 from tiktok_fetcher import TikTokAdsFetcher
@@ -68,14 +71,14 @@ class AdsReportFetcherApp:
         ctk.set_appearance_mode(theme_mode)
         ctk.set_default_color_theme("blue")
 
-        # Create main window: default size fits header + both rows of platform cards + Live Log (no cutoff)
         self.root = ctk.CTk()
         self.root.title(f"Ads Report Fetcher (Multi-Platform) v{__version__}")
-        self.root.geometry("960x1150")
+        # Default size fits a 1080p laptop screen; the Live Log is a collapsible drawer at the bottom
+        self.root.geometry("960x820")
         self.root.resizable(True, True)
-        # Min width: 3 cards (~240px each) + padx + scrollbar; min height: both card rows + log
+        # Min width: 3 cards (~240px each) + padx + scrollbar
         _min_w = 900
-        _min_h = 850
+        _min_h = 640
         self.root.minsize(_min_w, _min_h)
 
         # Month names for dropdowns
@@ -110,6 +113,10 @@ class AdsReportFetcherApp:
         self.reddit_id_display = ctk.StringVar(value="")
         self.pinterest_id_display = ctk.StringVar(value="")
         self.status_text = ctk.StringVar(value="Ready")
+        # Outcome of the latest Run Fetch (per platform), shown on the cards and in the status row
+        self._pipeline_report: Optional[PipelineReport] = None
+        self._error_capture: Optional[ErrorCapture] = None
+        self._run_started_at = 0.0
         if getattr(self, "_config_corrupted_msg", None):
             self.status_text.set(self._config_corrupted_msg)
         self.is_processing = False
@@ -185,13 +192,17 @@ class AdsReportFetcherApp:
 
     def _drain_log_queue(self) -> None:
         """Run on main thread only: drain log queue and append to Live Log. Reschedule to keep draining."""
+        last_msg = None
         try:
             while True:
                 msg = self._log_queue.get_nowait()
                 self.log_textbox.insert("end", msg + "\n")
                 self.log_textbox.see("end")
+                last_msg = msg
         except queue.Empty:
             pass
+        if last_msg is not None:
+            self._update_log_ticker(last_msg)
         self.root.after(100, self._drain_log_queue)
 
     def _create_widgets(self) -> None:
@@ -204,102 +215,97 @@ class AdsReportFetcherApp:
         content_frame.grid(row=0, column=0, sticky="nsew")
         self.root.grid_rowconfigure(0, weight=1)
         self.root.grid_columnconfigure(0, weight=1)
-        content_frame.grid_rowconfigure(3, weight=1)
+        content_frame.grid_rowconfigure(2, weight=1)
         content_frame.grid_columnconfigure(0, weight=1)
 
-        # Title
-        title_label = ctk.CTkLabel(content_frame, text="Ads Report Fetcher", font=ctk.CTkFont(size=24, weight="bold"))
-        title_label.grid(row=0, column=0, pady=15)
-
-        # Header: single horizontal bar, 4 buttons, uniform padding
-        header_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
-        header_frame.grid(row=1, column=0, pady=(0, 10), sticky="ew")
-        btn_h, btn_w = 36, 165
-        pad = 10
-        self.new_fetch_button = ctk.CTkButton(
-            header_frame,
-            text="New Fetch",
-            command=self._on_new_fetch_clicked,
-            font=ctk.CTkFont(size=13, weight="bold"),
-            height=btn_h,
-            width=btn_w,
-            fg_color="green",
-            hover_color="darkgreen",
-            state="disabled",
-        )
-        self.new_fetch_button.pack(side="left", padx=pad)
+        # Toolbar: title on the left, actions on the right. Run Fetch is the only accent (primary) button;
+        # Clear All Data lives in Settings → Data, away from the everyday actions.
+        toolbar = ctk.CTkFrame(content_frame, fg_color="transparent")
+        toolbar.grid(row=0, column=0, padx=ui.SPACE_L + ui.SPACE_XS, pady=(ui.SPACE_M, ui.SPACE_XS), sticky="ew")
+        ctk.CTkLabel(toolbar, text="Ads Report Fetcher", font=ui.title_font(), text_color=ui.TEXT).pack(side="left")
+        btn_h, btn_w = ui.BUTTON_HEIGHT, 140
         self.run_full_pipeline_button = ctk.CTkButton(
-            header_frame,
+            toolbar,
             text="Run Fetch",
             command=self._on_run_all_clicked,
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=ui.font(ui.SIZE_BODY, "bold"),
             height=btn_h,
             width=btn_w,
-            fg_color="#0066CC",
-            hover_color="#0052A3",
+            corner_radius=ui.RADIUS_SMALL,
+            **ui.PRIMARY_BTN,
         )
-        self.run_full_pipeline_button.pack(side="left", padx=pad)
+        self.run_full_pipeline_button.pack(side="right")
         self.process_all_data_button = ctk.CTkButton(
-            header_frame,
+            toolbar,
             text="Process All Data",
             command=self._on_process_all_data_clicked,
-            font=ctk.CTkFont(size=13, weight="bold"),
+            font=ui.font(ui.SIZE_BODY),
             height=btn_h,
             width=btn_w,
-            fg_color="orange",
-            hover_color="darkorange",
-            border_width=2,
-            border_color="#FF8C00",
-            corner_radius=8,
+            corner_radius=ui.RADIUS_SMALL,
+            **ui.OUTLINE_BTN,
         )
-        self.process_all_data_button.pack(side="left", padx=pad)
-        self.clear_data_button = ctk.CTkButton(
-            header_frame,
-            text="☢ Clear All Data ☢",
-            command=self._on_clear_data_clicked,
-            font=ctk.CTkFont(size=13, weight="bold"),
+        self.process_all_data_button.pack(side="right", padx=ui.SPACE_S)
+        self.new_fetch_button = ctk.CTkButton(
+            toolbar,
+            text="New Fetch",
+            command=self._on_new_fetch_clicked,
+            font=ui.font(ui.SIZE_BODY),
             height=btn_h,
             width=btn_w,
-            fg_color="#8B0000",
-            hover_color="#A00000",
-            border_width=2,
-            border_color="#FF4500",
-            corner_radius=8,
+            corner_radius=ui.RADIUS_SMALL,
+            state="disabled",
+            **ui.OUTLINE_BTN,
         )
-        self.clear_data_button.pack(side="left", padx=pad)
-        # Data guardrail: show data presence next to Clear All Data
-        self.data_status_label = ctk.CTkLabel(
-            header_frame, text="✓ No existing data", font=ctk.CTkFont(size=11), text_color="#90EE90"
-        )
-        self.data_status_label.pack(side="left", padx=(pad, 0))
+        self.new_fetch_button.pack(side="right")
 
-        # Status message and progress bar directly beneath header (visible during pipeline run)
+        # Status row: global status, pipeline progress, and whether report data already exists
         header_status_frame = ctk.CTkFrame(content_frame, fg_color="transparent")
-        header_status_frame.grid(row=2, column=0, pady=(0, 4), padx=20, sticky="ew")
-        content_frame.columnconfigure(0, weight=1)
+        header_status_frame.grid(row=1, column=0, pady=(0, ui.SPACE_XS), padx=ui.SPACE_L + ui.SPACE_XS, sticky="ew")
         # Global status label (token save, errors, etc.) - so messages are visible from any tab
-        ctk.CTkLabel(header_status_frame, text="Status:", font=ctk.CTkFont(size=10), text_color="#A0A0A0").pack(
+        ctk.CTkLabel(header_status_frame, text="Status:", font=ui.caption_font(), text_color=ui.TEXT_MUTED).pack(
             side="left", padx=(0, 6)
         )
         self.global_status_label = ctk.CTkLabel(
-            header_status_frame, textvariable=self.status_text, font=ctk.CTkFont(size=10), text_color="#C0C0C0"
+            header_status_frame, textvariable=self.status_text, font=ui.caption_font(), text_color=ui.TEXT,
+            anchor="w",
         )
         self.global_status_label.pack(side="left", padx=0, fill="x", expand=True)
+        # Right side: [Open ready reports] [Clear data…] data label — buttons only appear when relevant
+        status_actions = ctk.CTkFrame(header_status_frame, fg_color="transparent")
+        status_actions.pack(side="right")
+        small_btn = dict(font=ui.caption_font(), height=24, corner_radius=ui.RADIUS_SMALL)
+        self.open_reports_button = ctk.CTkButton(
+            status_actions, text="Open ready reports ↗", width=140, command=self._open_ready_reports,
+            **small_btn, **ui.OUTLINE_BTN,
+        )
+        self.clear_data_quick_button = ctk.CTkButton(
+            status_actions, text="Clear data…", width=90, command=self._on_clear_data_clicked,
+            **small_btn, **ui.DANGER_BTN,
+        )
+        self.data_status_label = ctk.CTkLabel(
+            status_actions, text="No existing data", font=ui.caption_font(), text_color=ui.TEXT_MUTED
+        )
+        self.data_status_label.pack(side="left", padx=(ui.SPACE_S, 0))
         self.pipeline_status_label = ctk.CTkLabel(
-            header_status_frame, text="", font=ctk.CTkFont(size=10), text_color="#A0A0A0"
+            header_status_frame, text="", font=ui.caption_font(), text_color=ui.TEXT_MUTED
         )
         self.pipeline_status_label.pack(side="left", padx=(15, 0))
+        self.view_log_button = ctk.CTkButton(
+            header_status_frame, text="View log", width=70, command=self._on_view_log_clicked,
+            **small_btn, **ui.OUTLINE_BTN,
+        )
         self.pipeline_progress_frame = ctk.CTkFrame(header_status_frame, fg_color="transparent")
         self.pipeline_progress_bar = ctk.CTkProgressBar(self.pipeline_progress_frame, width=200)
         self.pipeline_progress_bar.pack(side="left", padx=(10, 0))
         self.pipeline_progress_bar.set(0)
-        self.pipeline_progress_bar.configure(progress_color="#0066CC", fg_color="#2B2B2B")
+        self.pipeline_progress_bar.configure(progress_color=ui.ACCENT, fg_color=ui.TRACK)
         self.pipeline_progress_frame.pack(side="left")
         self.pipeline_progress_frame.pack_forget()
 
-        # Tabview: wide/tall enough so Main tab (control + cards + actions) fits without scroll
-        self.tabview = ctk.CTkTabview(content_frame, width=920, height=580)
-        self.tabview.grid(row=3, column=0, pady=10, padx=20, sticky="nsew")
+        # Tabview fills the remaining height
+        self.tabview = ctk.CTkTabview(content_frame, width=920, height=480, corner_radius=ui.RADIUS)
+        self.tabview.grid(row=2, column=0, pady=(ui.SPACE_XS, ui.SPACE_S), padx=ui.SPACE_L, sticky="nsew")
         self.main_tab = self.tabview.add("Main")
         self.accounts_tab = self.tabview.add("Accounts")
         self.settings_tab = self.tabview.add("Settings")
@@ -344,7 +350,7 @@ class AdsReportFetcherApp:
             return "Date not confirmed"
 
         def _status_color(ready: bool) -> str:
-            return "#90EE90" if ready else "gray"
+            return ui.SUCCESS if ready else ui.TEXT_MUTED
 
         self.google_card_status_label.configure(
             text=_status_text(google_ready, is_valid_google), text_color=_status_color(google_ready)
@@ -354,7 +360,7 @@ class AdsReportFetcherApp:
         )
         # Microsoft: show "Setup pending" when config file missing (admin consent / setup_ms_auth.py)
         if not ms_config_exists:
-            self.ms_card_status_label.configure(text="Setup pending", text_color="gray")
+            self.ms_card_status_label.configure(text="Setup pending", text_color=ui.TEXT_MUTED)
         else:
             self.ms_card_status_label.configure(
                 text=_status_text(ms_ready, is_valid_ms), text_color=_status_color(ms_ready)
@@ -363,7 +369,7 @@ class AdsReportFetcherApp:
         if not tiktok_config_exists:
             self.tiktok_card_status_label.configure(
                 text="Setup pending" if (self.tiktok_account_id.get() or "").strip() else "ID Missing",
-                text_color="gray",
+                text_color=ui.TEXT_MUTED,
             )
         else:
             self.tiktok_card_status_label.configure(
@@ -374,24 +380,26 @@ class AdsReportFetcherApp:
             text=_status_text(reddit_ready, bool((self.reddit_account_id.get() or "").strip())),
             text_color=_status_color(reddit_ready),
         )
-        self.pinterest_card_status_label.configure(text="Coming soon", text_color="gray")
+        self.pinterest_card_status_label.configure(text="Coming soon", text_color=ui.TEXT_MUTED)
+        self._apply_run_results_to_cards()
 
-        # Data guardrail: update label next to Clear All Data (top)
-        raw_base = Path(self.settings.get("raw_reports_dir", "raw_reports"))
-        google_dir = raw_base / "google"
-        meta_dir = raw_base / "meta"
-        merged_dir = Path(self.settings.get("merged_reports_dir", "merged_reports"))
+        # Data guardrail: status-row label + buttons, Settings → Data
+        has_csv_files = self._report_data_present()
         ready_dir = Path(self.settings.get("ready_reports_dir", "ready_reports"))
-        google_has_data = google_dir.exists() and any(google_dir.glob("*.csv"))
-        meta_has_data = meta_dir.exists() and any(meta_dir.glob("*.csv"))
-        merged_has_data = merged_dir.exists() and any(merged_dir.glob("*.csv"))
-        ready_has_data = ready_dir.exists() and any(ready_dir.glob("*.csv"))
-        has_csv_files = google_has_data or meta_has_data or merged_has_data or ready_has_data
+        has_ready_reports = ready_dir.exists() and any(ready_dir.glob("*.csv"))
+        quick_buttons = ((self.open_reports_button, has_ready_reports), (self.clear_data_quick_button, has_csv_files))
+        for button, _ in quick_buttons:
+            button.pack_forget()
+        for button, show in quick_buttons:
+            if show:
+                button.pack(side="left", padx=(ui.SPACE_XS, 0), before=self.data_status_label)
         if has_csv_files:
-            data_text, data_color = "☐ Data present", "#FF6B6B"
+            data_text, data_color = "Report data present", ui.WARNING
         else:
-            data_text, data_color = "✓ No existing data", "#90EE90"
+            data_text, data_color = "No existing data", ui.TEXT_MUTED
         self.data_status_label.configure(text=data_text, text_color=data_color)
+        if hasattr(self, "settings_data_status_label"):
+            self.settings_data_status_label.configure(text=data_text, text_color=data_color)
 
         # Run Fetch: enabled when at least one selected platform ready (data may exist; user can run and overwrite)
         google_selected = self.source_google_var.get()
@@ -413,30 +421,79 @@ class AdsReportFetcherApp:
             0,
             lambda: self.run_full_pipeline_button.configure(
                 state="normal" if all_ready else "disabled",
-                fg_color="#0066CC" if all_ready else "gray",
-                hover_color="#0052A3" if all_ready else "darkgray",
+                **(ui.PRIMARY_BTN if all_ready else ui.SECONDARY_BTN),
             ),
         )
 
         # Clear All Data button state
         self.root.after(
             0,
-            lambda: self.clear_data_button.configure(
-                fg_color="#8B0000" if has_csv_files else "gray",
-                hover_color="#A00000" if has_csv_files else "darkgray",
-                state="normal" if has_csv_files else "disabled",
-            ),
+            lambda: self.clear_data_button.configure(state="normal" if has_csv_files else "disabled"),
         )
 
         # Process All Data button state (enabled only when there is data to process)
         self.root.after(
             0,
-            lambda: self.process_all_data_button.configure(
-                state="normal" if has_csv_files else "disabled",
-                fg_color="orange" if has_csv_files else "gray",
-                hover_color="darkorange" if has_csv_files else "darkgray",
-            ),
+            lambda: self.process_all_data_button.configure(state="normal" if has_csv_files else "disabled"),
         )
+
+    def _report_data_folders(self) -> List[Path]:
+        return [
+            Path(self.settings.get(key, default))
+            for key, default in (
+                ("raw_reports_dir", "raw_reports"),
+                ("processed_reports_dir", "processed_reports"),
+                ("merged_reports_dir", "merged_reports"),
+                ("ready_reports_dir", "ready_reports"),
+            )
+        ]
+
+    def _report_data_present(self) -> bool:
+        """True if any CSV exists in the raw, processed, merged or ready folders (any platform subfolder)."""
+        return any(folder.exists() and next(folder.rglob("*.csv"), None) is not None
+                   for folder in self._report_data_folders())
+
+    def _apply_run_results_to_cards(self) -> None:
+        """After a run, show each platform's outcome on its card (overrides Ready / ID Missing)."""
+        report = self._pipeline_report
+        cards = (
+            ("Google Ads", self.google_card, self.google_card_status_label, self.source_google_var),
+            ("Meta Ads", self.meta_card, self.meta_card_status_label, self.source_meta_var),
+            ("Microsoft Ads", self.ms_card, self.ms_card_status_label, self.source_ms_var),
+            ("TikTok Ads", self.tiktok_card, self.tiktok_card_status_label, self.source_tiktok_var),
+            ("Reddit Ads", self.reddit_card, self.reddit_card_status_label, self.source_reddit_var),
+        )
+        for name, card, label, selected in cards:
+            result = report.platforms.get(name) if report else None
+            # Results can be long ("Failed: … API error …"): wrap inside the card, left-aligned
+            label.configure(wraplength=250, justify="left", anchor="w")
+            if result is not None:
+                color = {OK: ui.SUCCESS, FAILED: ui.DANGER}.get(result.status, ui.WARNING)
+                label.configure(text=result.card_text(), text_color=color)
+            if result is not None and result.status == FAILED:
+                card.configure(border_width=2, border_color=ui.DANGER)
+            elif selected.get():
+                card.configure(border_width=2, border_color=ui.ACCENT)
+            else:
+                card.configure(border_width=1, border_color=ui.BORDER)
+
+    def _open_ready_reports(self) -> None:
+        """Open the ready_reports folder in the system file manager."""
+        folder = Path(self.settings.get("ready_reports_dir", "ready_reports")).resolve()
+        if not folder.exists():
+            self.status_text.set(f"Ready reports folder not found: {folder}")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            else:
+                import subprocess
+
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(folder)])
+            self.status_text.set(f"Opened {folder}")
+        except Exception as e:
+            self.logger.error(f"Could not open {folder}: {e}")
+            self.status_text.set(f"Could not open {folder}: {e}")
 
     def _create_process_section(self) -> None:
         """Create process section between tabs and log."""
@@ -449,8 +506,7 @@ class AdsReportFetcherApp:
             command=self._on_process_clicked,
             font=ctk.CTkFont(size=14, weight="bold"),
             height=45,
-            fg_color="orange",
-            hover_color="darkorange",
+            **ui.PRIMARY_BTN,
         )
         self.process_button.pack(pady=10, padx=20, fill="x")
 
@@ -463,7 +519,7 @@ class AdsReportFetcherApp:
 
         # Animated status label
         self.process_status_label = ctk.CTkLabel(
-            progress_container, text="", font=ctk.CTkFont(size=13, weight="bold"), text_color="#FFA500"
+            progress_container, text="", font=ctk.CTkFont(size=13, weight="bold"), text_color=ui.ACCENT
         )
         self.process_status_label.pack(pady=(10, 5))
 
@@ -471,30 +527,30 @@ class AdsReportFetcherApp:
         self.process_progress_bar = ctk.CTkProgressBar(progress_container)
         self.process_progress_bar.pack(pady=10, padx=20, fill="x")
         self.process_progress_bar.set(0)
-        self.process_progress_bar.configure(progress_color="#FF6B35", fg_color="#2B2B2B")
+        self.process_progress_bar.configure(progress_color=ui.ACCENT, fg_color=ui.TRACK)
 
         # Progress info frame
         progress_info_frame = ctk.CTkFrame(progress_container)
         progress_info_frame.pack(pady=5, padx=20, fill="x")
 
         self.process_progress_percent_label = ctk.CTkLabel(
-            progress_info_frame, text="0%", font=ctk.CTkFont(size=14, weight="bold"), text_color="#FFA500"
+            progress_info_frame, text="0%", font=ctk.CTkFont(size=14, weight="bold"), text_color=ui.ACCENT
         )
         self.process_progress_percent_label.pack(side="left", padx=5)
 
         self.process_files_count_label = ctk.CTkLabel(
-            progress_info_frame, text="", font=ctk.CTkFont(size=11), text_color="#A0A0A0"
+            progress_info_frame, text="", font=ctk.CTkFont(size=11), text_color=ui.TEXT_MUTED
         )
         self.process_files_count_label.pack(side="left", padx=15, expand=True)
 
         self.process_current_file_label = ctk.CTkLabel(
-            progress_info_frame, text="", font=ctk.CTkFont(size=10), text_color="#808080"
+            progress_info_frame, text="", font=ctk.CTkFont(size=10), text_color=ui.TEXT_MUTED
         )
         self.process_current_file_label.pack(side="right", padx=5)
 
         # Spinner
         self.process_spinner_label = ctk.CTkLabel(
-            progress_container, text="", font=ctk.CTkFont(size=16), text_color="#FFA500"
+            progress_container, text="", font=ctk.CTkFont(size=16), text_color=ui.ACCENT
         )
         self.process_spinner_label.pack(pady=(5, 10))
 
@@ -508,124 +564,104 @@ class AdsReportFetcherApp:
         year_list = [str(y) for y in range(current_year - 10, current_year + 1)]
         self.main_pull_prior_year_var = ctk.BooleanVar(value=True)
 
-        # --- Control Panel: daily date range ---
-        control_frame = ctk.CTkFrame(self.main_tab)
-        control_frame.pack(pady=10, padx=20, fill="x")
-        ctk.CTkLabel(control_frame, text="Control Panel — Date Range", font=ctk.CTkFont(size=12, weight="bold")).pack(
-            anchor="w", padx=10, pady=(10, 5)
-        )
-        cal_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
-        cal_frame.pack(pady=5, padx=10, fill="x")
+        # --- Control Panel: compact date range (drop-down date fields + presets) ---
+        control_frame = ctk.CTkFrame(self.main_tab, fg_color="transparent")
+        control_frame.pack(pady=(ui.SPACE_XS, ui.SPACE_S), padx=ui.SPACE_L, fill="x")
+        ctk.CTkLabel(control_frame, text="Date range", font=ui.section_font()).pack(anchor="w", pady=(0, ui.SPACE_XS))
+
+        date_row = ctk.CTkFrame(control_frame, fg_color="transparent")
+        date_row.pack(fill="x")
         self.main_start_cal = None
         self.main_end_cal = None
-        if Calendar is not None:
-            start_col = ctk.CTkFrame(cal_frame, fg_color="transparent")
-            start_col.pack(side="left", padx=15, pady=5)
-            ctk.CTkLabel(start_col, text="Start date", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
-            start_cal_container = tk.Frame(start_col)
-            start_cal_container.pack(pady=5)
-            self.main_start_cal = Calendar(
-                start_cal_container,
+        self._date_preset_buttons: List[ctk.CTkButton] = []
+        if DateEntry is not None:
+            self._style_date_entries()
+            entry_kw = dict(
                 date_pattern="y-mm-dd",
-                mindate=datetime(now.year - 2, 1, 1),
+                mindate=datetime(now.year - 4, 1, 1),
                 maxdate=datetime(now.year + 1, 12, 31),
-                font="Arial 10",
+                width=12,
+                font=(ui.FONT_FAMILY, 10),
+                style="App.DateEntry",
+                firstweekday="monday",
+                showweeknumbers=False,
             )
-            self.main_start_cal.pack(padx=5, pady=5)
-            end_col = ctk.CTkFrame(cal_frame, fg_color="transparent")
-            end_col.pack(side="left", padx=15, pady=5)
-            ctk.CTkLabel(end_col, text="End date", font=ctk.CTkFont(size=11, weight="bold")).pack(anchor="w")
-            end_cal_container = tk.Frame(end_col)
-            end_cal_container.pack(pady=5)
-            self.main_end_cal = Calendar(
-                end_cal_container,
-                date_pattern="y-mm-dd",
-                mindate=datetime(now.year - 2, 1, 1),
-                maxdate=datetime(now.year + 1, 12, 31),
-                font="Arial 10",
+            self.main_start_cal = DateEntry(date_row, **entry_kw, **self._date_calendar_colors())
+            self.main_start_cal.pack(side="left", ipady=3)
+            ctk.CTkLabel(date_row, text="→", font=ui.font(ui.SIZE_BODY), text_color=ui.TEXT_MUTED).pack(
+                side="left", padx=ui.SPACE_S
             )
-            self.main_end_cal.pack(padx=5, pady=5)
+            self.main_end_cal = DateEntry(date_row, **entry_kw, **self._date_calendar_colors())
+            self.main_end_cal.pack(side="left", ipady=3)
             self._set_main_dates_default()
         else:
-            start_frame = ctk.CTkFrame(cal_frame, fg_color="transparent")
-            start_frame.pack(pady=3, fill="x")
-            ctk.CTkLabel(start_frame, text="Start:", font=ctk.CTkFont(size=11)).pack(side="left", padx=10)
-            self.start_month_menu = ctk.CTkOptionMenu(
-                start_frame,
-                values=self.month_names,
-                variable=self.start_month,
-                width=80,
-                state="normal" if not self.date_range_locked else "disabled",
-            )
-            self.start_month_menu.pack(side="left", padx=5)
-            self.start_year_menu = ctk.CTkOptionMenu(
-                start_frame,
-                values=year_list,
-                variable=self.start_year,
-                width=80,
-                state="normal" if not self.date_range_locked else "disabled",
-            )
-            self.start_year_menu.pack(side="left", padx=5)
-            end_frame = ctk.CTkFrame(cal_frame, fg_color="transparent")
-            end_frame.pack(pady=3, fill="x")
-            ctk.CTkLabel(end_frame, text="End:  ", font=ctk.CTkFont(size=11)).pack(side="left", padx=10)
-            self.end_month_menu = ctk.CTkOptionMenu(
-                end_frame,
-                values=self.month_names,
-                variable=self.end_month,
-                width=80,
-                state="normal" if not self.date_range_locked else "disabled",
-            )
-            self.end_month_menu.pack(side="left", padx=5)
-            self.end_year_menu = ctk.CTkOptionMenu(
-                end_frame,
-                values=year_list,
-                variable=self.end_year,
-                width=80,
-                state="normal" if not self.date_range_locked else "disabled",
-            )
-            self.end_year_menu.pack(side="left", padx=5)
+            for label, month_var, year_var, attr in (
+                ("Start", self.start_month, self.start_year, "start"),
+                ("End", self.end_month, self.end_year, "end"),
+            ):
+                ctk.CTkLabel(date_row, text=f"{label}:", font=ui.font(ui.SIZE_BODY)).pack(side="left", padx=(0, 4))
+                month_menu = ctk.CTkOptionMenu(date_row, values=self.month_names, variable=month_var, width=80)
+                month_menu.pack(side="left", padx=(0, 4))
+                year_menu = ctk.CTkOptionMenu(date_row, values=year_list, variable=year_var, width=80)
+                year_menu.pack(side="left", padx=(0, ui.SPACE_M))
+                setattr(self, f"{attr}_month_menu", month_menu)
+                setattr(self, f"{attr}_year_menu", year_menu)
 
-        date_btn_frame = ctk.CTkFrame(control_frame, fg_color="transparent")
-        date_btn_frame.pack(pady=8, padx=10)
         self.confirm_date_btn = ctk.CTkButton(
-            date_btn_frame,
+            date_row,
             text="Confirm Date Range",
             command=self._confirm_date_range_global,
-            font=ctk.CTkFont(size=11),
+            font=ui.font(ui.SIZE_BODY),
             width=150,
-            height=30,
+            height=ui.BUTTON_HEIGHT,
+            corner_radius=ui.RADIUS_SMALL,
+            **ui.PRIMARY_BTN,
         )
-        self.confirm_date_btn.pack(side="left", padx=5)
+        self.confirm_date_btn.pack(side="left", padx=(ui.SPACE_L, ui.SPACE_S))
         self.unlock_date_btn = ctk.CTkButton(
-            date_btn_frame,
+            date_row,
             text="Unlock",
             command=self._unlock_date_range_global,
-            font=ctk.CTkFont(size=10),
+            font=ui.font(ui.SIZE_BODY),
             width=80,
-            height=30,
-            fg_color="gray",
-            hover_color="darkgray",
+            height=ui.BUTTON_HEIGHT,
+            corner_radius=ui.RADIUS_SMALL,
             state="disabled",
+            **ui.OUTLINE_BTN,
         )
-        self.unlock_date_btn.pack(side="left", padx=5)
+        self.unlock_date_btn.pack(side="left")
 
-        prior_year_row = ctk.CTkFrame(control_frame, fg_color="transparent")
-        prior_year_row.pack(pady=6, padx=10, fill="x")
-        self.main_pull_prior_year_cb = ctk.CTkCheckBox(
-            prior_year_row,
-            text="Also pull same range previous year",
+        options_row = ctk.CTkFrame(control_frame, fg_color="transparent")
+        options_row.pack(fill="x", pady=(ui.SPACE_S, 0))
+        if DateEntry is not None:
+            for preset in PRESETS:
+                btn = ctk.CTkButton(
+                    options_row,
+                    text=preset,
+                    command=lambda name=preset: self._apply_date_preset(name),
+                    font=ui.caption_font(),
+                    height=24,
+                    width=0,
+                    corner_radius=12,
+                    **ui.OUTLINE_BTN,
+                )
+                btn.pack(side="left", padx=(0, ui.SPACE_XS))
+                self._date_preset_buttons.append(btn)
+        self.main_pull_prior_year_cb = ctk.CTkSwitch(
+            options_row,
+            text="Also pull same range previous year (YoY)",
             variable=self.main_pull_prior_year_var,
-            font=ctk.CTkFont(size=11),
+            font=ui.caption_font(),
+            progress_color=ui.ACCENT,
         )
-        self.main_pull_prior_year_cb.pack(side="left", padx=(20, 0))
+        self.main_pull_prior_year_cb.pack(side="right")
 
         # --- Scrollable: 3x2 grid of Platform Cards (expands to fill; scrollbar only when window shrunk)
         # Platform section and scrollbar use different shades to differentiate
-        PLATFORM_SECTION_BG = ("#e8e8e8", "#2a2a2a")
-        SCROLLBAR_FG = ("#d0d0d0", "#1e1e1e")
-        SCROLLBAR_BUTTON = ("#b0b0b0", "#333333")
-        SCROLLBAR_BUTTON_HOVER = ("#909090", "#444444")
+        PLATFORM_SECTION_BG = ui.SURFACE
+        SCROLLBAR_FG = ui.SURFACE
+        SCROLLBAR_BUTTON = ui.SCROLLBAR
+        SCROLLBAR_BUTTON_HOVER = ui.SCROLLBAR_HOVER
         self.main_scrollable = ctk.CTkScrollableFrame(
             self.main_tab,
             fg_color=PLATFORM_SECTION_BG,
@@ -646,7 +682,7 @@ class AdsReportFetcherApp:
 
         CARD_PAD = 10
         CARD_COMBO_WIDTH = 220
-        CARD_DIM_FG = ("#3a3a3a", "#2d2d2d")
+        CARD_DIM_FG = ui.CARD
 
         cards_grid = ctk.CTkFrame(self.main_scrollable, fg_color="transparent")
         cards_grid.pack(pady=8, padx=8, fill="both", expand=True)
@@ -687,7 +723,7 @@ class AdsReportFetcherApp:
         )
         self.customer_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
         self.google_card_status_label = ctk.CTkLabel(
-            self.google_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray"
+            self.google_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color=ui.TEXT_MUTED
         )
         self.google_card_status_label.pack(anchor="w", padx=10, pady=(0, 10))
         self._set_google_id_display_from_id()
@@ -707,11 +743,11 @@ class AdsReportFetcherApp:
         )
         self.meta_account_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
         self.meta_card_status_label = ctk.CTkLabel(
-            self.meta_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray"
+            self.meta_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color=ui.TEXT_MUTED
         )
         self.meta_card_status_label.pack(anchor="w", padx=10, pady=(0, 4))
         self.meta_retention_warning_label = ctk.CTkLabel(
-            self.meta_card, text="", font=ctk.CTkFont(size=10), text_color="#FFA500", wraplength=280, justify="left"
+            self.meta_card, text="", font=ctk.CTkFont(size=10), text_color=ui.WARNING, wraplength=280, justify="left"
         )
         self.meta_retention_warning_label.pack(anchor="w", padx=10, pady=(0, 4))
         self.meta_retention_warning_label.pack_forget()
@@ -735,7 +771,7 @@ class AdsReportFetcherApp:
         )
         self.ms_customer_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
         self.ms_card_status_label = ctk.CTkLabel(
-            self.ms_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray"
+            self.ms_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color=ui.TEXT_MUTED
         )
         self.ms_card_status_label.pack(anchor="w", padx=10, pady=(0, 10))
         self._make_reauth_button(self.ms_card, "Microsoft")
@@ -759,14 +795,14 @@ class AdsReportFetcherApp:
         )
         self.tiktok_account_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
         self.tiktok_card_status_label = ctk.CTkLabel(
-            self.tiktok_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray"
+            self.tiktok_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color=ui.TEXT_MUTED
         )
         self.tiktok_card_status_label.pack(anchor="w", padx=10, pady=(0, 2))
         ctk.CTkLabel(
             self.tiktok_card,
             text="API not yet connected",
             font=ctk.CTkFont(size=9, slant="italic"),
-            text_color="#888888",
+            text_color=ui.TEXT_MUTED,
         ).pack(anchor="w", padx=10, pady=(0, 8))
         self._make_reauth_button(self.tiktok_card, "TikTok")
         self._set_tiktok_id_display_from_id()
@@ -786,7 +822,7 @@ class AdsReportFetcherApp:
         )
         self.reddit_account_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
         self.reddit_card_status_label = ctk.CTkLabel(
-            self.reddit_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray"
+            self.reddit_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color=ui.TEXT_MUTED
         )
         self.reddit_card_status_label.pack(anchor="w", padx=10, pady=(0, 10))
         self._make_reauth_button(self.reddit_card, "Reddit")
@@ -811,14 +847,14 @@ class AdsReportFetcherApp:
         )
         self.pinterest_account_id_combobox.pack(anchor="w", padx=10, pady=(0, 4))
         self.pinterest_card_status_label = ctk.CTkLabel(
-            self.pinterest_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color="gray"
+            self.pinterest_card, text="ID Missing", font=ctk.CTkFont(size=10), text_color=ui.TEXT_MUTED
         )
         self.pinterest_card_status_label.pack(anchor="w", padx=10, pady=(0, 2))
         ctk.CTkLabel(
             self.pinterest_card,
             text="API not yet connected",
             font=ctk.CTkFont(size=9, slant="italic"),
-            text_color="#888888",
+            text_color=ui.TEXT_MUTED,
         ).pack(anchor="w", padx=10, pady=(0, 8))
         self._set_pinterest_id_display_from_id()
         self.pinterest_id_display.trace_add("write", lambda *a: self._sync_pinterest_id_from_display())
@@ -846,21 +882,21 @@ class AdsReportFetcherApp:
         for pf in [self.google_process_progress_frame, self.meta_process_progress_frame]:
             pc = ctk.CTkFrame(pf, fg_color="transparent")
             pc.pack(pady=10, padx=10, fill="x")
-            ctk.CTkLabel(pc, text="", font=ctk.CTkFont(size=13, weight="bold"), text_color="#FFA500").pack(pady=(10, 5))
+            ctk.CTkLabel(pc, text="", font=ctk.CTkFont(size=13, weight="bold"), text_color=ui.ACCENT).pack(pady=(10, 5))
             pb = ctk.CTkProgressBar(pc)
             pb.pack(pady=10, padx=20, fill="x")
             pb.set(0)
-            pb.configure(progress_color="#FF6B35", fg_color="#2B2B2B")
+            pb.configure(progress_color=ui.ACCENT, fg_color=ui.TRACK)
             pi = ctk.CTkFrame(pc, fg_color="transparent")
             pi.pack(pady=5, padx=20, fill="x")
-            ctk.CTkLabel(pi, text="0%", font=ctk.CTkFont(size=14, weight="bold"), text_color="#FFA500").pack(
+            ctk.CTkLabel(pi, text="0%", font=ctk.CTkFont(size=14, weight="bold"), text_color=ui.ACCENT).pack(
                 side="left", padx=5
             )
-            ctk.CTkLabel(pi, text="", font=ctk.CTkFont(size=11), text_color="#A0A0A0").pack(
+            ctk.CTkLabel(pi, text="", font=ctk.CTkFont(size=11), text_color=ui.TEXT_MUTED).pack(
                 side="left", padx=15, expand=True
             )
-            ctk.CTkLabel(pi, text="", font=ctk.CTkFont(size=10), text_color="#808080").pack(side="right", padx=5)
-            ctk.CTkLabel(pc, text="", font=ctk.CTkFont(size=16), text_color="#FFA500").pack(pady=(5, 10))
+            ctk.CTkLabel(pi, text="", font=ctk.CTkFont(size=10), text_color=ui.TEXT_MUTED).pack(side="right", padx=5)
+            ctk.CTkLabel(pc, text="", font=ctk.CTkFont(size=16), text_color=ui.ACCENT).pack(pady=(5, 10))
             pf.pack_forget()
         self.google_process_status_label = self.google_process_progress_frame.winfo_children()[0].winfo_children()[0]
         self.google_process_progress_bar = self.google_process_progress_frame.winfo_children()[0].winfo_children()[1]
@@ -929,10 +965,20 @@ class AdsReportFetcherApp:
             menu.grid(row=row, column=1, sticky="w", padx=PAD_COL, pady=PAD_ROW)
             setattr(self, menu_attr, menu)
             ctk.CTkButton(
-                default_favorite_frame, text="Add", command=add_cb, width=BTN_WIDTH, font=ctk.CTkFont(size=11)
+                default_favorite_frame,
+                text="Add",
+                command=add_cb,
+                width=BTN_WIDTH,
+                font=ctk.CTkFont(size=11),
+                **ui.OUTLINE_BTN,
             ).grid(row=row, column=2, padx=(0, 4), pady=PAD_ROW)
             ctk.CTkButton(
-                default_favorite_frame, text="Edit", command=edit_cb, width=BTN_WIDTH, font=ctk.CTkFont(size=11)
+                default_favorite_frame,
+                text="Edit",
+                command=edit_cb,
+                width=BTN_WIDTH,
+                font=ctk.CTkFont(size=11),
+                **ui.OUTLINE_BTN,
             ).grid(row=row, column=3, padx=4, pady=PAD_ROW)
             ctk.CTkButton(
                 default_favorite_frame,
@@ -940,8 +986,7 @@ class AdsReportFetcherApp:
                 command=delete_cb,
                 width=BTN_WIDTH,
                 font=ctk.CTkFont(size=11),
-                fg_color="red",
-                hover_color="darkred",
+                **ui.DANGER_BTN,
             ).grid(row=row, column=4, padx=(4, 10), pady=PAD_ROW)
 
         google_favorite_names = [fav["name"] for fav in self.favorites] if self.favorites else []
@@ -1058,9 +1103,9 @@ class AdsReportFetcherApp:
 
     def _on_source_selection_changed(self) -> None:
         """Update card state: enable/disable dropdown, dim/active card; apply smart default when first checked."""
-        CARD_DIM_FG = ("#3a3a3a", "#2d2d2d")
-        CARD_ACTIVE_FG = ("#4a4a4a", "#3d3d3d")
-        CARD_ACTIVE_BORDER = "#0066CC"
+        CARD_DIM_FG = ui.CARD
+        CARD_ACTIVE_FG = ui.CARD_ACTIVE
+        CARD_ACTIVE_BORDER = ui.ACCENT
         platform_cards = [
             (self.source_google_var, self.google_card, self.customer_id_combobox, "google"),
             (self.source_meta_var, self.meta_card, self.meta_account_id_combobox, "meta"),
@@ -1079,7 +1124,7 @@ class AdsReportFetcherApp:
                 card.configure(fg_color=CARD_ACTIVE_FG, border_width=2, border_color=CARD_ACTIVE_BORDER)
                 self._apply_smart_default_for_platform(key)
             else:
-                card.configure(fg_color=CARD_DIM_FG, border_width=0, border_color="#3a3a3a")
+                card.configure(fg_color=CARD_DIM_FG, border_width=1, border_color=ui.BORDER)
         self._update_checklist_statuses()
 
     def _apply_smart_default_for_platform(self, platform_key: str) -> None:
@@ -1348,7 +1393,7 @@ class AdsReportFetcherApp:
             folder_frame,
             text="Paths for raw downloads, processed files, merged CSVs, and YoY ready reports.",
             font=ctk.CTkFont(size=10),
-            text_color="gray",
+            text_color=ui.TEXT_MUTED,
         ).pack(anchor="w", padx=10, pady=(0, 5))
 
         def add_dir_row(parent: ctk.CTkFrame, label: str, setting_key: str, default: str) -> ctk.CTkEntry:
@@ -1388,13 +1433,43 @@ class AdsReportFetcherApp:
             command=self._on_save_all_settings,
             font=ctk.CTkFont(size=14, weight="bold"),
             height=40,
-            fg_color="green",
-            hover_color="darkgreen",
+            **ui.PRIMARY_BTN,
         )
         save_settings_btn.pack(pady=10, padx=20, fill="x")
 
         # Campaign Rules Manager (pack last with expand so it fills remaining space; scrolls if needed)
         self._create_campaign_rules_section()
+
+        # Data (danger zone): Clear All Data lives here rather than next to Run Fetch in the toolbar
+        data_frame = ctk.CTkFrame(self._settings_scroll, border_width=1, border_color=ui.BORDER)
+        data_frame.pack(pady=10, padx=20, fill="x")
+        ctk.CTkLabel(data_frame, text="Data", font=ui.section_font()).pack(anchor="w", padx=10, pady=(10, 2))
+        ctk.CTkLabel(
+            data_frame,
+            text="Delete every CSV in the raw, processed, merged and ready report folders. "
+            "You'll be asked to confirm; this can't be undone.",
+            font=ui.caption_font(),
+            text_color=ui.TEXT_MUTED,
+            wraplength=640,
+            justify="left",
+        ).pack(anchor="w", padx=10, pady=(0, 6))
+        data_row = ctk.CTkFrame(data_frame, fg_color="transparent")
+        data_row.pack(fill="x", padx=10, pady=(0, 10))
+        self.clear_data_button = ctk.CTkButton(
+            data_row,
+            text="Clear All Data…",
+            command=self._on_clear_data_clicked,
+            font=ui.font(ui.SIZE_BODY),
+            height=ui.BUTTON_HEIGHT,
+            width=150,
+            corner_radius=ui.RADIUS_SMALL,
+            **ui.DANGER_BTN,
+        )
+        self.clear_data_button.pack(side="left")
+        self.settings_data_status_label = ctk.CTkLabel(
+            data_row, text="", font=ui.caption_font(), text_color=ui.TEXT_MUTED
+        )
+        self.settings_data_status_label.pack(side="left", padx=ui.SPACE_M)
 
     def _create_campaign_rules_section(self) -> None:
         """Build Campaign Rules Manager UI and load mappings.json."""
@@ -1415,19 +1490,19 @@ class AdsReportFetcherApp:
                 "Used by Process All Data. Stored in mappings.json."
             ),
             font=ctk.CTkFont(size=10),
-            text_color="gray",
+            text_color=ui.TEXT_MUTED,
         ).pack(anchor="w", padx=10, pady=(0, 2))
         ctk.CTkLabel(
             sticky_header,
             text="Auto-rules (in processor): names containing 'Brand' or 'Branded' → Bottom.",
             font=ctk.CTkFont(size=10),
-            text_color="gray",
+            text_color=ui.TEXT_MUTED,
         ).pack(anchor="w", padx=10, pady=(0, 2))
         ctk.CTkLabel(
             sticky_header,
             text="Partial matches are supported. The system matches these keywords case-insensitively.",
             font=ctk.CTkFont(size=10),
-            text_color="gray",
+            text_color=ui.TEXT_MUTED,
         ).pack(anchor="w", padx=10, pady=(0, 8))
 
         # --- New Rule section ---
@@ -1438,7 +1513,7 @@ class AdsReportFetcherApp:
             sticky_header,
             text="New rule — campaign keyword (e.g., Spring Sale Campaign):",
             font=ctk.CTkFont(size=10),
-            text_color="gray",
+            text_color=ui.TEXT_MUTED,
         ).pack(anchor="w", padx=10, pady=(0, 2))
         add_row = ctk.CTkFrame(sticky_header, fg_color="transparent")
         add_row.pack(pady=(0, 4), padx=10, fill="x")
@@ -1463,8 +1538,7 @@ class AdsReportFetcherApp:
             width=110,
             height=28,
             font=ctk.CTkFont(size=11),
-            fg_color="#0066CC",
-            hover_color="#0052A3",
+            **ui.PRIMARY_BTN,
         ).pack(side="left", padx=0)
 
         # --- Campaign Filter section (below New Rule) ---
@@ -1475,7 +1549,7 @@ class AdsReportFetcherApp:
             sticky_header,
             text="Filter by campaign keyword or stage (e.g., Advantage+):",
             font=ctk.CTkFont(size=10),
-            text_color="gray",
+            text_color=ui.TEXT_MUTED,
         ).pack(anchor="w", padx=10, pady=(0, 2))
         filter_row = ctk.CTkFrame(sticky_header, fg_color="transparent")
         filter_row.pack(pady=(0, 4), padx=10, fill="x")
@@ -1506,8 +1580,7 @@ class AdsReportFetcherApp:
             width=180,
             height=32,
             font=ctk.CTkFont(size=11),
-            fg_color="green",
-            hover_color="darkgreen",
+            **ui.PRIMARY_BTN,
         )
         save_mappings_btn.pack(side="left", padx=(0, 10))
         ctk.CTkButton(
@@ -1517,8 +1590,7 @@ class AdsReportFetcherApp:
             width=120,
             height=32,
             font=ctk.CTkFont(size=11),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         ).pack(side="left", padx=0)
 
         # Rules list: fixed-height scrollable area; outer _settings_scroll handles the tab-level scroll
@@ -1577,8 +1649,8 @@ class AdsReportFetcherApp:
                 continue
             shown += 1
             # Subtle row bg for tracking; hover darkens slightly
-            row_bg = ("#e8e8e8", "#353535")
-            row_hover_bg = ("#d8d8d8", "#454545")
+            row_bg = ui.CARD
+            row_hover_bg = ui.NEUTRAL_FILL
             row = ctk.CTkFrame(self.mappings_rules_scroll, fg_color=row_bg, corner_radius=4)
             row.pack(fill="x", pady=2)
 
@@ -1611,13 +1683,15 @@ class AdsReportFetcherApp:
                 width=50,
                 height=24,
                 font=ctk.CTkFont(size=10),
-                fg_color="red",
-                hover_color="darkred",
+                **ui.DANGER_BTN,
                 command=lambda c=campaign: self._on_mappings_delete(c),
             ).pack(side="left", padx=2, pady=2)
         if shown == 0:
             no_match = ctk.CTkLabel(
-                self.mappings_rules_scroll, text="No matching rules found", font=ctk.CTkFont(size=11), text_color="gray"
+                self.mappings_rules_scroll,
+                text="No matching rules found",
+                font=ctk.CTkFont(size=11),
+                text_color=ui.TEXT_MUTED,
             )
             no_match.pack(expand=True, pady=40)
 
@@ -1678,7 +1752,9 @@ class AdsReportFetcherApp:
         btn_frame = ctk.CTkFrame(d, fg_color="transparent")
         btn_frame.pack(pady=10, padx=15)
         ctk.CTkButton(btn_frame, text="OK", command=on_ok, width=80).pack(side="left", padx=5)
-        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80, fg_color="gray").pack(side="left", padx=5)
+        ctk.CTkButton(btn_frame, text="Cancel", command=on_cancel, width=80, **ui.SECONDARY_BTN).pack(
+            side="left", padx=5
+        )
 
         d.wait_window(d)
         new_campaign = (result.get("campaign") or "").strip()
@@ -1786,6 +1862,9 @@ class AdsReportFetcherApp:
         """Handle theme mode change in settings."""
         self.settings["theme_mode"] = choice
         ctk.set_appearance_mode(choice)
+        self._apply_log_colors()
+        if DateEntry is not None:
+            self._style_date_entries()
         self._save_settings()
         self.logger.info(f"Theme mode changed to: {choice}")
         self.status_text.set(f"Theme changed to {choice} mode")
@@ -1823,40 +1902,92 @@ class AdsReportFetcherApp:
         self.root.after(150, self._animate_process_spinner)
 
     def _create_shared_log_area(self) -> ctk.CTkFrame:
-        """Create Live Log frame (caller grids it at bottom with sticky=ew). Returns the log frame."""
-        log_frame = ctk.CTkFrame(self.root)
+        """Create the Live Log drawer (caller grids it at the bottom with sticky=ew). Returns the log frame.
 
-        # Header with label and Export button
+        Collapsed: a single row with a toggle, a one-line ticker of the latest message, and Export.
+        Expanded: the full scrolling log below that row. The choice is remembered in config.json.
+        """
+        log_frame = ctk.CTkFrame(self.root, corner_radius=0, fg_color=ui.SURFACE)
+
         log_header_frame = ctk.CTkFrame(log_frame, fg_color="transparent")
-        log_header_frame.pack(pady=(6, 2), padx=10, fill="x")
+        log_header_frame.pack(pady=ui.SPACE_XS, padx=ui.SPACE_M, fill="x")
 
-        log_label = ctk.CTkLabel(log_header_frame, text="Live Log:", font=ctk.CTkFont(size=11, weight="bold"))
-        log_label.pack(side="left", padx=10)
+        self.log_toggle_button = ctk.CTkButton(
+            log_header_frame,
+            text="",
+            command=self._toggle_log_drawer,
+            font=ui.font(ui.SIZE_CAPTION, "bold"),
+            height=26,
+            width=110,
+            corner_radius=ui.RADIUS_SMALL,
+            **ui.OUTLINE_BTN,
+        )
+        self.log_toggle_button.pack(side="left")
 
         self.log_export_button = ctk.CTkButton(
             log_header_frame,
             text="Export to .txt",
             command=self._on_export_log_clicked,
-            font=ctk.CTkFont(size=11),
-            height=25,
+            font=ui.caption_font(),
+            height=26,
             width=100,
-            fg_color="#4CAF50",
-            hover_color="#45a049",
+            corner_radius=ui.RADIUS_SMALL,
+            **ui.OUTLINE_BTN,
         )
-        self.log_export_button.pack(side="right", padx=10)
+        self.log_export_button.pack(side="right")
 
-        # Increased height (16 lines) for more log visibility after removing checklist
+        # One-line ticker: latest log message, so progress is visible while the drawer is closed
+        self.log_ticker_label = ctk.CTkLabel(
+            log_header_frame, text="", font=ui.caption_font(), text_color=ui.TEXT_MUTED, anchor="w"
+        )
+        self.log_ticker_label.pack(side="left", fill="x", expand=True, padx=ui.SPACE_M)
+
         self.log_textbox = scrolledtext.ScrolledText(
             log_frame,
-            height=16,
+            height=10,
             wrap="word",
-            font=("Consolas", 9),
-            bg="#212121",
-            fg="#FFFFFF",
-            insertbackground="#FFFFFF",
+            font=ui.MONO_FONT,
+            relief="flat",
+            borderwidth=0,
         )
-        self.log_textbox.pack(pady=(0, 6), padx=10, fill="x")
+        self._apply_log_colors()
+
+        self._log_expanded = bool(self.settings.get("log_expanded", False))
+        self._render_log_drawer()
         return log_frame
+
+    def _apply_log_colors(self) -> None:
+        """Plain Tk text widget: pick light/dark colors explicitly (re-run on theme change)."""
+        fg = ui.resolve(ui.LOG_FG)
+        self.log_textbox.configure(bg=ui.resolve(ui.LOG_BG), fg=fg, insertbackground=fg)
+
+    def _render_log_drawer(self) -> None:
+        if self._log_expanded:
+            self.log_textbox.pack(pady=(0, ui.SPACE_S), padx=ui.SPACE_M, fill="x")
+            self.log_toggle_button.configure(text="▾  Hide log")
+        else:
+            self.log_textbox.pack_forget()
+            self.log_toggle_button.configure(text="▸  Show log")
+
+    def _toggle_log_drawer(self) -> None:
+        self._log_expanded = not self._log_expanded
+        self._render_log_drawer()
+        self.settings["log_expanded"] = self._log_expanded
+        self._save_settings()
+
+    def _update_log_ticker(self, msg: str) -> None:
+        """Show the latest log line (first line only, without the date) in the collapsed drawer."""
+        line = msg.splitlines()[0] if msg else ""
+        # Formatter: "YYYY-MM-DD HH:MM:SS AM - LEVEL - message" -> "HH:MM:SS AM  message"
+        parts = line.split(" - ", 2)
+        level = parts[1] if len(parts) == 3 else ""
+        if len(parts) == 3:
+            time_part = parts[0].split(" ", 1)[-1]
+            line = f"{time_part}  {parts[2]}"
+        if len(line) > 140:
+            line = line[:137] + "…"
+        color = ui.DANGER if level in ("ERROR", "CRITICAL") else ui.WARNING if level == "WARNING" else ui.TEXT_MUTED
+        self.log_ticker_label.configure(text=line, text_color=color)
 
     def _on_export_log_clicked(self) -> None:
         """Export log content to a text file."""
@@ -1885,7 +2016,7 @@ class AdsReportFetcherApp:
 
     def _get_main_date_range(self) -> Tuple[datetime, datetime]:
         """Return (start_date, end_date) from Main tab: calendars if available, else month/year dropdowns."""
-        if Calendar is not None and self.main_start_cal is not None and self.main_end_cal is not None:
+        if DateEntry is not None and self.main_start_cal is not None and self.main_end_cal is not None:
             start_d = self.main_start_cal.get_date()
             end_d = self.main_end_cal.get_date()
             if isinstance(start_d, str):
@@ -1910,13 +2041,86 @@ class AdsReportFetcherApp:
 
     def _set_main_dates_default(self) -> None:
         """Set Main tab start/end calendar to default: first of current month through today."""
-        if Calendar is None or self.main_start_cal is None or self.main_end_cal is None:
+        self._apply_date_preset("Month to date", announce=False)
+
+    def _apply_date_preset(self, name: str, announce: bool = True) -> None:
+        """Fill both date fields from a preset (no-op while the range is locked or without tkcalendar)."""
+        if DateEntry is None or self.main_start_cal is None or self.main_end_cal is None or self.date_range_locked:
             return
-        now = datetime.now()
-        start = datetime(now.year, now.month, 1)
-        end = now if now.day > 1 else start
-        self.main_start_cal.selection_set(start.date())
-        self.main_end_cal.selection_set(end.date())
+        start, end = preset_range(name, datetime.now().date())
+        self.main_start_cal.set_date(start)
+        self.main_end_cal.set_date(end)
+        if announce:
+            self.status_text.set(f"Date range set to {name.lower()}: {start:%Y-%m-%d} → {end:%Y-%m-%d}")
+
+    def _date_calendar_colors(self) -> Dict[str, str]:
+        """Colors for the drop-down calendar of each DateEntry (plain Tk, so resolved per theme)."""
+        r = ui.resolve
+        return dict(
+            background=r(ui.ACCENT),
+            foreground="#FFFFFF",
+            bordercolor=r(ui.BORDER),
+            headersbackground=r(ui.CARD),
+            headersforeground=r(ui.TEXT_MUTED),
+            normalbackground=r(ui.CARD),
+            normalforeground=r(ui.TEXT),
+            weekendbackground=r(ui.CARD),
+            weekendforeground=r(ui.TEXT),
+            othermonthbackground=r(ui.SURFACE),
+            othermonthforeground=r(ui.TEXT_MUTED),
+            othermonthwebackground=r(ui.SURFACE),
+            othermonthweforeground=r(ui.TEXT_MUTED),
+            selectbackground=r(ui.ACCENT),
+            selectforeground="#FFFFFF",
+            disabledbackground=r(ui.SURFACE),
+            disabledforeground=r(ui.TEXT_MUTED),
+        )
+
+    def _style_date_entries(self) -> None:
+        """ttk style for the DateEntry fields. 'clam' honours field colors on Windows (the native theme doesn't)."""
+        from tkinter import ttk
+
+        r = ui.resolve
+        style = ttk.Style(self.root)
+        if style.theme_use() != "clam":
+            style.theme_use("clam")
+        style.configure(
+            "App.DateEntry",
+            fieldbackground=r(ui.CARD),
+            background=r(ui.NEUTRAL_FILL),
+            foreground=r(ui.TEXT),
+            arrowcolor=r(ui.TEXT_MUTED),
+            bordercolor=r(ui.BORDER),
+            lightcolor=r(ui.CARD),
+            darkcolor=r(ui.CARD),
+            insertcolor=r(ui.TEXT),
+            selectbackground=r(ui.ACCENT),
+            selectforeground="#FFFFFF",
+            padding=4,
+        )
+        style.map(
+            "App.DateEntry",
+            fieldbackground=[("disabled", r(ui.SURFACE)), ("readonly", r(ui.CARD))],
+            foreground=[("disabled", r(ui.TEXT_MUTED))],
+            background=[("active", r(ui.NEUTRAL_FILL_HOVER)), ("disabled", r(ui.SURFACE))],
+        )
+        for entry in (self.main_start_cal, self.main_end_cal):
+            if entry is not None:
+                entry.configure(**self._date_calendar_colors())
+
+    def _set_date_inputs_enabled(self, enabled: bool) -> None:
+        """Enable/disable the date fields, presets and the prior-year switch together."""
+        state = "normal" if enabled else "disabled"
+        widgets = [self.main_start_cal, self.main_end_cal, *self._date_preset_buttons, self.main_pull_prior_year_cb]
+        widgets += [getattr(self, n, None) for n in ("start_month_menu", "start_year_menu", "end_month_menu",
+                                                      "end_year_menu")]
+        for widget in widgets:
+            if widget is None:
+                continue
+            try:
+                widget.configure(state=state)
+            except Exception:
+                pass
 
     def _month_name_to_number(self, month_name: str) -> int:
         """Convert month name to number (1-12)."""
@@ -1943,22 +2147,8 @@ class AdsReportFetcherApp:
             return
         self.date_range_locked = True
         self.meta_date_range_locked = True
-        if Calendar is not None and self.main_start_cal is not None and self.main_end_cal is not None:
-            self.main_pull_prior_year_cb.configure(state="disabled")
-            try:
-                self.main_start_cal.configure(state="disabled")
-            except Exception:
-                pass
-            try:
-                self.main_end_cal.configure(state="disabled")
-            except Exception:
-                pass
-        else:
-            self.start_month_menu.configure(state="disabled")
-            self.start_year_menu.configure(state="disabled")
-            self.end_month_menu.configure(state="disabled")
-            self.end_year_menu.configure(state="disabled")
-        self.confirm_date_btn.configure(text="Date Range Locked", state="disabled")
+        self._set_date_inputs_enabled(False)
+        self.confirm_date_btn.configure(text="Date Range Locked", state="disabled", **ui.SECONDARY_BTN)
         self.unlock_date_btn.configure(state="normal")
         # Meta retention: show warning in Meta card if start date is older than 37 months
         start_date, _ = self._get_main_date_range()
@@ -1985,22 +2175,9 @@ class AdsReportFetcherApp:
         self.date_range_locked = False
         self.meta_date_range_locked = False
         self.meta_retention_warning_label.pack_forget()
-        if Calendar is not None and self.main_start_cal is not None and self.main_end_cal is not None:
-            self.main_pull_prior_year_cb.configure(state="normal")
-            try:
-                self.main_start_cal.configure(state="normal")
-            except Exception:
-                pass
-            try:
-                self.main_end_cal.configure(state="normal")
-            except Exception:
-                pass
-        else:
-            self.start_month_menu.configure(state="normal")
-            self.start_year_menu.configure(state="normal")
-            self.end_month_menu.configure(state="normal")
-            self.end_year_menu.configure(state="normal")
-        self.confirm_date_btn.configure(text="Confirm Date Range", state="normal")
+        self._set_date_inputs_enabled(True)
+        self._clear_pipeline_report()
+        self.confirm_date_btn.configure(text="Confirm Date Range", state="normal", **ui.PRIMARY_BTN)
         self.unlock_date_btn.configure(state="disabled")
         self.status_text.set("Date range unlocked for editing")
         self.logger.info("Date range unconfirmed (global)")
@@ -2273,6 +2450,8 @@ class AdsReportFetcherApp:
             f"TikTok={tiktok_ready}, Reddit={reddit_ready}, Pinterest={pinterest_ready}"
         )
         self.status_text.set("Starting Full Pipeline...")
+        self._clear_pipeline_report()
+        self._update_checklist_statuses()
         self.batch_fetch_active = True
         self.run_full_pipeline_button.configure(state="disabled")
 
@@ -2284,6 +2463,53 @@ class AdsReportFetcherApp:
         # Run batch fetch in a thread
         batch_thread = threading.Thread(target=self._execute_batch_fetch, daemon=True)
         batch_thread.start()
+
+    def _fetch_range(self, platform: str, label: str, fetch, start: datetime, end: datetime):
+        """Run one range fetch and record its outcome (saved / no data / failed) on the pipeline report.
+
+        Fetchers return None both for API errors and for empty ranges; an ERROR logged during the call
+        is what marks it as failed. Exceptions still propagate to the fetch thread's own handlers.
+        """
+        capture = self._error_capture
+        mark = capture.mark() if capture else 0
+        df = fetch(start, end)
+        report = self._pipeline_report
+        if report is not None:
+            if df is not None and not df.empty:
+                status, detail = "saved", ""
+            else:
+                error = capture.first_error_since(mark) if capture else None
+                status, detail = ("failed", error) if error else ("no_data", "")
+            report.platform(platform).ranges.append(RangeResult(label, start.date(), end.date(), status, detail))
+            self.root.after(0, self._update_checklist_statuses)
+        return df
+
+    def _show_pipeline_report(self) -> None:
+        """Main thread: show the run summary in the status row and per-platform results on the cards."""
+        report = self._pipeline_report
+        if report is None:
+            return
+        level, text = report.summary()
+        color = {OK: ui.SUCCESS, FAILED: ui.DANGER}.get(level, ui.WARNING)
+        self.pipeline_progress_frame.pack_forget()
+        self.pipeline_status_label.configure(text=text, text_color=color)
+        self.status_text.set("Run finished")
+        if level != OK:
+            self.view_log_button.pack(side="left", padx=(ui.SPACE_S, 0), after=self.pipeline_status_label)
+        else:
+            self.view_log_button.pack_forget()
+        self._update_checklist_statuses()
+
+    def _clear_pipeline_report(self) -> None:
+        """Forget the last run's results (New Fetch, Unlock, Clear data, or a new run)."""
+        self._pipeline_report = None
+        self.view_log_button.pack_forget()
+        self.pipeline_status_label.configure(text="", text_color=ui.TEXT_MUTED)
+
+    def _on_view_log_clicked(self) -> None:
+        if not self._log_expanded:
+            self._toggle_log_drawer()
+        self.log_textbox.see("end")
 
     def _report_pipeline_platform_progress(self, platform_key: str, current: int, total: int) -> None:
         """Update per-platform progress (e.g. Google: 1/2) and refresh pipeline status.
@@ -2318,6 +2544,11 @@ class AdsReportFetcherApp:
         Execute the batch fetch sequence.
         Only runs platforms that are selected and ready (valid ID + date range confirmed).
         """
+        report = PipelineReport(yoy_expected=bool(self.main_pull_prior_year_var.get()))
+        self._pipeline_report = report
+        self._run_started_at = time.time()
+        self._error_capture = ErrorCapture()
+        logging.getLogger().addHandler(self._error_capture)
         try:
             is_valid_google, _ = self._validate_inputs()
             is_valid_meta, _ = self._validate_meta_inputs()
@@ -2351,12 +2582,14 @@ class AdsReportFetcherApp:
             # Skip platforms with missing config (log so user knows)
             if self.source_ms_var.get() and is_valid_ms and self.date_range_locked and not ms_config_exists:
                 self.logger.info("Skipping Microsoft Ads: microsoft-ads.yaml not found. Run setup_ms_auth.py first.")
+                report.platform("Microsoft Ads").skipped_reason = "microsoft-ads.yaml missing (run setup_ms_auth.py)"
             if (
                 self.source_tiktok_var.get()
                 and (self.tiktok_account_id.get() or "").strip()
                 and not tiktok_config_exists
             ):
                 self.logger.info("Skipping TikTok Ads: tiktok-ads.yaml not found. See PLATFORM_STATUS.md.")
+                report.platform("TikTok Ads").skipped_reason = "tiktok-ads.yaml missing"
             if (
                 self.source_pinterest_var.get()
                 and (self.pinterest_account_id.get() or "").strip()
@@ -2411,29 +2644,35 @@ class AdsReportFetcherApp:
 
                 self.logger.info(f"Pipeline: Starting {platform_name}...")
                 self.root.after(0, lambda pn=platform_name: self.status_text.set(f"Pipeline: Fetching {pn}..."))
+                platform_mark = self._error_capture.mark()
 
                 # Execute fetch and wait for completion
                 fetch_func()
 
                 # Wait for this platform to complete
-                if platform_name == "Google Ads":
-                    self.google_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
-                    self.google_fetch_complete.clear()
-                elif platform_name == "Meta Ads":
-                    self.meta_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
-                    self.meta_fetch_complete.clear()
-                elif platform_name == "Microsoft Ads":
-                    self.ms_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
-                    self.ms_fetch_complete.clear()
-                elif platform_name == "TikTok Ads":
-                    self.tiktok_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
-                    self.tiktok_fetch_complete.clear()
-                elif platform_name == "Reddit Ads":
-                    self.reddit_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
-                    self.reddit_fetch_complete.clear()
-                elif platform_name == "Pinterest Ads":
-                    self.pinterest_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
-                    self.pinterest_fetch_complete.clear()
+                complete_event = {
+                    "Google Ads": self.google_fetch_complete,
+                    "Meta Ads": self.meta_fetch_complete,
+                    "Microsoft Ads": self.ms_fetch_complete,
+                    "TikTok Ads": self.tiktok_fetch_complete,
+                    "Reddit Ads": self.reddit_fetch_complete,
+                    "Pinterest Ads": self.pinterest_fetch_complete,
+                }[platform_name]
+                finished = complete_event.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
+                complete_event.clear()
+
+                # Record anything the per-range results didn't capture (timeouts, setup errors, early exits)
+                result = report.platform(platform_name)
+                if platform_name == "Pinterest Ads":
+                    result.skipped_reason = "API not yet connected"
+                elif not finished:
+                    result.error = f"timed out after {PIPELINE_FETCH_WAIT_SECONDS // 60} min"
+                elif not result.ranges and not result.error and not result.token_expired:
+                    result.error = (
+                        self._error_capture.first_error_since(platform_mark)
+                        or "fetch did not run (check the account ID)"
+                    )
+                self.root.after(0, self._update_checklist_statuses)
 
                 # Mark this platform complete (in case fetch thread didn't report final step)
                 self._pipeline_platform_progress[short_name] = (platform_total, platform_total)
@@ -2470,6 +2709,7 @@ class AdsReportFetcherApp:
                     processed_dir = self.settings.get("processed_reports_dir", "processed_reports")
                     merged_dir = self.settings.get("merged_reports_dir", "merged_reports")
                     ready_dir = self.settings.get("ready_reports_dir", "ready_reports")
+                    processing_mark = self._error_capture.mark()
                     processor = ReportProcessor(
                         input_dir=raw_dir,
                         output_dir=processed_dir,
@@ -2492,27 +2732,26 @@ class AdsReportFetcherApp:
                     self.root.after(0, lambda: self.status_text.set("Pipeline: Building YoY reports..."))
                     processor.build_yoy_reports()
 
+                    report.processing_error = self._error_capture.first_error_since(processing_mark) or ""
+                    ready_path = Path(ready_dir)
+                    if ready_path.exists():
+                        report.ready_files = sorted(
+                            f.name for f in ready_path.glob("ready_*.csv") if f.stat().st_mtime >= self._run_started_at
+                        )
                     self.logger.info("Pipeline: Complete!")
-                    self.root.after(0, lambda: self.status_text.set("Pipeline Complete!"))
-                    self.root.after(
-                        0,
-                        lambda: (
-                            self.pipeline_progress_bar.set(1.0),
-                            self.pipeline_status_label.configure(text="Pipeline Complete!"),
-                        ),
-                    )
+                    self.root.after(0, lambda: self.pipeline_progress_bar.set(1.0))
                 except Exception as e:
-                    error_msg = f"Error during processing: {str(e)}"
                     self.logger.error(f"Error in pipeline processing: {e}", exc_info=True)
-                    self.root.after(0, lambda: self.status_text.set(error_msg))
-                    self.root.after(0, lambda: self.pipeline_status_label.configure(text="Error during processing"))
+                    report.processing_error = str(e)
 
         except Exception as e:
-            error_msg = f"Pipeline Error: {str(e)}"
             self.logger.error(f"Error in pipeline: {e}", exc_info=True)
-            self.root.after(0, lambda: self.status_text.set(error_msg))
-            self.root.after(0, lambda: self.pipeline_status_label.configure(text="Pipeline Error"))
+            report.processing_error = f"pipeline error: {e}"
         finally:
+            if self._error_capture is not None:
+                logging.getLogger().removeHandler(self._error_capture)
+                self._error_capture = None
+            self.root.after(0, self._show_pipeline_report)
             self.batch_fetch_active = False
             self._current_platform_key = None
             self.root.after(0, lambda: self.run_full_pipeline_button.configure(state="normal"))
@@ -2576,14 +2815,17 @@ class AdsReportFetcherApp:
             width=140,
             height=28,
             font=ctk.CTkFont(size=10, weight="bold"),
-            fg_color="#B8860B",
-            hover_color="#996F09",
+            **ui.WARNING_BTN,
         )
         # Created but not packed; revealed only on a token-expiry error.
         self._reauth_buttons[platform] = btn
 
     def _show_reauth_button(self, platform: str) -> None:
-        """Reveal the platform's Re-authenticate button (thread-safe)."""
+        """Reveal the platform's Re-authenticate button (thread-safe) and flag the run result."""
+        if self._pipeline_report is not None and self.batch_fetch_active:
+            result = self._pipeline_report.platform(f"{platform} Ads")
+            result.token_expired = True
+            result.error = result.error or "token expired"
         btn = self._reauth_buttons.get(platform)
         if btn is not None:
             self.root.after(0, lambda: btn.pack(anchor="w", padx=10, pady=(0, 8)))
@@ -2659,7 +2901,7 @@ class AdsReportFetcherApp:
             if getattr(self, "_current_platform_key", None) == "Microsoft":
                 self._report_pipeline_platform_progress("Microsoft", 0, pipeline_total)
             # Current range
-            df = fetcher.fetch_month_data(start_date, end_date)
+            df = self._fetch_range("Microsoft Ads", "current", fetcher.fetch_month_data, start_date, end_date)
             if df is not None and not df.empty:
                 fn = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
                 out = out_dir / fn
@@ -2674,7 +2916,9 @@ class AdsReportFetcherApp:
             if self.main_pull_prior_year_var.get():
                 prior_start = start_date - relativedelta(years=1)
                 prior_end = end_date - relativedelta(years=1)
-                df_prior = fetcher.fetch_month_data(prior_start, prior_end)
+                df_prior = self._fetch_range(
+                    "Microsoft Ads", "prior year", fetcher.fetch_month_data, prior_start, prior_end
+                )
                 if df_prior is not None and not df_prior.empty:
                     fn_prior = f"{prior_start.strftime('%Y-%m-%d')}_{prior_end.strftime('%Y-%m-%d')}.csv"
                     out_prior = out_dir / fn_prior
@@ -2741,7 +2985,7 @@ class AdsReportFetcherApp:
             if getattr(self, "_current_platform_key", None) == "TikTok":
                 self._report_pipeline_platform_progress("TikTok", 0, pipeline_total)
             # Current range
-            df = fetcher.fetch_month_data(start_date, end_date)
+            df = self._fetch_range("TikTok Ads", "current", fetcher.fetch_month_data, start_date, end_date)
             if df is not None and not df.empty:
                 fn = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
                 out = out_dir / fn
@@ -2756,7 +3000,9 @@ class AdsReportFetcherApp:
             if self.main_pull_prior_year_var.get():
                 prior_start = start_date - relativedelta(years=1)
                 prior_end = end_date - relativedelta(years=1)
-                df_prior = fetcher.fetch_month_data(prior_start, prior_end)
+                df_prior = self._fetch_range(
+                    "TikTok Ads", "prior year", fetcher.fetch_month_data, prior_start, prior_end
+                )
                 if df_prior is not None and not df_prior.empty:
                     fn_prior = f"{prior_start.strftime('%Y-%m-%d')}_{prior_end.strftime('%Y-%m-%d')}.csv"
                     out_prior = out_dir / fn_prior
@@ -2824,7 +3070,7 @@ class AdsReportFetcherApp:
             if getattr(self, "_current_platform_key", None) == "Reddit":
                 self._report_pipeline_platform_progress("Reddit", 0, pipeline_total)
             # Current range
-            df = fetcher.fetch_month_data(start_date, end_date)
+            df = self._fetch_range("Reddit Ads", "current", fetcher.fetch_month_data, start_date, end_date)
             if df is not None and not df.empty:
                 fn = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
                 out = out_dir / fn
@@ -2839,7 +3085,9 @@ class AdsReportFetcherApp:
             if self.main_pull_prior_year_var.get():
                 prior_start = start_date - relativedelta(years=1)
                 prior_end = end_date - relativedelta(years=1)
-                df_prior = fetcher.fetch_month_data(prior_start, prior_end)
+                df_prior = self._fetch_range(
+                    "Reddit Ads", "prior year", fetcher.fetch_month_data, prior_start, prior_end
+                )
                 if df_prior is not None and not df_prior.empty:
                     fn_prior = f"{prior_start.strftime('%Y-%m-%d')}_{prior_end.strftime('%Y-%m-%d')}.csv"
                     out_prior = out_dir / fn_prior
@@ -2919,7 +3167,8 @@ class AdsReportFetcherApp:
         self.status_text.set(status_msg)
         self.logger.info(status_msg)
 
-        # Update checklist statuses after clearing
+        # Old run results refer to files that are gone now
+        self._clear_pipeline_report()
         self._update_checklist_statuses()
 
         # Also log to GUI log box
@@ -2937,14 +3186,9 @@ class AdsReportFetcherApp:
 
         # Reset Main tab (date range unlocked)
         self.date_range_locked = False
-        if hasattr(self, "start_month_menu") and self.start_month_menu is not None:
-            self.start_month_menu.configure(state="normal")
-            self.start_year_menu.configure(state="normal")
-            self.end_month_menu.configure(state="normal")
-            self.end_year_menu.configure(state="normal")
-        if hasattr(self, "main_pull_prior_year_cb") and self.main_pull_prior_year_cb is not None:
-            self.main_pull_prior_year_cb.configure(state="normal")
-        self.confirm_date_btn.configure(text="Confirm Date Range", state="normal")
+        self._set_date_inputs_enabled(True)
+        self._clear_pipeline_report()
+        self.confirm_date_btn.configure(text="Confirm Date Range", state="normal", **ui.PRIMARY_BTN)
         self.unlock_date_btn.configure(state="disabled")
         self.progress_bar.set(0)
         self.progress_percent_label.configure(text="0%")
@@ -3049,7 +3293,7 @@ class AdsReportFetcherApp:
             if getattr(self, "_current_platform_key", None) == "Google":
                 self._report_pipeline_platform_progress("Google", 0, pipeline_total)
             # Current range
-            df = fetcher.fetch_month_data(start_date, end_date)
+            df = self._fetch_range("Google Ads", "current", fetcher.fetch_month_data, start_date, end_date)
             if df is not None and not df.empty:
                 fn = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
                 out = out_dir / fn
@@ -3064,7 +3308,9 @@ class AdsReportFetcherApp:
             if self.main_pull_prior_year_var.get():
                 prior_start = start_date - relativedelta(years=1)
                 prior_end = end_date - relativedelta(years=1)
-                df_prior = fetcher.fetch_month_data(prior_start, prior_end)
+                df_prior = self._fetch_range(
+                    "Google Ads", "prior year", fetcher.fetch_month_data, prior_start, prior_end
+                )
                 if df_prior is not None and not df_prior.empty:
                     fn_prior = f"{prior_start.strftime('%Y-%m-%d')}_{prior_end.strftime('%Y-%m-%d')}.csv"
                     out_prior = out_dir / fn_prior
@@ -3126,7 +3372,7 @@ class AdsReportFetcherApp:
             while True:
                 try:
                     # Current range
-                    df = do_fetch(start_date, end_date)
+                    df = self._fetch_range("Meta Ads", "current", do_fetch, start_date, end_date)
                     if df is not None and not df.empty:
                         fn = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
                         (out_dir / fn).parent.mkdir(parents=True, exist_ok=True)
@@ -3141,7 +3387,7 @@ class AdsReportFetcherApp:
                     if self.main_pull_prior_year_var.get():
                         prior_start = start_date - relativedelta(years=1)
                         prior_end = end_date - relativedelta(years=1)
-                        df_prior = do_fetch(prior_start, prior_end)
+                        df_prior = self._fetch_range("Meta Ads", "prior year", do_fetch, prior_start, prior_end)
                         if df_prior is not None and not df_prior.empty:
                             fn_prior = f"{prior_start.strftime('%Y-%m-%d')}_{prior_end.strftime('%Y-%m-%d')}.csv"
                             df_prior.to_csv(out_dir / fn_prior, index=False)
@@ -3446,8 +3692,7 @@ class AdsReportFetcherApp:
                 width=120,
                 height=35,
                 font=ctk.CTkFont(size=12, weight="bold"),
-                fg_color="green",
-                hover_color="darkgreen",
+                **ui.PRIMARY_BTN,
             )
             ok_btn.pack(side="left", padx=10)
 
@@ -3458,8 +3703,7 @@ class AdsReportFetcherApp:
                 width=120,
                 height=35,
                 font=ctk.CTkFont(size=12),
-                fg_color="gray",
-                hover_color="darkgray",
+                **ui.SECONDARY_BTN,
             )
             cancel_btn.pack(side="left", padx=10)
 
@@ -3541,8 +3785,7 @@ class AdsReportFetcherApp:
                 width=110,
                 height=40,
                 font=ctk.CTkFont(size=14, weight="bold"),
-                fg_color="green",
-                hover_color="darkgreen",
+                **ui.PRIMARY_BTN,
             )
             bottom_btn.pack(side="left", padx=4)
 
@@ -3553,8 +3796,7 @@ class AdsReportFetcherApp:
                 width=140,
                 height=40,
                 font=ctk.CTkFont(size=12, weight="bold"),
-                fg_color="orange",
-                hover_color="darkorange",
+                **ui.SECONDARY_BTN,
             )
             skip_btn.pack(side="left", padx=4)
 
@@ -3565,8 +3807,7 @@ class AdsReportFetcherApp:
                 width=150,
                 height=40,
                 font=ctk.CTkFont(size=12, weight="bold"),
-                fg_color="red",
-                hover_color="darkred",
+                **ui.DANGER_BTN,
             )
             always_ignore_btn.pack(side="left", padx=4)
 
@@ -3701,8 +3942,7 @@ class AdsReportFetcherApp:
             command=dialog.destroy,
             width=100,
             font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         )
         cancel_btn.pack(side="left", padx=10)
 
@@ -3797,8 +4037,7 @@ class AdsReportFetcherApp:
             command=dialog.destroy,
             width=100,
             font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         )
         cancel_btn.pack(side="left", padx=10)
 
@@ -4056,8 +4295,7 @@ class AdsReportFetcherApp:
             command=dialog.destroy,
             width=100,
             font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         )
         cancel_btn.pack(side="left", padx=10)
 
@@ -4168,8 +4406,7 @@ class AdsReportFetcherApp:
             command=dialog.destroy,
             width=100,
             font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         )
         cancel_btn.pack(side="left", padx=10)
 
@@ -4280,8 +4517,7 @@ class AdsReportFetcherApp:
             command=dialog.destroy,
             width=100,
             font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         ).pack(side="left", padx=10)
 
     def _on_settings_edit_ms_favorite(self) -> None:
@@ -4329,8 +4565,7 @@ class AdsReportFetcherApp:
             command=dialog.destroy,
             width=100,
             font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         ).pack(side="left", padx=10)
 
     def _on_settings_delete_ms_favorite(self) -> None:
@@ -4389,8 +4624,7 @@ class AdsReportFetcherApp:
             command=dialog.destroy,
             width=100,
             font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         ).pack(side="left", padx=10)
 
     def _on_settings_edit_tiktok_favorite(self) -> None:
@@ -4438,8 +4672,7 @@ class AdsReportFetcherApp:
             command=dialog.destroy,
             width=100,
             font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         ).pack(side="left", padx=10)
 
     def _on_settings_delete_tiktok_favorite(self) -> None:
@@ -4499,8 +4732,7 @@ class AdsReportFetcherApp:
             width=120,
             height=36,
             font=ctk.CTkFont(size=12, weight="bold"),
-            fg_color="green",
-            hover_color="darkgreen",
+            **ui.PRIMARY_BTN,
         ).pack(side="left", padx=10)
         ctk.CTkButton(
             btn_f,
@@ -4509,8 +4741,7 @@ class AdsReportFetcherApp:
             width=120,
             height=36,
             font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         ).pack(side="left", padx=10)
         dialog.update_idletasks()
         x = max(0, (dialog.winfo_screenwidth() - 450) // 2)
@@ -4562,8 +4793,7 @@ class AdsReportFetcherApp:
             command=dialog.destroy,
             width=100,
             font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         ).pack(side="left", padx=10)
 
     def _on_settings_delete_reddit_favorite(self) -> None:
@@ -4622,8 +4852,7 @@ class AdsReportFetcherApp:
             command=dialog.destroy,
             width=100,
             font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         ).pack(side="left", padx=10)
 
     def _on_settings_edit_pinterest_favorite(self) -> None:
@@ -4671,8 +4900,7 @@ class AdsReportFetcherApp:
             command=dialog.destroy,
             width=100,
             font=ctk.CTkFont(size=12),
-            fg_color="gray",
-            hover_color="darkgray",
+            **ui.SECONDARY_BTN,
         ).pack(side="left", padx=10)
 
     def _on_settings_delete_pinterest_favorite(self) -> None:
