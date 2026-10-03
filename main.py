@@ -3,6 +3,7 @@ Ads Report Fetcher - GUI Entry Point
 Main window for the desktop application (Multi-Platform).
 """
 
+import json
 import logging
 import os
 import queue
@@ -19,16 +20,11 @@ from typing import Dict, List, Optional, Tuple
 import customtkinter as ctk
 from dateutil.relativedelta import relativedelta
 
-try:
-    from tkcalendar import DateEntry
-except ImportError:
-    DateEntry = None  # optional: fallback to month/year dropdowns if not installed
-import json
-
 import ui_theme as ui
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
 from api_fetcher import AdsApiFetcher
 from constants import DIALOG_WAIT_SECONDS, META_RETENTION_MONTHS, PIPELINE_FETCH_WAIT_SECONDS
+from date_entry import DateEntry  # None when tkcalendar isn't installed (falls back to month/year dropdowns)
 from date_presets import PRESETS, preset_range
 from meta_fetcher import MetaAdsFetcher, MetaTokenExpiredError
 from microsoft_fetcher import MicrosoftAdsFetcher
@@ -579,7 +575,7 @@ class AdsReportFetcherApp:
             entry_kw = dict(
                 date_pattern="y-mm-dd",
                 mindate=datetime(now.year - 4, 1, 1),
-                maxdate=datetime(now.year + 1, 12, 31),
+                maxdate=now,  # no ad data exists for future dates
                 width=12,
                 font=(ui.FONT_FAMILY, 10),
                 style="App.DateEntry",
@@ -593,6 +589,9 @@ class AdsReportFetcherApp:
             )
             self.main_end_cal = DateEntry(date_row, **entry_kw, **self._date_calendar_colors())
             self.main_end_cal.pack(side="left", ipady=3)
+            # Keep start <= end: picking one past the other moves the other to match
+            self.main_start_cal.bind("<<DateEntrySelected>>", lambda e: self._keep_date_order(changed="start"))
+            self.main_end_cal.bind("<<DateEntrySelected>>", lambda e: self._keep_date_order(changed="end"))
             self._set_main_dates_default()
         else:
             for label, month_var, year_var, attr in (
@@ -2053,6 +2052,20 @@ class AdsReportFetcherApp:
         if announce:
             self.status_text.set(f"Date range set to {name.lower()}: {start:%Y-%m-%d} → {end:%Y-%m-%d}")
 
+    def _keep_date_order(self, changed: str) -> None:
+        """If the start date is now after the end date (or vice versa), move the other one to match."""
+        if self.main_start_cal is None or self.main_end_cal is None:
+            return
+        start, end = self.main_start_cal.get_date(), self.main_end_cal.get_date()
+        if start <= end:
+            return
+        if changed == "start":
+            self.main_end_cal.set_date(start)
+            self.status_text.set(f"End date moved to {start:%Y-%m-%d} to match the new start date")
+        else:
+            self.main_start_cal.set_date(end)
+            self.status_text.set(f"Start date moved to {end:%Y-%m-%d} to match the new end date")
+
     def _date_calendar_colors(self) -> Dict[str, str]:
         """Colors for the drop-down calendar of each DateEntry (plain Tk, so resolved per theme)."""
         r = ui.resolve
@@ -2074,6 +2087,9 @@ class AdsReportFetcherApp:
             selectforeground="#FFFFFF",
             disabledbackground=r(ui.SURFACE),
             disabledforeground=r(ui.TEXT_MUTED),
+            # days after today (maxdate) are disabled; keep them on the theme surface, dimmed
+            disableddaybackground=r(ui.SURFACE),
+            disableddayforeground=r(ui.TEXT_MUTED),
         )
 
     def _style_date_entries(self) -> None:
