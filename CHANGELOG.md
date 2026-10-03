@@ -44,6 +44,7 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ### Fixed
 
+- **Date picker arrows sometimes closed the calendar** instead of changing the month or year. tkcalendar 1.5's `DateEntry` closes its drop-down whenever the calendar loses focus, and on Windows clicking the ◂ ▸ buttons sometimes triggers that. The new `date_entry.DateEntry` only closes the drop-down when the pointer is outside it. Dates are also capped at today, so you can't pick a future start date anymore. Picking a start after the end, or an end before the start, now moves the other date to match instead of showing an error.
 - **"No existing data" while data existed:** the data check only looked at the Google and Meta raw folders plus merged and ready, so Microsoft/TikTok/Reddit-only or processed-only data went unnoticed, and Clear/Process stayed disabled. It now checks every CSV in all four folders.
 - **New Fetch left the date pickers disabled:** it re-enabled only the fallback month/year dropdowns, not the calendars. Locking, unlocking and New Fetch now share one helper that enables or disables all the date controls together.
 - **YoY ready-report column order**: metrics are now interleaved side-by-side per metric (`Impressions (2026)`, `Impressions (2025)`, `Clicks (2026)`, `Clicks (2025)`, …) instead of one block per year, matching TECHNICAL_OVERVIEW. Ordering is handled by the new `processor.interleave_period_columns()`, which parses `<Metric> (<period>)` headers dynamically, with no hardcoded years, and supports any number of periods.
