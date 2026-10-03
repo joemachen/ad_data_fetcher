@@ -166,7 +166,10 @@ def main() -> int:
     config = load_config(yaml_path)
     out = {
         "client_key": (config.get("client_key") or config.get("app_id") or client_key) or "",
-        "client_secret": (config.get("client_secret") or config.get("app_secret") or config.get("secret") or client_secret) or "",
+        "client_secret": (
+            config.get("client_secret") or config.get("app_secret") or config.get("secret") or client_secret
+        )
+        or "",
         "redirect_uri": TIKTOK_REDIRECT_URI,
         "access_token": access_token,
         "refresh_token": refresh_token or (config.get("refresh_token") or ""),

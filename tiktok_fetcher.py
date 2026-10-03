@@ -4,7 +4,8 @@ Loads config from tiktok-ads.yaml (client_key, client_secret, access_token, refr
 Uses OAuth2 token refresh for 24-hour token expiry.
 Calls TikTok Marketing API v1.3 report/integrated/get:
   GET https://business-api.tiktok.com/open_api/v1.3/report/integrated/get/
-  data_level=AUCTION_CAMPAIGN, dimensions=[stat_time_day, campaign_id], metrics=[spend, impressions, clicks, conversion, ctr, cpc]
+  data_level=AUCTION_CAMPAIGN, dimensions=[stat_time_day, campaign_id],
+  metrics=[spend, impressions, clicks, conversion, ctr, cpc]
 Resolves campaign_id to campaign_name via campaigns list API.
 Saves raw_reports/tiktok/YYYY-MM-DD_YYYY-MM-DD.csv with: campaign_name, spend, impressions, clicks, conversion, revenue.
 """
@@ -15,15 +16,15 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, Callable, Dict, Any, List
+from typing import Any, Callable, Dict, List, Optional
 
 import pandas as pd
 import yaml
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
-from utils import TokenExpiredError
+from utils import RETRY_MAX_ATTEMPTS, TokenExpiredError, backoff_delay, http_retry_after
 
 TIKTOK_REDIRECT_URI = "https://mabelslabels.com/tiktok-callback"
 TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
@@ -31,9 +32,27 @@ TIKTOK_REPORT_BASE = "https://business-api.tiktok.com/open_api/v1.3/report/integ
 TIKTOK_CAMPAIGNS_URL = "https://business-api.tiktok.com/open_api/v1.3/campaign/get/"
 
 # Retries for transient API errors (5xx, 429)
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 2  # seconds
+MAX_RETRIES = RETRY_MAX_ATTEMPTS
 RETRYABLE_HTTP_CODES = (429, 500, 502, 503, 504)
+# TikTok also reports errors as HTTP 200 with a non-zero JSON "code":
+# 40100 = too many requests, 50000 = system error, 50002 = service temporarily unavailable.
+RETRYABLE_API_CODES = {40100, 50000, 50002}
+
+
+class TikTokApiError(Exception):
+    """Non-zero "code" in a TikTok API response body."""
+
+    def __init__(self, code: Any, message: str = "", request_id: str = ""):
+        super().__init__(f"TikTok API error {code}: {message} [request_id={request_id}]")
+        self.code = code
+        self.request_id = request_id
+
+
+def _check_api_code(body: Any) -> Any:
+    """Return body if TikTok reported success (code 0 or absent); raise TikTokApiError otherwise."""
+    if isinstance(body, dict) and body.get("code") not in (None, 0, "0"):
+        raise TikTokApiError(body.get("code"), str(body.get("message", "")), str(body.get("request_id", "")))
+    return body
 
 # Raw CSV columns for TikTok; processor maps these to INTERNAL_SCHEMA
 OUTPUT_COLUMNS = [
@@ -76,7 +95,9 @@ class TikTokAdsFetcher:
         with open(yaml_path, "r", encoding="utf-8") as f:
             self.config = yaml.safe_load(f) or {}
         ck = (self.config.get("client_key") or self.config.get("app_id") or "").strip()
-        self.logger.info("TikTok Ads config loaded (client_key prefix: %s)", (ck[:8] + "…") if len(ck) > 8 else ck or "missing")
+        self.logger.info(
+            "TikTok Ads config loaded (client_key prefix: %s)", (ck[:8] + "…") if len(ck) > 8 else ck or "missing"
+        )
 
     def _update_status(self, message: str) -> None:
         if self.status_callback:
@@ -91,17 +112,21 @@ class TikTokAdsFetcher:
         if self._access_token:
             return self._access_token
         client_key = (self.config.get("client_key") or self.config.get("app_id") or "").strip()
-        client_secret = (self.config.get("client_secret") or self.config.get("app_secret") or self.config.get("secret") or "").strip()
+        client_secret = (
+            self.config.get("client_secret") or self.config.get("app_secret") or self.config.get("secret") or ""
+        ).strip()
         refresh_token = (self.config.get("refresh_token") or "").strip()
         access_token = (self.config.get("access_token") or "").strip()
         if refresh_token and client_key and client_secret:
             # Prefer refresh flow
-            data = urllib.parse.urlencode({
-                "client_key": client_key,
-                "client_secret": client_secret,
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-            }).encode("utf-8")
+            data = urllib.parse.urlencode(
+                {
+                    "client_key": client_key,
+                    "client_secret": client_secret,
+                    "grant_type": "refresh_token",
+                    "refresh_token": refresh_token,
+                }
+            ).encode("utf-8")
             req = urllib.request.Request(
                 TIKTOK_TOKEN_URL,
                 data=data,
@@ -123,7 +148,9 @@ class TikTokAdsFetcher:
             except urllib.error.HTTPError as e:
                 err_body = (e.fp.read().decode() if e.fp else "")[:300]
                 self.logger.error(f"TikTok token refresh failed: {e.code} {err_body}")
-                raise TokenExpiredError(f"TikTok token refresh failed: {e.code}. Re-run setup_tiktok_auth.py.", platform="TikTok") from e
+                raise TokenExpiredError(
+                    f"TikTok token refresh failed: {e.code}. Re-run setup_tiktok_auth.py.", platform="TikTok"
+                ) from e
             except Exception as e:
                 self.logger.error(f"TikTok token refresh failed: {e}", exc_info=True)
                 raise RuntimeError(f"TikTok token refresh failed: {e}") from e
@@ -135,9 +162,15 @@ class TikTokAdsFetcher:
             "Access tokens expire in 24 hours; refresh_token is used to obtain new ones."
         )
 
-    def _api_request(self, url: str, method: str = "GET", data: Optional[bytes] = None, extra_headers: Optional[Dict[str, str]] = None) -> Any:
-        last_error = None
+    def _api_request(
+        self,
+        url: str,
+        method: str = "GET",
+        data: Optional[bytes] = None,
+        extra_headers: Optional[Dict[str, str]] = None,
+    ) -> Any:
         for attempt in range(MAX_RETRIES):
+            last_attempt = attempt >= MAX_RETRIES - 1
             try:
                 token = self._get_access_token()
                 headers = {
@@ -151,41 +184,59 @@ class TikTokAdsFetcher:
                 for k, v in headers.items():
                     req.add_header(k, v)
                 with urllib.request.urlopen(req, timeout=60) as resp:
-                    return json.loads(resp.read().decode())
+                    return _check_api_code(json.loads(resp.read().decode()))
+            except TikTokApiError as e:
+                try:
+                    code = int(e.code)
+                except (TypeError, ValueError):
+                    code = None
+                if code not in RETRYABLE_API_CODES or last_attempt:
+                    self.logger.error("%s", e)
+                    raise
+                delay = backoff_delay(attempt)
+                self.logger.warning("%s (attempt %s/%s), retrying in %.1fs", e, attempt + 1, MAX_RETRIES, delay)
+                time.sleep(delay)
             except urllib.error.HTTPError as e:
-                last_error = e
                 if e.code == 401:
                     self._access_token = None
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(RETRY_BACKOFF_BASE)
+                    if not last_attempt:
+                        time.sleep(backoff_delay(attempt))
                         continue
-                    raise TokenExpiredError("TikTok 401 Unauthorized. Token may have expired. Re-run setup_tiktok_auth.py.", platform="TikTok") from e
-                if e.code in RETRYABLE_HTTP_CODES and attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
-                    self.logger.warning("TikTok API %s (attempt %s/%s), retrying in %ss", e.code, attempt + 1, MAX_RETRIES, delay)
-                    time.sleep(delay)
-                else:
+                    raise TokenExpiredError(
+                        "TikTok 401 Unauthorized. Token may have expired. Re-run setup_tiktok_auth.py.",
+                        platform="TikTok",
+                    ) from e
+                if e.code not in RETRYABLE_HTTP_CODES or last_attempt:
                     raise
+                delay = backoff_delay(attempt, retry_after=http_retry_after(e))
+                self.logger.warning(
+                    "TikTok API %s (attempt %s/%s), retrying in %.1fs", e.code, attempt + 1, MAX_RETRIES, delay
+                )
+                time.sleep(delay)
             except (urllib.error.URLError, OSError) as e:
-                last_error = e
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
-                    self.logger.warning("TikTok API connection error (attempt %s/%s), retrying: %s", attempt + 1, MAX_RETRIES, e)
-                    time.sleep(delay)
-                else:
+                if last_attempt:
                     raise
-        if last_error:
-            raise last_error
-        return None
+                delay = backoff_delay(attempt)
+                self.logger.warning(
+                    "TikTok API connection error (attempt %s/%s), retrying in %.1fs: %s",
+                    attempt + 1,
+                    MAX_RETRIES,
+                    delay,
+                    e,
+                )
+                time.sleep(delay)
+        raise RuntimeError(f"TikTok API request failed after {MAX_RETRIES} attempts")
 
     def _fetch_campaign_name_map(self) -> Dict[str, str]:
         """Fetch campaign id -> name for the advertiser. Returns {} on failure."""
         try:
-            params = urllib.parse.urlencode({
-                "advertiser_id": self.advertiser_id,
-                "page": 1,
-                "page_size": 1000,
-            })
+            params = urllib.parse.urlencode(
+                {
+                    "advertiser_id": self.advertiser_id,
+                    "page": 1,
+                    "page_size": 1000,
+                }
+            )
             url = f"{TIKTOK_CAMPAIGNS_URL}?{params}"
             raw = self._api_request(url)
             out: Dict[str, str] = {}
@@ -221,15 +272,17 @@ class TikTokAdsFetcher:
         # TikTok API may expect YYYYMMDD; try both formats - docs vary
         start_compact = start_date.strftime("%Y%m%d")
         end_compact = end_date.strftime("%Y%m%d")
-        params = urllib.parse.urlencode({
-            "advertiser_id": self.advertiser_id,
-            "report_type": "BASIC",
-            "data_level": "AUCTION_CAMPAIGN",
-            "dimensions": json.dumps(["stat_time_day", "campaign_id"]),
-            "metrics": json.dumps(["spend", "impressions", "clicks", "conversion", "ctr", "cpc"]),
-            "start_date": start_compact,
-            "end_date": end_compact,
-        })
+        params = urllib.parse.urlencode(
+            {
+                "advertiser_id": self.advertiser_id,
+                "report_type": "BASIC",
+                "data_level": "AUCTION_CAMPAIGN",
+                "dimensions": json.dumps(["stat_time_day", "campaign_id"]),
+                "metrics": json.dumps(["spend", "impressions", "clicks", "conversion", "ctr", "cpc"]),
+                "start_date": start_compact,
+                "end_date": end_compact,
+            }
+        )
         url = f"{TIKTOK_REPORT_BASE}?{params}"
         self.logger.info("TikTok report: GET %s (dates %s to %s)", TIKTOK_REPORT_BASE[:60], start_str, end_str)
         try:
@@ -240,7 +293,10 @@ class TikTokAdsFetcher:
         return self._parse_report_response(raw, start_str, end_str)
 
     def _parse_report_response(self, raw: Any, start_str: str, end_str: str) -> Optional[List[Dict]]:
-        """Parse TikTok report response into rows with campaign_name, spend, impressions, clicks, conversion, revenue."""
+        """Parse TikTok report response into rows.
+
+        Row keys: campaign_name, spend, impressions, clicks, conversion, revenue.
+        """
         if not isinstance(raw, dict):
             return None
         data = raw.get("data")
@@ -260,15 +316,17 @@ class TikTokAdsFetcher:
             clicks = _to_float(item.get("clicks") or 0)
             conversion = _to_float(item.get("conversion") or 0)
             revenue = _to_float(item.get("total_purchase_value") or item.get("conversion_value") or 0)
-            rows.append({
-                "campaign_id": str(cid) if cid else "",
-                "campaign_name": str(cid) if cid else "",
-                "spend": spend,
-                "impressions": impressions,
-                "clicks": clicks,
-                "conversion": conversion,
-                "revenue": revenue,
-            })
+            rows.append(
+                {
+                    "campaign_id": str(cid) if cid else "",
+                    "campaign_name": str(cid) if cid else "",
+                    "spend": spend,
+                    "impressions": impressions,
+                    "clicks": clicks,
+                    "conversion": conversion,
+                    "revenue": revenue,
+                }
+            )
         if rows:
             name_map = self._fetch_campaign_name_map()
             if name_map:

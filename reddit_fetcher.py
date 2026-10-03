@@ -3,7 +3,8 @@ Reddit Ads API Report Fetcher
 Loads config from reddit-ads.yaml (client_id, client_secret, refresh_token).
 Calls Reddit Ads API v3 "Get A Report":
   POST https://ads-api.reddit.com/api/v3/ad_accounts/{ad_account_id}/reports
-  Fields: SPEND, IMPRESSIONS, CLICKS, CONVERSION_PURCHASE_CLICKS, CONVERSION_PURCHASE_VIEWS, CONVERSION_PURCHASE_TOTAL_VALUE
+  Fields: SPEND, IMPRESSIONS, CLICKS, CONVERSION_PURCHASE_CLICKS, CONVERSION_PURCHASE_VIEWS,
+  CONVERSION_PURCHASE_TOTAL_VALUE
   Conversions = CONVERSION_PURCHASE_CLICKS + CONVERSION_PURCHASE_VIEWS (computed in fetcher).
 Saves raw_reports/reddit/{month}_{year}.csv with: campaign_name, amount_spent, impressions, clicks,
   conversion_purchase_clicks, conversion_purchase_views, conversion_purchase_total_value, conversions.
@@ -16,23 +17,22 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Tuple, Callable, Dict, Any
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import pandas as pd
 import yaml
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
-from utils import TokenExpiredError
+from utils import RETRY_MAX_ATTEMPTS, TokenExpiredError, backoff_delay, http_retry_after
 
 REDDIT_USER_AGENT = "AdsReportFetcher/1.0 (Desktop; Python)"
 REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 REDDIT_REDIRECT_URI = "http://127.0.0.1:8765/reddit_oauth"
 
 # Retries for transient API errors (5xx, 429 rate limit)
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 2  # seconds
+MAX_RETRIES = RETRY_MAX_ATTEMPTS
 RETRYABLE_HTTP_CODES = (429, 500, 502, 503, 504)
 
 # Reddit Ads API base URLs to try (v2, v2.0, v3)
@@ -80,11 +80,15 @@ class RedditAdsFetcher:
     def _load_config(self) -> None:
         yaml_path = _APP_DIR / "reddit-ads.yaml"
         if not yaml_path.exists():
-            raise FileNotFoundError("reddit-ads.yaml not found. Add client_id, client_secret, refresh_token (run setup_reddit_auth.py).")
+            raise FileNotFoundError(
+                "reddit-ads.yaml not found. Add client_id, client_secret, refresh_token (run setup_reddit_auth.py)."
+            )
         with open(yaml_path, "r", encoding="utf-8") as f:
             self.config = yaml.safe_load(f) or {}
         cid = (self.config.get("client_id") or self.config.get("app_id") or "").strip()
-        self.logger.info("Reddit Ads config loaded (client_id prefix: %s)", (cid[:8] + "…") if len(cid) > 8 else cid or "missing")
+        self.logger.info(
+            "Reddit Ads config loaded (client_id prefix: %s)", (cid[:8] + "…") if len(cid) > 8 else cid or "missing"
+        )
 
     def _update_status(self, message: str) -> None:
         if self.status_callback:
@@ -108,18 +112,24 @@ class RedditAdsFetcher:
                 "Run setup_reddit_auth.py and add the printed refresh_token to the file."
             )
         redirect_uri = (self.config.get("redirect_uri") or REDDIT_REDIRECT_URI).strip()
-        data = urllib.parse.urlencode({
-            "grant_type": "refresh_token",
-            "refresh_token": refresh_token,
-            "redirect_uri": redirect_uri,
-        }).encode("utf-8")
+        data = urllib.parse.urlencode(
+            {
+                "grant_type": "refresh_token",
+                "refresh_token": refresh_token,
+                "redirect_uri": redirect_uri,
+            }
+        ).encode("utf-8")
         req = urllib.request.Request(
             REDDIT_TOKEN_URL,
             data=data,
             method="POST",
             headers={"Content-Type": "application/x-www-form-urlencoded", "User-Agent": REDDIT_USER_AGENT},
         )
-        creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode() if client_secret else base64.b64encode(f"{client_id}:".encode()).decode()
+        creds = (
+            base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+            if client_secret
+            else base64.b64encode(f"{client_id}:".encode()).decode()
+        )
         req.add_header("Authorization", f"Basic {creds}")
         try:
             with urllib.request.urlopen(req, timeout=30) as resp:
@@ -129,14 +139,21 @@ class RedditAdsFetcher:
             self.logger.error(f"Reddit token refresh failed: {e.code} {err_body}")
             if e.code == 401:
                 self.logger.error(
-                    "Reddit 401 Unauthorized: Check reddit-ads.yaml — use keys client_id and client_secret (not app_id/app_secret). "
-                    "Ensure client_id is the string under your app name, client_secret is the 'secret', and refresh_token is the full token from setup_reddit_auth.py. "
+                    "Reddit 401 Unauthorized: Check reddit-ads.yaml — "
+                    "use keys client_id and client_secret (not app_id/app_secret). "
+                    "Ensure client_id is the string under your app name, client_secret is the 'secret', "
+                    "and refresh_token is the full token from setup_reddit_auth.py. "
                     "Re-run 'python setup_reddit_auth.py' to get a new refresh_token and paste it into reddit-ads.yaml."
                 )
-            raise TokenExpiredError(f"Reddit token refresh failed: {e.code}. Re-run setup_reddit_auth.py to get a new refresh_token.", platform="Reddit") from e
+            raise TokenExpiredError(
+                f"Reddit token refresh failed: {e.code}. Re-run setup_reddit_auth.py to get a new refresh_token.",
+                platform="Reddit",
+            ) from e
         token = body.get("access_token")
         if not token:
-            raise TokenExpiredError("No access_token in Reddit response. Re-run setup_reddit_auth.py.", platform="Reddit")
+            raise TokenExpiredError(
+                "No access_token in Reddit response. Re-run setup_reddit_auth.py.", platform="Reddit"
+            )
         self._access_token = token
         return token
 
@@ -156,8 +173,8 @@ class RedditAdsFetcher:
         }
 
     def _api_request(self, url: str, method: str = "GET", data: Optional[bytes] = None) -> Any:
-        last_error = None
         for attempt in range(MAX_RETRIES):
+            last_attempt = attempt >= MAX_RETRIES - 1
             try:
                 req = urllib.request.Request(url, data=data, method=method, headers=self._headers())
                 if data:
@@ -165,7 +182,6 @@ class RedditAdsFetcher:
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     return json.loads(resp.read().decode())
             except urllib.error.HTTPError as e:
-                last_error = e
                 if e.code == 401 and attempt == 0:
                     self.logger.info(
                         "Reddit API 401 on attempt %s — access token may have expired; refreshing and retrying",
@@ -173,29 +189,26 @@ class RedditAdsFetcher:
                     )
                     self._access_token = None  # force _get_access_token() to fetch a fresh token
                     continue
-                if e.code in RETRYABLE_HTTP_CODES and attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
-                    self.logger.warning(
-                        "Reddit API %s (attempt %s/%s), retrying in %ss",
-                        e.code, attempt + 1, MAX_RETRIES, delay,
-                    )
-                    time.sleep(delay)
-                else:
+                if e.code not in RETRYABLE_HTTP_CODES or last_attempt:
                     raise
+                delay = backoff_delay(attempt, retry_after=http_retry_after(e))
+                self.logger.warning(
+                    "Reddit API %s (attempt %s/%s), retrying in %.1fs", e.code, attempt + 1, MAX_RETRIES, delay
+                )
+                time.sleep(delay)
             except (urllib.error.URLError, OSError) as e:
-                last_error = e
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
-                    self.logger.warning(
-                        "Reddit API connection error (attempt %s/%s), retrying in %ss: %s",
-                        attempt + 1, MAX_RETRIES, delay, e,
-                    )
-                    time.sleep(delay)
-                else:
+                if last_attempt:
                     raise
-        if last_error:
-            raise last_error
-        return None  # unreachable
+                delay = backoff_delay(attempt)
+                self.logger.warning(
+                    "Reddit API connection error (attempt %s/%s), retrying in %.1fs: %s",
+                    attempt + 1,
+                    MAX_RETRIES,
+                    delay,
+                    e,
+                )
+                time.sleep(delay)
+        raise RuntimeError(f"Reddit API request failed after {MAX_RETRIES} attempts: {url}")
 
     def _fetch_v3_me(self) -> Optional[Dict[str, Any]]:
         """Call GET /api/v3/me to discover profile/ad_account structure; cache result."""
@@ -256,9 +269,7 @@ class RedditAdsFetcher:
             "ad_account_id": self.account_id.strip(),
         }
 
-    def _fetch_v3_get_a_report(
-        self, start_str: str, end_str: str
-    ) -> Tuple[Optional[List[Dict]], Optional[int]]:
+    def _fetch_v3_get_a_report(self, start_str: str, end_str: str) -> Tuple[Optional[List[Dict]], Optional[int]]:
         """
         Call official v3 "Get A Report": POST /api/v3/ad_accounts/{ad_account_id}/reports.
         Returns (rows, http_status). If status is 401, caller should skip fallbacks.
@@ -299,9 +310,7 @@ class RedditAdsFetcher:
                 )
         return (rows, 200)
 
-    def _v3_discover_report_paths(
-        self, start_str: str, end_str: str
-    ) -> List[Tuple[str, str]]:
+    def _v3_discover_report_paths(self, start_str: str, end_str: str) -> List[Tuple[str, str]]:
         """
         Use v3 /me -> profiles -> businesses -> ad_accounts to build report URL paths.
         Returns list of (base_url, path) for GET.
@@ -326,11 +335,25 @@ class RedditAdsFetcher:
             for b in businesses[:3]:
                 bid = b.get("id") if isinstance(b, dict) else None
                 if bid:
-                    out.append((base, f"/businesses/{bid}/ad_accounts/{aid}/report?start_date={start_str}&end_date={end_str}&group_by=campaign"))
-                    out.append((base, f"/businesses/{bid}/ad_accounts/{aid}/analytics/report?start_date={start_str}&end_date={end_str}"))
+                    out.append(
+                        (
+                            base,
+                            f"/businesses/{bid}/ad_accounts/{aid}/report?start_date={start_str}&end_date={end_str}&group_by=campaign",
+                        )
+                    )
+                    out.append(
+                        (
+                            base,
+                            f"/businesses/{bid}/ad_accounts/{aid}/analytics/report?start_date={start_str}&end_date={end_str}",
+                        )
+                    )
         if profile_id:
-            out.append((base, f"/profiles/{profile_id}/report?start_date={start_str}&end_date={end_str}&ad_account_id={aid}"))
-            out.append((base, f"/profiles/{profile_id}/ad_accounts/{aid}/report?start_date={start_str}&end_date={end_str}"))
+            out.append(
+                (base, f"/profiles/{profile_id}/report?start_date={start_str}&end_date={end_str}&ad_account_id={aid}")
+            )
+            out.append(
+                (base, f"/profiles/{profile_id}/ad_accounts/{aid}/report?start_date={start_str}&end_date={end_str}")
+            )
         return out
 
     def _v3_discover_report_post_candidates(
@@ -416,7 +439,10 @@ class RedditAdsFetcher:
         rows, http_status = self._fetch_v3_get_a_report(start_str, end_str)
         if rows:
             # If report returned only campaign IDs (long numeric names), resolve to names via campaigns list
-            if any((r.get("campaign_name") or "").strip().isdigit() and len((r.get("campaign_name") or "").strip()) >= 10 for r in rows):
+            if any(
+                (r.get("campaign_name") or "").strip().isdigit() and len((r.get("campaign_name") or "").strip()) >= 10
+                for r in rows
+            ):
                 name_map = self._fetch_campaign_name_map()
                 if name_map:
                     self._resolve_campaign_names(rows, name_map)
@@ -454,7 +480,10 @@ class RedditAdsFetcher:
             if rows is not None and len(rows) > 0:
                 return rows
             if raw and raw != [] and raw != {}:
-                self.logger.info(f"Reddit API (POST discovered) returned data but no report rows; keys={list(raw.keys())[:15] if isinstance(raw, dict) else 'list'}")
+                self.logger.info(
+                    f"Reddit API (POST discovered) returned data but no report rows; "
+                    f"keys={list(raw.keys())[:15] if isinstance(raw, dict) else 'list'}"
+                )
         # POST to v3 fallback paths (no discovery)
         v3_base = "https://ads-api.reddit.com/api/v3"
         for path in [
@@ -480,7 +509,10 @@ class RedditAdsFetcher:
             if rows is not None and len(rows) > 0:
                 return rows
             if raw and raw != [] and raw != {}:
-                self.logger.info(f"Reddit API (POST v3 fallback) returned data but no report rows; keys={list(raw.keys())[:15] if isinstance(raw, dict) else 'list'}")
+                self.logger.info(
+                    f"Reddit API (POST v3 fallback) returned data but no report rows; "
+                    f"keys={list(raw.keys())[:15] if isinstance(raw, dict) else 'list'}"
+                )
         # Try GET on paths derived from v3 /me (profile -> businesses -> ad_accounts)
         discovered = self._v3_discover_report_paths(start_str, end_str)
         for base_url, path in discovered:
@@ -501,7 +533,10 @@ class RedditAdsFetcher:
             if rows is not None and len(rows) > 0:
                 return rows
             if raw and raw != [] and raw != {}:
-                self.logger.info(f"Reddit API (discovered path) returned data but no report rows; keys={list(raw.keys())[:15] if isinstance(raw, dict) else 'list'}")
+                self.logger.info(
+                    f"Reddit API (discovered path) returned data but no report rows; "
+                    f"keys={list(raw.keys())[:15] if isinstance(raw, dict) else 'list'}"
+                )
         # Fallback: try ad_accounts / accounts paths (GET)
         get_paths = [
             f"/ad_accounts/{account_id}/report?start_date={start_str}&end_date={end_str}&group_by=campaign",
@@ -541,18 +576,20 @@ class RedditAdsFetcher:
                     summary = list(raw.keys())[:15] if isinstance(raw, dict) else f"list(len={len(raw)})"
                     self.logger.info(f"Reddit API returned data but no report rows; response keys: {summary}")
         # Try POST report with JSON body (some APIs use POST for analytics)
-        body = json.dumps({
-            "start_date": start_str,
-            "end_date": end_str,
-            "group_by": "campaign",
-        }).encode("utf-8")
+        body = json.dumps(
+            {
+                "start_date": start_str,
+                "end_date": end_str,
+                "group_by": "campaign",
+            }
+        ).encode("utf-8")
         for base in REDDIT_ADS_BASES:
             for path in [
                 f"/ad_accounts/{account_id}/report",
                 f"/ad_accounts/{account_id}/analytics/report",
                 f"/accounts/{account_id}/report",
                 f"/accounts/{account_id}/analytics/report",
-                f"/report",
+                "/report",
             ]:
                 url = base.rstrip("/") + path
                 try:
@@ -582,7 +619,10 @@ class RedditAdsFetcher:
         return None
 
     def _parse_report_response(self, raw: Any, start_str: str, end_str: str) -> Optional[List[Dict]]:
-        """Parse v3 Get A Report response into row dicts; Conversions = CONVERSION_PURCHASE_CLICKS + CONVERSION_PURCHASE_VIEWS."""
+        """Parse v3 Get A Report response into row dicts.
+
+        Conversions = CONVERSION_PURCHASE_CLICKS + CONVERSION_PURCHASE_VIEWS.
+        """
         if raw is None:
             return None
         rows = []
@@ -595,9 +635,13 @@ class RedditAdsFetcher:
                 data_list = inner.get("metrics") or inner.get("rows") or inner.get("campaigns") or inner.get("items")
             if data_list is None:
                 data_list = (
-                    raw.get("rows") or raw.get("report_rows") or raw.get("results")
-                    or raw.get("items") or raw.get("campaigns")
-                    or (raw.get("report") or {}).get("rows") or (raw.get("report") or {}).get("data")
+                    raw.get("rows")
+                    or raw.get("report_rows")
+                    or raw.get("results")
+                    or raw.get("items")
+                    or raw.get("campaigns")
+                    or (raw.get("report") or {}).get("rows")
+                    or (raw.get("report") or {}).get("data")
                 )
             if data_list is None and isinstance(raw.get("data"), dict):
                 data_list = raw["data"].get("rows") or raw["data"].get("campaigns") or raw["data"].get("items")
@@ -610,8 +654,12 @@ class RedditAdsFetcher:
                 continue
             # Prefer name from breakdown (CAMPAIGN_NAME); fall back to campaign_name, name, or ID
             campaign_name = (
-                item.get("CAMPAIGN_NAME") or item.get("campaign_name") or item.get("campaignName") or item.get("name")
-                or str(item.get("campaign_id") or item.get("CAMPAIGN_ID") or "") or ""
+                item.get("CAMPAIGN_NAME")
+                or item.get("campaign_name")
+                or item.get("campaignName")
+                or item.get("name")
+                or str(item.get("campaign_id") or item.get("CAMPAIGN_ID") or "")
+                or ""
             ).strip()
             amount_spent = self._to_float(
                 item.get("spend") or item.get("SPEND") or item.get("amount_spent") or item.get("cost") or 0
@@ -620,12 +668,8 @@ class RedditAdsFetcher:
             # Any real spend value will be >= 1 micro-dollar, so divide to get dollars.
             if amount_spent and amount_spent >= 1:
                 amount_spent = amount_spent / 1_000_000
-            impressions = self._to_float(
-                item.get("impressions") or item.get("IMPRESSIONS") or 0
-            )
-            clicks = self._to_float(
-                item.get("clicks") or item.get("CLICKS") or 0
-            )
+            impressions = self._to_float(item.get("impressions") or item.get("IMPRESSIONS") or 0)
+            clicks = self._to_float(item.get("clicks") or item.get("CLICKS") or 0)
             conv_clicks = self._to_float(
                 item.get("conversion_purchase_clicks") or item.get("CONVERSION_PURCHASE_CLICKS") or 0
             )
@@ -639,16 +683,18 @@ class RedditAdsFetcher:
             if conv_total_value and conv_total_value >= 1:
                 conv_total_value = conv_total_value / 100
             conversions = conv_clicks + conv_views
-            rows.append({
-                "campaign_name": campaign_name or "Unknown",
-                "amount_spent": amount_spent,
-                "impressions": impressions,
-                "clicks": clicks,
-                "conversion_purchase_clicks": conv_clicks,
-                "conversion_purchase_views": conv_views,
-                "conversion_purchase_total_value": conv_total_value,
-                "conversions": conversions,
-            })
+            rows.append(
+                {
+                    "campaign_name": campaign_name or "Unknown",
+                    "amount_spent": amount_spent,
+                    "impressions": impressions,
+                    "clicks": clicks,
+                    "conversion_purchase_clicks": conv_clicks,
+                    "conversion_purchase_views": conv_views,
+                    "conversion_purchase_total_value": conv_total_value,
+                    "conversions": conversions,
+                }
+            )
         return rows if rows else None
 
     @staticmethod

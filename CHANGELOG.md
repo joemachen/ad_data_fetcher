@@ -4,6 +4,32 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ---
 
+## [Unreleased]
+
+### Changed
+
+- **Shared retry logic for all fetchers** (`utils.retry_call`, `utils.backoff_delay`, `utils.http_retry_after`). Each fetcher used to have its own retry loop. Now they all share one helper. Retries now:
+  - **Use jittered backoff**, so retries aren't synchronized.
+  - **Honour the server's `Retry-After` header**, capped at 120s.
+  - **Only retry errors a retry can fix.** Each fetcher has its own rule:
+    - **Google:** gRPC UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED or INTERNAL. Invalid queries and permission errors fail immediately.
+    - **Meta:** rate-limit and temporary codes 1, 2, 4, 17, 32 and 613, or `is_transient`. Code 190 still prompts for a new token.
+    - **Microsoft:** API error codes 0 (internal) and 117 (rate limit), plus network timeouts. Errors like "Invalid client data" now fail on the first try, and the log shows the API's actual error code and message.
+    - **Reddit and TikTok:** HTTP 429 and 5xx, plus connection errors.
+    - **TikTok also** checks the JSON `code` in successful (HTTP 200) responses. It retries 40100 (rate limit) and 50000/50002 (system errors). Any other non-zero code is logged with its message and `request_id`. Before, it silently returned no rows.
+- Google and Meta now fetch every result page inside the retry, so a throttled later page is retried too.
+
+### Fixed
+
+- **YoY ready-report column order**: metrics are now interleaved side-by-side per metric (`Impressions (2026)`, `Impressions (2025)`, `Clicks (2026)`, `Clicks (2025)`, …) instead of one block per year, matching TECHNICAL_OVERVIEW. Ordering is handled by the new `processor.interleave_period_columns()`, which parses `<Metric> (<period>)` headers dynamically, with no hardcoded years, and supports any number of periods.
+- **CI lint**: `ruff check .` now passes. CI was failing at the lint step on `main`, so tests never ran. The existing findings were fixed with ruff's auto-fixer, range-limited `ruff format` on over-long lines, and a handful of manual edits: removed unused variables, moved a constant below imports in `meta_fetcher.py`, replaced a bare `except` in `update_mcc_id.py`. Apart from those manual edits, behavior is unchanged (verified by comparing syntax trees). CI now pins `ruff==0.15.20`, and the ruff settings moved to `[tool.ruff.lint]`, with `[tool.ruff.format] quote-style = "preserve"`.
+- **Google Ads fetch failing with `501 GRPC target method can't be resolved`** (and `No module named 'pkg_resources'` on newer setuptools): `google-ads` raised from `~=22.0` (API v13–v15, which Google has shut off) to `~=33.0` (API v23–v25). The new version doesn't import `pkg_resources`. Every GAQL field the fetcher uses exists in v25.
+- **Microsoft Ads "Invalid client data" for ranges ending after today**: the Reporting API rejects custom ranges that end in the future, so the end date is now capped at today. A range that starts in the future is skipped.
+- **Processing summary undercounted** (e.g. "Found 5 file(s)" then "2/2 processed"): `process_all()` keyed its results by bare filename, so platforms sharing a date-range filename overwrote each other. They're now keyed `platform/filename`.
+- **Tests**: replaced the YoY column-order test, which only checked a local copy of the list, with unit tests for `interleave_period_columns()` and an exact-header assertion on a generated ready report.
+
+---
+
 ## [1.1.0] — 2026-06-28
 
 ### Added

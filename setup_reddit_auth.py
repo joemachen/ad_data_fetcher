@@ -157,7 +157,7 @@ def main() -> int:
         method="POST",
         headers={"Content-Type": "application/x-www-form-urlencoded"},
     )
-    creds = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode() if client_secret else base64.b64encode(f"{client_id}:".encode()).decode()
+    creds = base64.b64encode(f"{client_id}:{client_secret or ''}".encode()).decode()
     req.add_header("Authorization", f"Basic {creds}")
 
     try:

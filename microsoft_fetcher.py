@@ -6,15 +6,15 @@ saves to raw_reports/microsoft/{month}_{year}.csv. Columns match processor PLATF
 
 import logging
 import tempfile
-import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Tuple, Callable
+from typing import Any, Callable, List, Optional, Tuple
+
 import pandas as pd
 import yaml
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
-from utils import TokenExpiredError
+from utils import TokenExpiredError, retry_call
 
 # Redirect URI used during setup (Web app flow); must match Azure app registration
 MS_REDIRECT_URI = "http://localhost:8400"
@@ -26,13 +26,17 @@ try:
         OAuthDesktopMobileAuthCodeGrant,
         OAuthWebAuthCodeGrant,
     )
-    from bingads.v13.reporting.reporting_service_manager import ReportingServiceManager
     from bingads.v13.reporting.reporting_download_parameters import ReportingDownloadParameters
+    from bingads.v13.reporting.reporting_service_manager import ReportingServiceManager
+    from suds import WebFault  # bingads' SOAP client; raised for API faults
     _BINGADS_AVAILABLE = True
 except ImportError:
     ReportingServiceManager = None
     ReportingDownloadParameters = None
     _BINGADS_AVAILABLE = False
+
+    class WebFault(Exception):  # type: ignore[no-redef]  # placeholder so isinstance checks work
+        pass
 
 # Column names our processor expects for Microsoft (processor.PLATFORM_CONFIG['microsoft'])
 OUTPUT_COLUMNS = ["Campaign", "Impressions", "Clicks", "Spend", "AllConversions", "AllRevenue"]
@@ -49,8 +53,72 @@ _CSV_COLUMN_MAP: dict = {
 }
 
 # Retries for transient API errors (rate limit, 5xx)
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 2  # seconds
+# Microsoft Ads API error codes worth retrying: 0 = InternalError, 117 = CallRateExceeded.
+# Everything else (e.g. invalid dates/IDs -> "Invalid client data") fails immediately.
+MS_TRANSIENT_ERROR_CODES = {"0", "117"}
+MS_TRANSIENT_ERROR_NAMES = {"InternalError", "CallRateExceeded"}
+
+
+def _as_list(value: Any) -> List[Any]:
+    if value is None:
+        return []
+    return list(value) if isinstance(value, (list, tuple)) else [value]
+
+
+def fault_errors(exc: BaseException) -> List[Tuple[str, str, str]]:
+    """(Code, ErrorCode, Message) for each error in a Microsoft Ads SOAP fault; [] if none."""
+    detail = getattr(getattr(exc, "fault", None), "detail", None)
+    if detail is None:
+        return []
+    found: List[Any] = []
+    ad_api = getattr(detail, "AdApiFaultDetail", None)
+    if ad_api is not None:
+        found += _as_list(getattr(getattr(ad_api, "Errors", None), "AdApiError", None))
+    api = getattr(detail, "ApiFaultDetail", None)
+    if api is not None:
+        found += _as_list(getattr(getattr(api, "OperationErrors", None), "OperationError", None))
+        found += _as_list(getattr(getattr(api, "BatchErrors", None), "BatchError", None))
+    return [
+        (str(getattr(e, "Code", "")), str(getattr(e, "ErrorCode", "")), str(getattr(e, "Message", "")))
+        for e in found
+    ]
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for rate limits, internal errors and network/timeouts; False for invalid requests."""
+    if isinstance(exc, WebFault):
+        return any(
+            code in MS_TRANSIENT_ERROR_CODES or name in MS_TRANSIENT_ERROR_NAMES
+            for code, name, _ in fault_errors(exc)
+        )
+    return isinstance(exc, (ConnectionError, TimeoutError)) or type(exc).__name__ in (
+        "ConnectionError",  # requests.exceptions.ConnectionError
+        "Timeout",
+        "ReadTimeout",
+        "TimeoutException",  # bingads report polling timeout
+    )
+
+
+def _describe_error(exc: BaseException) -> str:
+    errors = fault_errors(exc)
+    if not errors:
+        return str(exc)
+    return "; ".join(f"{name or 'Error'} {code}: {msg}".strip() for code, name, msg in errors)
+
+
+def clamp_end_to_today(
+    start_date: datetime, end_date: datetime, today: Optional[datetime] = None
+) -> Optional[datetime]:
+    """Return end_date capped at today; None if the whole range is in the future.
+
+    The Reporting API rejects custom date ranges that end after today ("Invalid client data").
+    """
+    today = today or datetime.now()
+    if start_date.date() > today.date():
+        return None
+    if end_date.date() > today.date():
+        return datetime(today.year, today.month, today.day)
+    return end_date
 
 
 class MicrosoftAdsFetcher:
@@ -113,7 +181,8 @@ class MicrosoftAdsFetcher:
         developer_token = (self.config.get("developer_token") or "").strip()
         if not client_id or not refresh_token:
             raise ValueError(
-                "microsoft-ads.yaml must contain client_id and refresh_token. Run setup_ms_auth.py and add refresh_token."
+                "microsoft-ads.yaml must contain client_id and refresh_token. "
+                "Run setup_ms_auth.py and add refresh_token."
             )
         if not developer_token:
             raise ValueError(
@@ -191,69 +260,89 @@ class MicrosoftAdsFetcher:
         report_time.CustomDateRangeEnd.Month = end_date.month
         report_time.CustomDateRangeEnd.Year = end_date.year
         request.Time = report_time
-        request.Columns = {"CampaignPerformanceReportColumn": [
-            "CampaignName", "Impressions", "Clicks", "Spend", "AllConversions", "AllRevenue"
-        ]}
+        request.Columns = {
+            "CampaignPerformanceReportColumn": [
+                "CampaignName",
+                "Impressions",
+                "Clicks",
+                "Spend",
+                "AllConversions",
+                "AllRevenue",
+            ]
+        }
         return request
 
     def fetch_month_data(self, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
-        """Fetch campaign-level data for the date range; return DataFrame with Campaign, Impressions, Clicks, Spend, AllConversions, AllRevenue."""
+        """Fetch campaign-level data for the date range.
+
+        Returns a DataFrame with Campaign, Impressions, Clicks, Spend, AllConversions, AllRevenue.
+        """
         start_str = start_date.strftime("%Y-%m-%d")
+        clamped_end = clamp_end_to_today(start_date, end_date)
+        if clamped_end is None:
+            self.logger.info(f"Microsoft Ads: range starting {start_str} is in the future; skipping")
+            return None
+        if clamped_end != end_date:
+            self.logger.info(
+                f"Microsoft Ads: end date {end_date:%Y-%m-%d} is in the future; "
+                f"requesting through {clamped_end:%Y-%m-%d}"
+            )
+            end_date = clamped_end
         end_str = end_date.strftime("%Y-%m-%d")
         self._update_status(f"Fetching Microsoft Ads {start_str} to {end_str}...")
-        last_error = None
-        for attempt in range(MAX_RETRIES):
-            try:
-                manager = ReportingServiceManager(
-                    authorization_data=self._authorization_data,
-                    poll_interval_in_milliseconds=5000,
-                    environment="production",
+
+        def _download() -> Optional[pd.DataFrame]:
+            manager = ReportingServiceManager(
+                authorization_data=self._authorization_data,
+                poll_interval_in_milliseconds=5000,
+                environment="production",
+            )
+            request = self._build_report_request(manager.service_client.factory, start_date, end_date)
+            with tempfile.TemporaryDirectory(prefix="ms_ads_report_") as tmpdir:
+                params = ReportingDownloadParameters(
+                    report_request=request,
+                    result_file_directory=str(Path(tmpdir)),
+                    result_file_name="report.csv",
+                    overwrite_result_file=True,
+                    timeout_in_milliseconds=300000,
                 )
-                factory = manager.service_client.factory
-                request = self._build_report_request(factory, start_date, end_date)
-                with tempfile.TemporaryDirectory(prefix="ms_ads_report_") as tmpdir:
-                    result_dir = str(Path(tmpdir))
-                    result_name = "report.csv"
-                    params = ReportingDownloadParameters(
-                        report_request=request,
-                        result_file_directory=result_dir,
-                        result_file_name=result_name,
-                        overwrite_result_file=True,
-                        timeout_in_milliseconds=300000,
-                    )
-                    file_path = manager.download_file(params)
-                    if not file_path or not Path(file_path).exists():
-                        self.logger.warning(f"No report file for {start_str} to {end_str}")
-                        return None
-                    df = pd.read_csv(file_path)
-                if df.empty:
-                    self.logger.warning(f"No rows for {start_str} to {end_str}")
+                file_path = manager.download_file(params)
+                if not file_path or not Path(file_path).exists():
                     return None
-                # Normalize column names: Bing Ads CSV headers use display names (e.g.
-                # "All revenue") rather than API enum names (e.g. "AllRevenue").
-                self.logger.debug("Microsoft Ads CSV columns received: %s", list(df.columns))
-                rename = {}
-                for c in df.columns:
-                    c2 = str(c).strip()
-                    if c2 in _CSV_COLUMN_MAP:
-                        rename[c] = _CSV_COLUMN_MAP[c2]
-                    elif c2 in OUTPUT_COLUMNS:
-                        rename[c] = c2  # already matches, normalise any surrounding whitespace
-                df = df.rename(columns=rename)
-                for col in OUTPUT_COLUMNS:
-                    if col not in df.columns:
-                        df[col] = 0 if col != "Campaign" else ""
-                df = df[OUTPUT_COLUMNS].copy()
-                self.logger.info(f"Fetched {len(df)} campaigns for {start_str} to {end_str}")
-                return df
-            except Exception as e:
-                last_error = e
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
-                    self.logger.warning(f"Microsoft Ads transient error (attempt {attempt + 1}/{MAX_RETRIES}), retrying in {delay}s: {e}")
-                    time.sleep(delay)
-                else:
-                    self.logger.error(f"Microsoft Ads fetch failed: {e}", exc_info=True)
-                    self._update_status(f"Error: {e}")
-                    return None
-        return None
+                return pd.read_csv(file_path)
+
+        try:
+            df = retry_call(_download, is_retryable=_is_transient, on_retry=self._log_retry)
+        except Exception as e:
+            detail = _describe_error(e)
+            self.logger.error(f"Microsoft Ads fetch failed: {detail}", exc_info=True)
+            self._update_status(f"Error: {detail}")
+            return None
+        if df is None:
+            self.logger.warning(f"No report file for {start_str} to {end_str}")
+            return None
+        if df.empty:
+            self.logger.warning(f"No rows for {start_str} to {end_str}")
+            return None
+        # Normalize column names: Bing Ads CSV headers use display names (e.g.
+        # "All revenue") rather than API enum names (e.g. "AllRevenue").
+        self.logger.debug("Microsoft Ads CSV columns received: %s", list(df.columns))
+        rename = {}
+        for c in df.columns:
+            c2 = str(c).strip()
+            if c2 in _CSV_COLUMN_MAP:
+                rename[c] = _CSV_COLUMN_MAP[c2]
+            elif c2 in OUTPUT_COLUMNS:
+                rename[c] = c2  # already matches, normalise any surrounding whitespace
+        df = df.rename(columns=rename)
+        for col in OUTPUT_COLUMNS:
+            if col not in df.columns:
+                df[col] = 0 if col != "Campaign" else ""
+        df = df[OUTPUT_COLUMNS].copy()
+        self.logger.info(f"Fetched {len(df)} campaigns for {start_str} to {end_str}")
+        return df
+
+    def _log_retry(self, attempt: int, delay: float, exc: BaseException) -> None:
+        self.logger.warning(
+            f"Microsoft Ads transient error (attempt {attempt}), retrying in {delay:.1f}s: {_describe_error(exc)}"
+        )

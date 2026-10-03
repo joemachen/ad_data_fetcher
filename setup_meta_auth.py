@@ -7,8 +7,9 @@ token expires. So if meta-ads.yaml already has app_id/app_secret, this script re
 and prompts only for a new access token. Existing keys are preserved on write.
 """
 
-import yaml
 from typing import Dict
+
+import yaml
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
 

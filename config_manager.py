@@ -9,7 +9,6 @@ import os
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
-
 CONFIG_DEFAULTS: Dict[str, Any] = {
     "default_google_favorite": "ML",
     "default_meta_favorite": "ML",
