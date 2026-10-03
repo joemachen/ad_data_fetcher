@@ -46,4 +46,4 @@ Shown in the window title (e.g. `Ads Report Fetcher (Multi-Platform) v1.0.2`). D
 
 - **Tests**: `pytest` (from project root with venv active). Processor tests live in `tests/test_processor.py`.
 - **Lint**: `ruff check .` (config in `pyproject.toml`; CI pins `ruff==0.15.20`, so use the same version locally). Optional: `mypy .` for type checking.
-- **Constants**: Timeouts and dialog waits are in `constants.py`; retry settings are in each fetcher module.
+- **Constants**: Timeouts and dialog waits are in `constants.py`; retry/backoff settings and helpers are in `utils.py`; what counts as retryable is decided per fetcher (`_is_transient`).

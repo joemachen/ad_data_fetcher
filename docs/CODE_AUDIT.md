@@ -34,7 +34,7 @@ This audit started from a generic "principal-engineer" review prompt. Some of th
 - **There's no shared fetcher contract.** The fetchers line up only because their method names match. Adding a `BaseAdsFetcher` ABC or `Protocol` (`platform_key`, `fetch_month_data`, `save`), plus a platform registry, would let the duplicated thread methods collapse into one generic runner. Pinterest, currently a stub, should implement it too.
 
 ### P2
-- **Retry/backoff logic is copied five times** (`api_fetcher.py`, `meta_fetcher.py`, `microsoft_fetcher.py`, `reddit_fetcher.py`, `tiktok_fetcher.py`). None of the copies add jitter or honour `Retry-After`. TikTok's API-code retry path sleeps a fixed 2s. Replace them with one helper, e.g. `utils.retry_with_backoff(fn, is_retryable, max_attempts, base)`, using full jitter and `Retry-After` support. Reddit and TikTok each also hand-roll their own `urllib` request wrapper, which a shared helper could replace.
+- ✅ *Fixed.* **Retry/backoff logic is copied five times** (`api_fetcher.py`, `meta_fetcher.py`, `microsoft_fetcher.py`, `reddit_fetcher.py`, `tiktok_fetcher.py`). None of the copies add jitter or honour `Retry-After`. TikTok's API-code retry path sleeps a fixed 2s. Replace them with one helper, e.g. `utils.retry_with_backoff(fn, is_retryable, max_attempts, base)`, using full jitter and `Retry-After` support. Reddit and TikTok each also hand-roll their own `urllib` request wrapper, which a shared helper could replace.
 - **There are many broad `except Exception` handlers** (main.py ≈23, reddit ≈12, processor ≈10). Handlers at thread boundaries are fine. Elsewhere, narrow them (e.g. `_save_mappings`, the YoY CSV read) and log the HTTP status code and platform request ID where the API provides one.
 - **mypy is configured but not enforced.** CI runs only ruff and pytest. Add a mypy step for `processor.py`, `utils.py` and the fetchers, leaving `main.py` out for now. There is one existing error: an unannotated `results` in `process_all`.
 
@@ -52,7 +52,7 @@ This audit started from a generic "principal-engineer" review prompt. Some of th
 
 1. ✅ YoY metric interleaving plus real tests.
 2. ✅ Make CI lint meaningful: pin ruff, run a one-time autofix, and move the ruff settings to `[tool.ruff.lint]`.
-3. Shared retry helper with jitter and `Retry-After`, applied to all fetchers, with mocked-response tests.
+3. ✅ Shared retry helper with jitter and `Retry-After`, applied to all fetchers, with mocked-response tests.
 4. `BaseAdsFetcher` ABC and a platform registry; fold the per-platform thread methods in `main.py` into one generic runner.
 5. Split `main.py` into UI modules and a pipeline module (ROADMAP §4).
 6. Add mypy to CI; narrow the exception handlers; remove the legacy fallbacks.

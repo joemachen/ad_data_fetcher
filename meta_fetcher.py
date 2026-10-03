@@ -4,7 +4,7 @@ Fetches report data using the Meta (Facebook) Ads API.
 """
 
 import logging
-import time
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
@@ -17,9 +17,45 @@ from facebook_business.api import FacebookAdsApi
 from facebook_business.exceptions import FacebookRequestError
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
-from utils import TokenExpiredError
+from utils import TokenExpiredError, retry_call
 
-META_RETRY_BACKOFF_BASE = 2  # seconds; delay = base ** attempt (2s, 4s, 8s)
+# Meta error codes worth retrying: 1 unknown, 2 service unavailable, 4 app rate limit,
+# 17 user rate limit, 32 page rate limit, 613 call rate limit. 190 = token expired (never retried).
+META_TRANSIENT_ERROR_CODES = {1, 2, 4, 17, 32, 613}
+META_MAX_ATTEMPTS = 4  # first try + 3 retries, as before
+
+
+def _meta_error_code(e: FacebookRequestError) -> Optional[int]:
+    """Extract error code from FacebookRequestError. Returns None if unavailable."""
+    try:
+        code = e.api_error_code()
+        return int(code) if code is not None else None
+    except (AttributeError, TypeError, ValueError):
+        pass
+    try:
+        body = getattr(e, "body", None) or getattr(e, "_body", None)
+        if isinstance(body, dict):
+            err = body.get("error") or body
+            code = err.get("code") if isinstance(err, dict) else None
+            return int(code) if code is not None else None
+    except (TypeError, ValueError, KeyError):
+        pass
+    return None
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for Meta rate-limit/temporary errors; never for token expiry (190)."""
+    if not isinstance(exc, FacebookRequestError):
+        return False
+    code = _meta_error_code(exc)
+    if code == 190:
+        return False
+    try:
+        if exc.api_transient_error():
+            return True
+    except Exception:
+        pass
+    return code in META_TRANSIENT_ERROR_CODES
 
 
 class MetaTokenExpiredError(TokenExpiredError):
@@ -169,103 +205,91 @@ class MetaAdsFetcher:
 
     def _get_facebook_error_code(self, e: FacebookRequestError) -> Optional[int]:
         """Extract error code from FacebookRequestError. Returns None if unavailable."""
-        try:
-            code = e.api_error_code()
-            return int(code) if code is not None else None
-        except (AttributeError, TypeError, ValueError):
-            pass
-        try:
-            body = getattr(e, "body", None) or getattr(e, "_body", None)
-            if isinstance(body, dict):
-                err = body.get("error") or body
-                code = err.get("code") if isinstance(err, dict) else None
-                return int(code) if code is not None else None
-        except (TypeError, ValueError, KeyError):
-            pass
-        return None
+        return _meta_error_code(e)
 
     def fetch_month_data(self, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
         """
         Fetch Meta Ads insights for a date range.
-        Only raises MetaTokenExpiredError when error code is 190.
-        On error code 17 (rate limit) or 1 (API unknown), pauses 5 seconds and retries.
+        Raises MetaTokenExpiredError only for error code 190 (token expired).
+        Rate-limit / temporary errors are retried with jittered backoff (see _is_transient).
         """
         start_str = start_date.strftime('%Y-%m-%d')
         end_str = end_date.strftime('%Y-%m-%d')
-        max_retries_rate_limit = 3  # Max retries for rate limit / API unknown
+        if self.cancel_flag and self.cancel_flag.is_set():
+            return None
+        fields = [
+            AdsInsights.Field.campaign_name,
+            AdsInsights.Field.impressions,
+            AdsInsights.Field.inline_link_clicks,
+            AdsInsights.Field.spend,
+            AdsInsights.Field.action_values,
+            AdsInsights.Field.actions
+        ]
+        params = {
+            'time_range': {'since': start_str, 'until': end_str},
+            'level': 'campaign',
+            'fields': fields
+        }
 
-        for attempt in range(max_retries_rate_limit + 1):
+        def _fetch_insights() -> list:
+            self._update_status(f"Fetching Meta Ads data for {start_str} to {end_str}...")
+            # list() walks every page inside the retry, so a throttled later page is retried too
+            return list(AdAccount(self.ad_account_id).get_insights(params=params))
+
+        try:
+            insights = retry_call(
+                _fetch_insights,
+                is_retryable=_is_transient,
+                max_attempts=META_MAX_ATTEMPTS,
+                on_retry=self._log_retry,
+                cancel_event=self.cancel_flag if isinstance(self.cancel_flag, threading.Event) else None,
+            )
+        except FacebookRequestError as e:
+            error_code = _meta_error_code(e)
+            if error_code == 190:
+                self.logger.error("Meta access token has expired (error 190)")
+                self._update_status("Meta access token has expired")
+                raise MetaTokenExpiredError("Meta access token has expired. Please provide a new token.")
             if self.cancel_flag and self.cancel_flag.is_set():
                 return None
-            try:
-                self._update_status(f"Fetching Meta Ads data for {start_str} to {end_str}...")
-                account = AdAccount(self.ad_account_id)
-                fields = [
-                    AdsInsights.Field.campaign_name,
-                    AdsInsights.Field.impressions,
-                    AdsInsights.Field.inline_link_clicks,
-                    AdsInsights.Field.spend,
-                    AdsInsights.Field.action_values,
-                    AdsInsights.Field.actions
-                ]
-                params = {
-                    'time_range': {'since': start_str, 'until': end_str},
-                    'level': 'campaign',
-                    'fields': fields
-                }
-                insights = account.get_insights(params=params)
-                rows = []
-                for insight in insights:
-                    campaign_name = insight.get(AdsInsights.Field.campaign_name, '')
-                    impressions = int(insight.get(AdsInsights.Field.impressions, 0) or 0)
-                    link_clicks = int(insight.get(AdsInsights.Field.inline_link_clicks, 0) or 0)
-                    spend = float(insight.get(AdsInsights.Field.spend, 0) or 0)
-                    action_values = insight.get(AdsInsights.Field.action_values, [])
-                    purchase_value = self._parse_action_value(action_values, 'purchase')
-                    actions = insight.get(AdsInsights.Field.actions, [])
-                    purchase_count = self._parse_action_count(actions, 'purchase')
-                    rows.append({
-                        'Campaign name': campaign_name,
-                        'Impressions': impressions,
-                        'Link clicks': link_clicks,
-                        'Amount spent': spend,
-                        'Purchases conversion value': purchase_value,
-                        'Results': purchase_count
-                    })
-                if not rows:
-                    self.logger.warning(f"No data returned for {start_str} to {end_str}")
-                    return None
-                df = pd.DataFrame(rows)
-                self.logger.info(f"Fetched {len(df)} campaigns for {start_str} to {end_str}")
-                return df
-            except FacebookRequestError as e:
-                error_code = self._get_facebook_error_code(e)
-                # Only raise MetaTokenExpiredError for OAuth/token expiry (code 190)
-                if error_code == 190:
-                    self.logger.error("Meta access token has expired (error 190)")
-                    self._update_status("Meta access token has expired")
-                    raise MetaTokenExpiredError("Meta access token has expired. Please provide a new token.")
-                # Rate limit (17) or API unknown (1): pause 5s and retry
-                if error_code in (17, 1):
-                    if attempt < max_retries_rate_limit:
-                        delay = META_RETRY_BACKOFF_BASE ** (attempt + 1)
-                        self.logger.warning(
-                            f"Meta API error {error_code} (rate limit or unknown). "
-                            f"Pausing {delay}s and retrying ({attempt + 1}/{max_retries_rate_limit})..."
-                        )
-                        self._update_status(f"Rate limit/API delay (code {error_code}). Pausing {delay}s, retrying...")
-                        time.sleep(delay)
-                        continue
-                    self.logger.error(f"Meta API error {error_code} after {max_retries_rate_limit} retries")
-                    self._update_status(f"Error: Meta API error {error_code} after retries")
-                    return None
-                error_msg = f"Meta Ads API error: {e}"
-                self.logger.error(error_msg, exc_info=True)
-                self._update_status(f"Error: {error_msg}")
-                return None
-            except Exception as e:
-                error_msg = f"Failed to fetch data: {str(e)}"
-                self.logger.error(error_msg, exc_info=True)
-                self._update_status(f"Error: {error_msg}")
-                return None
-        return None
+            error_msg = f"Meta Ads API error {error_code}: {e.api_error_message() or e}"
+            self.logger.error(error_msg, exc_info=True)
+            self._update_status(f"Error: {error_msg}")
+            return None
+        except Exception as e:
+            error_msg = f"Failed to fetch data: {str(e)}"
+            self.logger.error(error_msg, exc_info=True)
+            self._update_status(f"Error: {error_msg}")
+            return None
+
+        rows = []
+        for insight in insights:
+            campaign_name = insight.get(AdsInsights.Field.campaign_name, '')
+            impressions = int(insight.get(AdsInsights.Field.impressions, 0) or 0)
+            link_clicks = int(insight.get(AdsInsights.Field.inline_link_clicks, 0) or 0)
+            spend = float(insight.get(AdsInsights.Field.spend, 0) or 0)
+            action_values = insight.get(AdsInsights.Field.action_values, [])
+            purchase_value = self._parse_action_value(action_values, 'purchase')
+            actions = insight.get(AdsInsights.Field.actions, [])
+            purchase_count = self._parse_action_count(actions, 'purchase')
+            rows.append({
+                'Campaign name': campaign_name,
+                'Impressions': impressions,
+                'Link clicks': link_clicks,
+                'Amount spent': spend,
+                'Purchases conversion value': purchase_value,
+                'Results': purchase_count
+            })
+        if not rows:
+            self.logger.warning(f"No data returned for {start_str} to {end_str}")
+            return None
+        df = pd.DataFrame(rows)
+        self.logger.info(f"Fetched {len(df)} campaigns for {start_str} to {end_str}")
+        return df
+
+    def _log_retry(self, attempt: int, delay: float, exc: BaseException) -> None:
+        code = _meta_error_code(exc) if isinstance(exc, FacebookRequestError) else type(exc).__name__
+        self.logger.warning(
+            f"Meta API error {code} (rate limit/temporary), attempt {attempt}; retrying in {delay:.1f}s"
+        )
+        self._update_status(f"Rate limit/API delay (code {code}). Pausing {delay:.0f}s, retrying...")

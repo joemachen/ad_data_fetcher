@@ -25,15 +25,14 @@ import pandas as pd
 import yaml
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
-from utils import TokenExpiredError
+from utils import RETRY_MAX_ATTEMPTS, TokenExpiredError, backoff_delay, http_retry_after
 
 REDDIT_USER_AGENT = "AdsReportFetcher/1.0 (Desktop; Python)"
 REDDIT_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
 REDDIT_REDIRECT_URI = "http://127.0.0.1:8765/reddit_oauth"
 
 # Retries for transient API errors (5xx, 429 rate limit)
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 2  # seconds
+MAX_RETRIES = RETRY_MAX_ATTEMPTS
 RETRYABLE_HTTP_CODES = (429, 500, 502, 503, 504)
 
 # Reddit Ads API base URLs to try (v2, v2.0, v3)
@@ -174,8 +173,8 @@ class RedditAdsFetcher:
         }
 
     def _api_request(self, url: str, method: str = "GET", data: Optional[bytes] = None) -> Any:
-        last_error = None
         for attempt in range(MAX_RETRIES):
+            last_attempt = attempt >= MAX_RETRIES - 1
             try:
                 req = urllib.request.Request(url, data=data, method=method, headers=self._headers())
                 if data:
@@ -183,7 +182,6 @@ class RedditAdsFetcher:
                 with urllib.request.urlopen(req, timeout=60) as resp:
                     return json.loads(resp.read().decode())
             except urllib.error.HTTPError as e:
-                last_error = e
                 if e.code == 401 and attempt == 0:
                     self.logger.info(
                         "Reddit API 401 on attempt %s — access token may have expired; refreshing and retrying",
@@ -191,35 +189,26 @@ class RedditAdsFetcher:
                     )
                     self._access_token = None  # force _get_access_token() to fetch a fresh token
                     continue
-                if e.code in RETRYABLE_HTTP_CODES and attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
-                    self.logger.warning(
-                        "Reddit API %s (attempt %s/%s), retrying in %ss",
-                        e.code,
-                        attempt + 1,
-                        MAX_RETRIES,
-                        delay,
-                    )
-                    time.sleep(delay)
-                else:
+                if e.code not in RETRYABLE_HTTP_CODES or last_attempt:
                     raise
+                delay = backoff_delay(attempt, retry_after=http_retry_after(e))
+                self.logger.warning(
+                    "Reddit API %s (attempt %s/%s), retrying in %.1fs", e.code, attempt + 1, MAX_RETRIES, delay
+                )
+                time.sleep(delay)
             except (urllib.error.URLError, OSError) as e:
-                last_error = e
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
-                    self.logger.warning(
-                        "Reddit API connection error (attempt %s/%s), retrying in %ss: %s",
-                        attempt + 1,
-                        MAX_RETRIES,
-                        delay,
-                        e,
-                    )
-                    time.sleep(delay)
-                else:
+                if last_attempt:
                     raise
-        if last_error:
-            raise last_error
-        return None  # unreachable
+                delay = backoff_delay(attempt)
+                self.logger.warning(
+                    "Reddit API connection error (attempt %s/%s), retrying in %.1fs: %s",
+                    attempt + 1,
+                    MAX_RETRIES,
+                    delay,
+                    e,
+                )
+                time.sleep(delay)
+        raise RuntimeError(f"Reddit API request failed after {MAX_RETRIES} attempts: {url}")
 
     def _fetch_v3_me(self) -> Optional[Dict[str, Any]]:
         """Call GET /api/v3/me to discover profile/ad_account structure; cache result."""

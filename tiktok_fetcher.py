@@ -24,7 +24,7 @@ import pandas as pd
 import yaml
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
-from utils import TokenExpiredError
+from utils import RETRY_MAX_ATTEMPTS, TokenExpiredError, backoff_delay, http_retry_after
 
 TIKTOK_REDIRECT_URI = "https://mabelslabels.com/tiktok-callback"
 TIKTOK_TOKEN_URL = "https://open.tiktokapis.com/v2/oauth/token/"
@@ -32,9 +32,27 @@ TIKTOK_REPORT_BASE = "https://business-api.tiktok.com/open_api/v1.3/report/integ
 TIKTOK_CAMPAIGNS_URL = "https://business-api.tiktok.com/open_api/v1.3/campaign/get/"
 
 # Retries for transient API errors (5xx, 429)
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 2  # seconds
+MAX_RETRIES = RETRY_MAX_ATTEMPTS
 RETRYABLE_HTTP_CODES = (429, 500, 502, 503, 504)
+# TikTok also reports errors as HTTP 200 with a non-zero JSON "code":
+# 40100 = too many requests, 50000 = system error, 50002 = service temporarily unavailable.
+RETRYABLE_API_CODES = {40100, 50000, 50002}
+
+
+class TikTokApiError(Exception):
+    """Non-zero "code" in a TikTok API response body."""
+
+    def __init__(self, code: Any, message: str = "", request_id: str = ""):
+        super().__init__(f"TikTok API error {code}: {message} [request_id={request_id}]")
+        self.code = code
+        self.request_id = request_id
+
+
+def _check_api_code(body: Any) -> Any:
+    """Return body if TikTok reported success (code 0 or absent); raise TikTokApiError otherwise."""
+    if isinstance(body, dict) and body.get("code") not in (None, 0, "0"):
+        raise TikTokApiError(body.get("code"), str(body.get("message", "")), str(body.get("request_id", "")))
+    return body
 
 # Raw CSV columns for TikTok; processor maps these to INTERNAL_SCHEMA
 OUTPUT_COLUMNS = [
@@ -151,8 +169,8 @@ class TikTokAdsFetcher:
         data: Optional[bytes] = None,
         extra_headers: Optional[Dict[str, str]] = None,
     ) -> Any:
-        last_error = None
         for attempt in range(MAX_RETRIES):
+            last_attempt = attempt >= MAX_RETRIES - 1
             try:
                 token = self._get_access_token()
                 headers = {
@@ -166,39 +184,48 @@ class TikTokAdsFetcher:
                 for k, v in headers.items():
                     req.add_header(k, v)
                 with urllib.request.urlopen(req, timeout=60) as resp:
-                    return json.loads(resp.read().decode())
+                    return _check_api_code(json.loads(resp.read().decode()))
+            except TikTokApiError as e:
+                try:
+                    code = int(e.code)
+                except (TypeError, ValueError):
+                    code = None
+                if code not in RETRYABLE_API_CODES or last_attempt:
+                    self.logger.error("%s", e)
+                    raise
+                delay = backoff_delay(attempt)
+                self.logger.warning("%s (attempt %s/%s), retrying in %.1fs", e, attempt + 1, MAX_RETRIES, delay)
+                time.sleep(delay)
             except urllib.error.HTTPError as e:
-                last_error = e
                 if e.code == 401:
                     self._access_token = None
-                    if attempt < MAX_RETRIES - 1:
-                        time.sleep(RETRY_BACKOFF_BASE)
+                    if not last_attempt:
+                        time.sleep(backoff_delay(attempt))
                         continue
                     raise TokenExpiredError(
                         "TikTok 401 Unauthorized. Token may have expired. Re-run setup_tiktok_auth.py.",
                         platform="TikTok",
                     ) from e
-                if e.code in RETRYABLE_HTTP_CODES and attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
-                    self.logger.warning(
-                        "TikTok API %s (attempt %s/%s), retrying in %ss", e.code, attempt + 1, MAX_RETRIES, delay
-                    )
-                    time.sleep(delay)
-                else:
+                if e.code not in RETRYABLE_HTTP_CODES or last_attempt:
                     raise
+                delay = backoff_delay(attempt, retry_after=http_retry_after(e))
+                self.logger.warning(
+                    "TikTok API %s (attempt %s/%s), retrying in %.1fs", e.code, attempt + 1, MAX_RETRIES, delay
+                )
+                time.sleep(delay)
             except (urllib.error.URLError, OSError) as e:
-                last_error = e
-                if attempt < MAX_RETRIES - 1:
-                    delay = RETRY_BACKOFF_BASE ** (attempt + 1)
-                    self.logger.warning(
-                        "TikTok API connection error (attempt %s/%s), retrying: %s", attempt + 1, MAX_RETRIES, e
-                    )
-                    time.sleep(delay)
-                else:
+                if last_attempt:
                     raise
-        if last_error:
-            raise last_error
-        return None
+                delay = backoff_delay(attempt)
+                self.logger.warning(
+                    "TikTok API connection error (attempt %s/%s), retrying in %.1fs: %s",
+                    attempt + 1,
+                    MAX_RETRIES,
+                    delay,
+                    e,
+                )
+                time.sleep(delay)
+        raise RuntimeError(f"TikTok API request failed after {MAX_RETRIES} attempts")
 
     def _fetch_campaign_name_map(self) -> Dict[str, str]:
         """Fetch campaign id -> name for the advertiser. Returns {} on failure."""

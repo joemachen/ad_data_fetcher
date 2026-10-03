@@ -6,6 +6,19 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ## [Unreleased]
 
+### Changed
+
+- **Shared retry logic for all fetchers** (`utils.retry_call`, `utils.backoff_delay`, `utils.http_retry_after`). Each fetcher used to have its own retry loop. Now they all share one helper. Retries now:
+  - **Use jittered backoff**, so retries aren't synchronized.
+  - **Honour the server's `Retry-After` header**, capped at 120s.
+  - **Only retry errors a retry can fix.** Each fetcher has its own rule:
+    - **Google:** gRPC UNAVAILABLE, DEADLINE_EXCEEDED, RESOURCE_EXHAUSTED or INTERNAL. Invalid queries and permission errors fail immediately.
+    - **Meta:** rate-limit and temporary codes 1, 2, 4, 17, 32 and 613, or `is_transient`. Code 190 still prompts for a new token.
+    - **Microsoft:** API error codes 0 (internal) and 117 (rate limit), plus network timeouts. Errors like "Invalid client data" now fail on the first try, and the log shows the API's actual error code and message.
+    - **Reddit and TikTok:** HTTP 429 and 5xx, plus connection errors.
+    - **TikTok also** checks the JSON `code` in successful (HTTP 200) responses. It retries 40100 (rate limit) and 50000/50002 (system errors). Any other non-zero code is logged with its message and `request_id`. Before, it silently returned no rows.
+- Google and Meta now fetch every result page inside the retry, so a throttled later page is retried too.
+
 ### Fixed
 
 - **YoY ready-report column order**: metrics are now interleaved side-by-side per metric (`Impressions (2026)`, `Impressions (2025)`, `Clicks (2026)`, `Clicks (2025)`, …) instead of one block per year, matching TECHNICAL_OVERVIEW. Ordering is handled by the new `processor.interleave_period_columns()`, which parses `<Metric> (<period>)` headers dynamically, with no hardcoded years, and supports any number of periods.

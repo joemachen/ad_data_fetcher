@@ -4,18 +4,42 @@ Fetches report data using the Google Ads API instead of browser automation.
 """
 
 import logging
-import time
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Callable, Optional
 
+import grpc
 import pandas as pd
 from google.ads.googleads.client import GoogleAdsClient
 from google.ads.googleads.errors import GoogleAdsException
+from google.api_core import exceptions as api_exceptions
 
-# Retries for transient API errors (rate limit, 5xx)
-MAX_RETRIES = 3
-RETRY_BACKOFF_BASE = 2  # seconds
+from utils import retry_call
+
+# gRPC statuses worth retrying: throttling, server overload/timeouts, internal errors
+_TRANSIENT_GRPC_CODES = {
+    grpc.StatusCode.UNAVAILABLE,
+    grpc.StatusCode.DEADLINE_EXCEEDED,
+    grpc.StatusCode.RESOURCE_EXHAUSTED,
+    grpc.StatusCode.INTERNAL,
+}
+_TRANSIENT_API_CORE_ERRORS = (
+    api_exceptions.ServiceUnavailable,
+    api_exceptions.DeadlineExceeded,
+    api_exceptions.ResourceExhausted,
+    api_exceptions.InternalServerError,
+)
+
+
+def _is_transient(exc: BaseException) -> bool:
+    """True for errors a retry can fix (rate limits, 5xx/timeouts); False for bad queries, auth, etc."""
+    if isinstance(exc, GoogleAdsException):
+        try:
+            return exc.error.code() in _TRANSIENT_GRPC_CODES
+        except Exception:
+            return False
+    return isinstance(exc, _TRANSIENT_API_CORE_ERRORS)
 
 
 class AdsApiFetcher:
@@ -68,6 +92,14 @@ class AdsApiFetcher:
             self._update_status(f"Error: {error_msg}")
             raise RuntimeError(error_msg) from e
 
+    def _log_retry(self, attempt: int, delay: float, exc: BaseException) -> None:
+        code = exc.error.code().name if isinstance(exc, GoogleAdsException) else type(exc).__name__
+        request_id = getattr(exc, "request_id", None)
+        self.logger.warning(
+            f"Google Ads API transient error {code} (attempt {attempt}), retrying in {delay:.1f}s"
+            + (f" [request_id={request_id}]" if request_id else "")
+        )
+
     def _update_status(self, message: str) -> None:
         """Update status message via callback if provided."""
         if self.status_callback:
@@ -114,25 +146,14 @@ class AdsApiFetcher:
                 ORDER BY segments.date, campaign.name
             """
 
-            # Execute query with retries for transient errors
+            # Execute query (all pages) with retries for transient errors only
             ga_service = self.client.get_service("GoogleAdsService")
-            for attempt in range(MAX_RETRIES):
-                try:
-                    response = ga_service.search(customer_id=self.customer_id, query=query)
-                    break
-                except GoogleAdsException as e:
-                    code = (e.error.code().name if hasattr(e.error, "code") else "") or ""
-                    if "USER_PERMISSION_DENIED" in code or "PERMISSION_DENIED" in code:
-                        raise
-                    if attempt < MAX_RETRIES - 1:
-                        delay = RETRY_BACKOFF_BASE ** (attempt + 1)
-                        self.logger.warning(
-                            f"Google Ads API transient error (attempt {attempt + 1}/{MAX_RETRIES}), "
-                            f"retrying in {delay}s: {code}"
-                        )
-                        time.sleep(delay)
-                    else:
-                        raise
+            response = retry_call(
+                lambda: list(ga_service.search(customer_id=self.customer_id, query=query)),
+                is_retryable=_is_transient,
+                on_retry=self._log_retry,
+                cancel_event=self.cancel_flag if isinstance(self.cancel_flag, threading.Event) else None,
+            )
 
             # Collect data
             rows = []
@@ -180,7 +201,7 @@ class AdsApiFetcher:
 
         except GoogleAdsException as e:
             error_code = e.error.code().name if hasattr(e.error, 'code') else "UNKNOWN"
-            error_msg = f"Google Ads API error: {error_code}"
+            error_msg = f"Google Ads API error: {error_code} [request_id={getattr(e, 'request_id', None)}]"
 
             # Special handling for permission errors
             if "USER_PERMISSION_DENIED" in error_code or "PERMISSION_DENIED" in error_code:
