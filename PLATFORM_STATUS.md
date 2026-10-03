@@ -44,4 +44,4 @@ Quick reference for what works, what’s pending, and what to do next.
 
 ---
 
-*Last updated: v1.0.2 — Google, Meta, Microsoft (with developer_token), Reddit, TikTok working; Pinterest stub.*
+*Last updated: v1.2.0 — Google (google-ads 33 / API v25), Meta, Microsoft (with developer_token), Reddit, TikTok working; Pinterest stub.*
