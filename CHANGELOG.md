@@ -6,6 +6,20 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ## [Unreleased]
 
+### Added
+
+- **Pipeline results on the cards and in the status row.** Each Run Fetch now records what happened to every platform (`pipeline_results.py`).
+  - **Cards:** each platform card shows its outcome:
+    - green "✓ Saved 2 ranges";
+    - amber "No data for prior year (Sep 2025)" or "Skipped: microsoft-ads.yaml missing";
+    - red "Failed (current): Google Ads API error: UNAUTHENTICATED …", "timed out" or "Token expired", with a red border.
+  - **Summary:** the status row shows a colored summary (e.g. "Completed with 1 failure: Google Ads"), plus a **View log** button when anything failed or was skipped.
+  - **How failures are detected:** an ERROR logged while a range was being fetched means it failed; otherwise an empty result means "no data".
+  - **Previously unreported:** platforms skipped for missing config, fetch timeouts and processing errors are reported too.
+  - **Reset:** results clear on New Fetch, Unlock, Clear data or the next run.
+- **"Open ready reports ↗"** in the status row opens the ready-reports folder in Explorer (Finder / xdg-open elsewhere). It appears whenever that folder has CSVs.
+- **"Clear data…"** in the status row appears whenever report data exists. It deletes the CSVs in the raw, processed, merged and ready folders after confirmation, the same action as Settings → Data.
+
 ### Changed
 
 - **UI refresh, first pass:**
@@ -30,6 +44,7 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ### Fixed
 
+- **"No existing data" while data existed:** the data check only looked at the Google and Meta raw folders plus merged and ready, so Microsoft/TikTok/Reddit-only or processed-only data went unnoticed, and Clear/Process stayed disabled. It now checks every CSV in all four folders.
 - **New Fetch left the date pickers disabled:** it re-enabled only the fallback month/year dropdowns, not the calendars. Locking, unlocking and New Fetch now share one helper that enables or disables all the date controls together.
 - **YoY ready-report column order**: metrics are now interleaved side-by-side per metric (`Impressions (2026)`, `Impressions (2025)`, `Clicks (2026)`, `Clicks (2025)`, …) instead of one block per year, matching TECHNICAL_OVERVIEW. Ordering is handled by the new `processor.interleave_period_columns()`, which parses `<Metric> (<period>)` headers dynamically, with no hardcoded years, and supports any number of periods.
 - **CI lint**: `ruff check .` now passes. CI was failing at the lint step on `main`, so tests never ran. The existing findings were fixed with ruff's auto-fixer, range-limited `ruff format` on over-long lines, and a handful of manual edits: removed unused variables, moved a constant below imports in `meta_fetcher.py`, replaced a bare `except` in `update_mcc_id.py`. Apart from those manual edits, behavior is unchanged (verified by comparing syntax trees). CI now pins `ruff==0.15.20`, and the ruff settings moved to `[tool.ruff.lint]`, with `[tool.ruff.format] quote-style = "preserve"`.

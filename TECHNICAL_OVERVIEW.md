@@ -25,7 +25,8 @@ For a quick **platform status and next steps** (what works, what’s pending, se
 
 - **GUI**: Single-window CustomTkinter app. Colors, fonts and spacing come from `ui_theme.py` as (light, dark) pairs, so both appearance modes stay consistent.
   - **Toolbar:** the title, then New Fetch and Process All Data (outlined), then **Run Fetch**, the only accent-colored button.
-  - **Status row:** the **Status** label, pipeline progress while a run is going, and a data-present label.
+  - **Status row:** the **Status** label, pipeline progress while a run is going, then the run summary colored by outcome, with **View log** when something failed. On the right: **Open ready reports ↗** (when ready CSVs exist), **Clear data…** (when any report CSVs exist) and the data-present label.
+  - **Run results:** `pipeline_results.py` records each platform's ranges as saved, no data or failed, plus skips and timeouts. An `ErrorCapture` log handler tells "failed" apart from "no data". Platform cards show the outcome text, with a red border on failure, until New Fetch, Unlock, Clear data or the next run.
   - **Tabs:**
     - **Main:** compact start/end date fields with a drop-down calendar (`tkcalendar.DateEntry`), Confirm/Unlock, preset chips (Month to date, Last month, Last 7 days, Last 30 days; from `date_presets.py`), the “Also pull same range previous year (YoY)” switch, then the platform cards in two rows.
     - **Accounts:** the default account per platform.

@@ -8,6 +8,7 @@ import os
 import queue
 import sys
 import threading
+import time
 import tkinter.filedialog as filedialog
 import tkinter.messagebox as messagebox
 import tkinter.scrolledtext as scrolledtext
@@ -31,6 +32,7 @@ from constants import DIALOG_WAIT_SECONDS, META_RETENTION_MONTHS, PIPELINE_FETCH
 from date_presets import PRESETS, preset_range
 from meta_fetcher import MetaAdsFetcher, MetaTokenExpiredError
 from microsoft_fetcher import MicrosoftAdsFetcher
+from pipeline_results import FAILED, OK, ErrorCapture, PipelineReport, RangeResult
 from processor import ReportProcessor
 from reddit_fetcher import RedditAdsFetcher
 from tiktok_fetcher import TikTokAdsFetcher
@@ -111,6 +113,10 @@ class AdsReportFetcherApp:
         self.reddit_id_display = ctk.StringVar(value="")
         self.pinterest_id_display = ctk.StringVar(value="")
         self.status_text = ctk.StringVar(value="Ready")
+        # Outcome of the latest Run Fetch (per platform), shown on the cards and in the status row
+        self._pipeline_report: Optional[PipelineReport] = None
+        self._error_capture: Optional[ErrorCapture] = None
+        self._run_started_at = 0.0
         if getattr(self, "_config_corrupted_msg", None):
             self.status_text.set(self._config_corrupted_msg)
         self.is_processing = False
@@ -265,14 +271,30 @@ class AdsReportFetcherApp:
             anchor="w",
         )
         self.global_status_label.pack(side="left", padx=0, fill="x", expand=True)
-        self.data_status_label = ctk.CTkLabel(
-            header_status_frame, text="No existing data", font=ui.caption_font(), text_color=ui.TEXT_MUTED
+        # Right side: [Open ready reports] [Clear data…] data label — buttons only appear when relevant
+        status_actions = ctk.CTkFrame(header_status_frame, fg_color="transparent")
+        status_actions.pack(side="right")
+        small_btn = dict(font=ui.caption_font(), height=24, corner_radius=ui.RADIUS_SMALL)
+        self.open_reports_button = ctk.CTkButton(
+            status_actions, text="Open ready reports ↗", width=140, command=self._open_ready_reports,
+            **small_btn, **ui.OUTLINE_BTN,
         )
-        self.data_status_label.pack(side="right", padx=(ui.SPACE_L, 0))
+        self.clear_data_quick_button = ctk.CTkButton(
+            status_actions, text="Clear data…", width=90, command=self._on_clear_data_clicked,
+            **small_btn, **ui.DANGER_BTN,
+        )
+        self.data_status_label = ctk.CTkLabel(
+            status_actions, text="No existing data", font=ui.caption_font(), text_color=ui.TEXT_MUTED
+        )
+        self.data_status_label.pack(side="left", padx=(ui.SPACE_S, 0))
         self.pipeline_status_label = ctk.CTkLabel(
             header_status_frame, text="", font=ui.caption_font(), text_color=ui.TEXT_MUTED
         )
         self.pipeline_status_label.pack(side="left", padx=(15, 0))
+        self.view_log_button = ctk.CTkButton(
+            header_status_frame, text="View log", width=70, command=self._on_view_log_clicked,
+            **small_btn, **ui.OUTLINE_BTN,
+        )
         self.pipeline_progress_frame = ctk.CTkFrame(header_status_frame, fg_color="transparent")
         self.pipeline_progress_bar = ctk.CTkProgressBar(self.pipeline_progress_frame, width=200)
         self.pipeline_progress_bar.pack(side="left", padx=(10, 0))
@@ -359,18 +381,18 @@ class AdsReportFetcherApp:
             text_color=_status_color(reddit_ready),
         )
         self.pinterest_card_status_label.configure(text="Coming soon", text_color=ui.TEXT_MUTED)
+        self._apply_run_results_to_cards()
 
-        # Data guardrail: status-row label + Settings → Data
-        raw_base = Path(self.settings.get("raw_reports_dir", "raw_reports"))
-        google_dir = raw_base / "google"
-        meta_dir = raw_base / "meta"
-        merged_dir = Path(self.settings.get("merged_reports_dir", "merged_reports"))
+        # Data guardrail: status-row label + buttons, Settings → Data
+        has_csv_files = self._report_data_present()
         ready_dir = Path(self.settings.get("ready_reports_dir", "ready_reports"))
-        google_has_data = google_dir.exists() and any(google_dir.glob("*.csv"))
-        meta_has_data = meta_dir.exists() and any(meta_dir.glob("*.csv"))
-        merged_has_data = merged_dir.exists() and any(merged_dir.glob("*.csv"))
-        ready_has_data = ready_dir.exists() and any(ready_dir.glob("*.csv"))
-        has_csv_files = google_has_data or meta_has_data or merged_has_data or ready_has_data
+        has_ready_reports = ready_dir.exists() and any(ready_dir.glob("*.csv"))
+        quick_buttons = ((self.open_reports_button, has_ready_reports), (self.clear_data_quick_button, has_csv_files))
+        for button, _ in quick_buttons:
+            button.pack_forget()
+        for button, show in quick_buttons:
+            if show:
+                button.pack(side="left", padx=(ui.SPACE_XS, 0), before=self.data_status_label)
         if has_csv_files:
             data_text, data_color = "Report data present", ui.WARNING
         else:
@@ -414,6 +436,64 @@ class AdsReportFetcherApp:
             0,
             lambda: self.process_all_data_button.configure(state="normal" if has_csv_files else "disabled"),
         )
+
+    def _report_data_folders(self) -> List[Path]:
+        return [
+            Path(self.settings.get(key, default))
+            for key, default in (
+                ("raw_reports_dir", "raw_reports"),
+                ("processed_reports_dir", "processed_reports"),
+                ("merged_reports_dir", "merged_reports"),
+                ("ready_reports_dir", "ready_reports"),
+            )
+        ]
+
+    def _report_data_present(self) -> bool:
+        """True if any CSV exists in the raw, processed, merged or ready folders (any platform subfolder)."""
+        return any(folder.exists() and next(folder.rglob("*.csv"), None) is not None
+                   for folder in self._report_data_folders())
+
+    def _apply_run_results_to_cards(self) -> None:
+        """After a run, show each platform's outcome on its card (overrides Ready / ID Missing)."""
+        report = self._pipeline_report
+        cards = (
+            ("Google Ads", self.google_card, self.google_card_status_label, self.source_google_var),
+            ("Meta Ads", self.meta_card, self.meta_card_status_label, self.source_meta_var),
+            ("Microsoft Ads", self.ms_card, self.ms_card_status_label, self.source_ms_var),
+            ("TikTok Ads", self.tiktok_card, self.tiktok_card_status_label, self.source_tiktok_var),
+            ("Reddit Ads", self.reddit_card, self.reddit_card_status_label, self.source_reddit_var),
+        )
+        for name, card, label, selected in cards:
+            result = report.platforms.get(name) if report else None
+            # Results can be long ("Failed: … API error …"): wrap inside the card, left-aligned
+            label.configure(wraplength=250, justify="left", anchor="w")
+            if result is not None:
+                color = {OK: ui.SUCCESS, FAILED: ui.DANGER}.get(result.status, ui.WARNING)
+                label.configure(text=result.card_text(), text_color=color)
+            if result is not None and result.status == FAILED:
+                card.configure(border_width=2, border_color=ui.DANGER)
+            elif selected.get():
+                card.configure(border_width=2, border_color=ui.ACCENT)
+            else:
+                card.configure(border_width=1, border_color=ui.BORDER)
+
+    def _open_ready_reports(self) -> None:
+        """Open the ready_reports folder in the system file manager."""
+        folder = Path(self.settings.get("ready_reports_dir", "ready_reports")).resolve()
+        if not folder.exists():
+            self.status_text.set(f"Ready reports folder not found: {folder}")
+            return
+        try:
+            if sys.platform.startswith("win"):
+                os.startfile(str(folder))  # type: ignore[attr-defined]
+            else:
+                import subprocess
+
+                subprocess.Popen(["open" if sys.platform == "darwin" else "xdg-open", str(folder)])
+            self.status_text.set(f"Opened {folder}")
+        except Exception as e:
+            self.logger.error(f"Could not open {folder}: {e}")
+            self.status_text.set(f"Could not open {folder}: {e}")
 
     def _create_process_section(self) -> None:
         """Create process section between tabs and log."""
@@ -2096,6 +2176,7 @@ class AdsReportFetcherApp:
         self.meta_date_range_locked = False
         self.meta_retention_warning_label.pack_forget()
         self._set_date_inputs_enabled(True)
+        self._clear_pipeline_report()
         self.confirm_date_btn.configure(text="Confirm Date Range", state="normal", **ui.PRIMARY_BTN)
         self.unlock_date_btn.configure(state="disabled")
         self.status_text.set("Date range unlocked for editing")
@@ -2369,6 +2450,8 @@ class AdsReportFetcherApp:
             f"TikTok={tiktok_ready}, Reddit={reddit_ready}, Pinterest={pinterest_ready}"
         )
         self.status_text.set("Starting Full Pipeline...")
+        self._clear_pipeline_report()
+        self._update_checklist_statuses()
         self.batch_fetch_active = True
         self.run_full_pipeline_button.configure(state="disabled")
 
@@ -2380,6 +2463,53 @@ class AdsReportFetcherApp:
         # Run batch fetch in a thread
         batch_thread = threading.Thread(target=self._execute_batch_fetch, daemon=True)
         batch_thread.start()
+
+    def _fetch_range(self, platform: str, label: str, fetch, start: datetime, end: datetime):
+        """Run one range fetch and record its outcome (saved / no data / failed) on the pipeline report.
+
+        Fetchers return None both for API errors and for empty ranges; an ERROR logged during the call
+        is what marks it as failed. Exceptions still propagate to the fetch thread's own handlers.
+        """
+        capture = self._error_capture
+        mark = capture.mark() if capture else 0
+        df = fetch(start, end)
+        report = self._pipeline_report
+        if report is not None:
+            if df is not None and not df.empty:
+                status, detail = "saved", ""
+            else:
+                error = capture.first_error_since(mark) if capture else None
+                status, detail = ("failed", error) if error else ("no_data", "")
+            report.platform(platform).ranges.append(RangeResult(label, start.date(), end.date(), status, detail))
+            self.root.after(0, self._update_checklist_statuses)
+        return df
+
+    def _show_pipeline_report(self) -> None:
+        """Main thread: show the run summary in the status row and per-platform results on the cards."""
+        report = self._pipeline_report
+        if report is None:
+            return
+        level, text = report.summary()
+        color = {OK: ui.SUCCESS, FAILED: ui.DANGER}.get(level, ui.WARNING)
+        self.pipeline_progress_frame.pack_forget()
+        self.pipeline_status_label.configure(text=text, text_color=color)
+        self.status_text.set("Run finished")
+        if level != OK:
+            self.view_log_button.pack(side="left", padx=(ui.SPACE_S, 0), after=self.pipeline_status_label)
+        else:
+            self.view_log_button.pack_forget()
+        self._update_checklist_statuses()
+
+    def _clear_pipeline_report(self) -> None:
+        """Forget the last run's results (New Fetch, Unlock, Clear data, or a new run)."""
+        self._pipeline_report = None
+        self.view_log_button.pack_forget()
+        self.pipeline_status_label.configure(text="", text_color=ui.TEXT_MUTED)
+
+    def _on_view_log_clicked(self) -> None:
+        if not self._log_expanded:
+            self._toggle_log_drawer()
+        self.log_textbox.see("end")
 
     def _report_pipeline_platform_progress(self, platform_key: str, current: int, total: int) -> None:
         """Update per-platform progress (e.g. Google: 1/2) and refresh pipeline status.
@@ -2414,6 +2544,11 @@ class AdsReportFetcherApp:
         Execute the batch fetch sequence.
         Only runs platforms that are selected and ready (valid ID + date range confirmed).
         """
+        report = PipelineReport(yoy_expected=bool(self.main_pull_prior_year_var.get()))
+        self._pipeline_report = report
+        self._run_started_at = time.time()
+        self._error_capture = ErrorCapture()
+        logging.getLogger().addHandler(self._error_capture)
         try:
             is_valid_google, _ = self._validate_inputs()
             is_valid_meta, _ = self._validate_meta_inputs()
@@ -2447,12 +2582,14 @@ class AdsReportFetcherApp:
             # Skip platforms with missing config (log so user knows)
             if self.source_ms_var.get() and is_valid_ms and self.date_range_locked and not ms_config_exists:
                 self.logger.info("Skipping Microsoft Ads: microsoft-ads.yaml not found. Run setup_ms_auth.py first.")
+                report.platform("Microsoft Ads").skipped_reason = "microsoft-ads.yaml missing (run setup_ms_auth.py)"
             if (
                 self.source_tiktok_var.get()
                 and (self.tiktok_account_id.get() or "").strip()
                 and not tiktok_config_exists
             ):
                 self.logger.info("Skipping TikTok Ads: tiktok-ads.yaml not found. See PLATFORM_STATUS.md.")
+                report.platform("TikTok Ads").skipped_reason = "tiktok-ads.yaml missing"
             if (
                 self.source_pinterest_var.get()
                 and (self.pinterest_account_id.get() or "").strip()
@@ -2507,29 +2644,35 @@ class AdsReportFetcherApp:
 
                 self.logger.info(f"Pipeline: Starting {platform_name}...")
                 self.root.after(0, lambda pn=platform_name: self.status_text.set(f"Pipeline: Fetching {pn}..."))
+                platform_mark = self._error_capture.mark()
 
                 # Execute fetch and wait for completion
                 fetch_func()
 
                 # Wait for this platform to complete
-                if platform_name == "Google Ads":
-                    self.google_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
-                    self.google_fetch_complete.clear()
-                elif platform_name == "Meta Ads":
-                    self.meta_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
-                    self.meta_fetch_complete.clear()
-                elif platform_name == "Microsoft Ads":
-                    self.ms_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
-                    self.ms_fetch_complete.clear()
-                elif platform_name == "TikTok Ads":
-                    self.tiktok_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
-                    self.tiktok_fetch_complete.clear()
-                elif platform_name == "Reddit Ads":
-                    self.reddit_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
-                    self.reddit_fetch_complete.clear()
-                elif platform_name == "Pinterest Ads":
-                    self.pinterest_fetch_complete.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
-                    self.pinterest_fetch_complete.clear()
+                complete_event = {
+                    "Google Ads": self.google_fetch_complete,
+                    "Meta Ads": self.meta_fetch_complete,
+                    "Microsoft Ads": self.ms_fetch_complete,
+                    "TikTok Ads": self.tiktok_fetch_complete,
+                    "Reddit Ads": self.reddit_fetch_complete,
+                    "Pinterest Ads": self.pinterest_fetch_complete,
+                }[platform_name]
+                finished = complete_event.wait(timeout=PIPELINE_FETCH_WAIT_SECONDS)
+                complete_event.clear()
+
+                # Record anything the per-range results didn't capture (timeouts, setup errors, early exits)
+                result = report.platform(platform_name)
+                if platform_name == "Pinterest Ads":
+                    result.skipped_reason = "API not yet connected"
+                elif not finished:
+                    result.error = f"timed out after {PIPELINE_FETCH_WAIT_SECONDS // 60} min"
+                elif not result.ranges and not result.error and not result.token_expired:
+                    result.error = (
+                        self._error_capture.first_error_since(platform_mark)
+                        or "fetch did not run (check the account ID)"
+                    )
+                self.root.after(0, self._update_checklist_statuses)
 
                 # Mark this platform complete (in case fetch thread didn't report final step)
                 self._pipeline_platform_progress[short_name] = (platform_total, platform_total)
@@ -2566,6 +2709,7 @@ class AdsReportFetcherApp:
                     processed_dir = self.settings.get("processed_reports_dir", "processed_reports")
                     merged_dir = self.settings.get("merged_reports_dir", "merged_reports")
                     ready_dir = self.settings.get("ready_reports_dir", "ready_reports")
+                    processing_mark = self._error_capture.mark()
                     processor = ReportProcessor(
                         input_dir=raw_dir,
                         output_dir=processed_dir,
@@ -2588,27 +2732,26 @@ class AdsReportFetcherApp:
                     self.root.after(0, lambda: self.status_text.set("Pipeline: Building YoY reports..."))
                     processor.build_yoy_reports()
 
+                    report.processing_error = self._error_capture.first_error_since(processing_mark) or ""
+                    ready_path = Path(ready_dir)
+                    if ready_path.exists():
+                        report.ready_files = sorted(
+                            f.name for f in ready_path.glob("ready_*.csv") if f.stat().st_mtime >= self._run_started_at
+                        )
                     self.logger.info("Pipeline: Complete!")
-                    self.root.after(0, lambda: self.status_text.set("Pipeline Complete!"))
-                    self.root.after(
-                        0,
-                        lambda: (
-                            self.pipeline_progress_bar.set(1.0),
-                            self.pipeline_status_label.configure(text="Pipeline Complete!"),
-                        ),
-                    )
+                    self.root.after(0, lambda: self.pipeline_progress_bar.set(1.0))
                 except Exception as e:
-                    error_msg = f"Error during processing: {str(e)}"
                     self.logger.error(f"Error in pipeline processing: {e}", exc_info=True)
-                    self.root.after(0, lambda: self.status_text.set(error_msg))
-                    self.root.after(0, lambda: self.pipeline_status_label.configure(text="Error during processing"))
+                    report.processing_error = str(e)
 
         except Exception as e:
-            error_msg = f"Pipeline Error: {str(e)}"
             self.logger.error(f"Error in pipeline: {e}", exc_info=True)
-            self.root.after(0, lambda: self.status_text.set(error_msg))
-            self.root.after(0, lambda: self.pipeline_status_label.configure(text="Pipeline Error"))
+            report.processing_error = f"pipeline error: {e}"
         finally:
+            if self._error_capture is not None:
+                logging.getLogger().removeHandler(self._error_capture)
+                self._error_capture = None
+            self.root.after(0, self._show_pipeline_report)
             self.batch_fetch_active = False
             self._current_platform_key = None
             self.root.after(0, lambda: self.run_full_pipeline_button.configure(state="normal"))
@@ -2678,7 +2821,11 @@ class AdsReportFetcherApp:
         self._reauth_buttons[platform] = btn
 
     def _show_reauth_button(self, platform: str) -> None:
-        """Reveal the platform's Re-authenticate button (thread-safe)."""
+        """Reveal the platform's Re-authenticate button (thread-safe) and flag the run result."""
+        if self._pipeline_report is not None and self.batch_fetch_active:
+            result = self._pipeline_report.platform(f"{platform} Ads")
+            result.token_expired = True
+            result.error = result.error or "token expired"
         btn = self._reauth_buttons.get(platform)
         if btn is not None:
             self.root.after(0, lambda: btn.pack(anchor="w", padx=10, pady=(0, 8)))
@@ -2754,7 +2901,7 @@ class AdsReportFetcherApp:
             if getattr(self, "_current_platform_key", None) == "Microsoft":
                 self._report_pipeline_platform_progress("Microsoft", 0, pipeline_total)
             # Current range
-            df = fetcher.fetch_month_data(start_date, end_date)
+            df = self._fetch_range("Microsoft Ads", "current", fetcher.fetch_month_data, start_date, end_date)
             if df is not None and not df.empty:
                 fn = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
                 out = out_dir / fn
@@ -2769,7 +2916,9 @@ class AdsReportFetcherApp:
             if self.main_pull_prior_year_var.get():
                 prior_start = start_date - relativedelta(years=1)
                 prior_end = end_date - relativedelta(years=1)
-                df_prior = fetcher.fetch_month_data(prior_start, prior_end)
+                df_prior = self._fetch_range(
+                    "Microsoft Ads", "prior year", fetcher.fetch_month_data, prior_start, prior_end
+                )
                 if df_prior is not None and not df_prior.empty:
                     fn_prior = f"{prior_start.strftime('%Y-%m-%d')}_{prior_end.strftime('%Y-%m-%d')}.csv"
                     out_prior = out_dir / fn_prior
@@ -2836,7 +2985,7 @@ class AdsReportFetcherApp:
             if getattr(self, "_current_platform_key", None) == "TikTok":
                 self._report_pipeline_platform_progress("TikTok", 0, pipeline_total)
             # Current range
-            df = fetcher.fetch_month_data(start_date, end_date)
+            df = self._fetch_range("TikTok Ads", "current", fetcher.fetch_month_data, start_date, end_date)
             if df is not None and not df.empty:
                 fn = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
                 out = out_dir / fn
@@ -2851,7 +3000,9 @@ class AdsReportFetcherApp:
             if self.main_pull_prior_year_var.get():
                 prior_start = start_date - relativedelta(years=1)
                 prior_end = end_date - relativedelta(years=1)
-                df_prior = fetcher.fetch_month_data(prior_start, prior_end)
+                df_prior = self._fetch_range(
+                    "TikTok Ads", "prior year", fetcher.fetch_month_data, prior_start, prior_end
+                )
                 if df_prior is not None and not df_prior.empty:
                     fn_prior = f"{prior_start.strftime('%Y-%m-%d')}_{prior_end.strftime('%Y-%m-%d')}.csv"
                     out_prior = out_dir / fn_prior
@@ -2919,7 +3070,7 @@ class AdsReportFetcherApp:
             if getattr(self, "_current_platform_key", None) == "Reddit":
                 self._report_pipeline_platform_progress("Reddit", 0, pipeline_total)
             # Current range
-            df = fetcher.fetch_month_data(start_date, end_date)
+            df = self._fetch_range("Reddit Ads", "current", fetcher.fetch_month_data, start_date, end_date)
             if df is not None and not df.empty:
                 fn = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
                 out = out_dir / fn
@@ -2934,7 +3085,9 @@ class AdsReportFetcherApp:
             if self.main_pull_prior_year_var.get():
                 prior_start = start_date - relativedelta(years=1)
                 prior_end = end_date - relativedelta(years=1)
-                df_prior = fetcher.fetch_month_data(prior_start, prior_end)
+                df_prior = self._fetch_range(
+                    "Reddit Ads", "prior year", fetcher.fetch_month_data, prior_start, prior_end
+                )
                 if df_prior is not None and not df_prior.empty:
                     fn_prior = f"{prior_start.strftime('%Y-%m-%d')}_{prior_end.strftime('%Y-%m-%d')}.csv"
                     out_prior = out_dir / fn_prior
@@ -3014,7 +3167,8 @@ class AdsReportFetcherApp:
         self.status_text.set(status_msg)
         self.logger.info(status_msg)
 
-        # Update checklist statuses after clearing
+        # Old run results refer to files that are gone now
+        self._clear_pipeline_report()
         self._update_checklist_statuses()
 
         # Also log to GUI log box
@@ -3033,6 +3187,7 @@ class AdsReportFetcherApp:
         # Reset Main tab (date range unlocked)
         self.date_range_locked = False
         self._set_date_inputs_enabled(True)
+        self._clear_pipeline_report()
         self.confirm_date_btn.configure(text="Confirm Date Range", state="normal", **ui.PRIMARY_BTN)
         self.unlock_date_btn.configure(state="disabled")
         self.progress_bar.set(0)
@@ -3138,7 +3293,7 @@ class AdsReportFetcherApp:
             if getattr(self, "_current_platform_key", None) == "Google":
                 self._report_pipeline_platform_progress("Google", 0, pipeline_total)
             # Current range
-            df = fetcher.fetch_month_data(start_date, end_date)
+            df = self._fetch_range("Google Ads", "current", fetcher.fetch_month_data, start_date, end_date)
             if df is not None and not df.empty:
                 fn = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
                 out = out_dir / fn
@@ -3153,7 +3308,9 @@ class AdsReportFetcherApp:
             if self.main_pull_prior_year_var.get():
                 prior_start = start_date - relativedelta(years=1)
                 prior_end = end_date - relativedelta(years=1)
-                df_prior = fetcher.fetch_month_data(prior_start, prior_end)
+                df_prior = self._fetch_range(
+                    "Google Ads", "prior year", fetcher.fetch_month_data, prior_start, prior_end
+                )
                 if df_prior is not None and not df_prior.empty:
                     fn_prior = f"{prior_start.strftime('%Y-%m-%d')}_{prior_end.strftime('%Y-%m-%d')}.csv"
                     out_prior = out_dir / fn_prior
@@ -3215,7 +3372,7 @@ class AdsReportFetcherApp:
             while True:
                 try:
                     # Current range
-                    df = do_fetch(start_date, end_date)
+                    df = self._fetch_range("Meta Ads", "current", do_fetch, start_date, end_date)
                     if df is not None and not df.empty:
                         fn = f"{start_date.strftime('%Y-%m-%d')}_{end_date.strftime('%Y-%m-%d')}.csv"
                         (out_dir / fn).parent.mkdir(parents=True, exist_ok=True)
@@ -3230,7 +3387,7 @@ class AdsReportFetcherApp:
                     if self.main_pull_prior_year_var.get():
                         prior_start = start_date - relativedelta(years=1)
                         prior_end = end_date - relativedelta(years=1)
-                        df_prior = do_fetch(prior_start, prior_end)
+                        df_prior = self._fetch_range("Meta Ads", "prior year", do_fetch, prior_start, prior_end)
                         if df_prior is not None and not df_prior.empty:
                             fn_prior = f"{prior_start.strftime('%Y-%m-%d')}_{prior_end.strftime('%Y-%m-%d')}.csv"
                             df_prior.to_csv(out_dir / fn_prior, index=False)
