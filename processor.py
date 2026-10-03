@@ -542,7 +542,7 @@ class ReportProcessor:
         Process all report files in the input directory.
 
         Returns:
-            Dictionary mapping filename -> success status (True/False)
+            Dictionary mapping 'platform/filename' -> success status (True/False)
         """
         results = {}
 
@@ -560,7 +560,8 @@ class ReportProcessor:
         # Process each file
         for file_path in report_files:
             output_path = self.process_file(file_path)
-            results[file_path.name] = output_path is not None
+            # Key by platform/filename: every platform uses the same date-range filenames
+            results[f"{file_path.parent.name}/{file_path.name}"] = output_path is not None
 
         # Summary
         success_count = sum(1 for success in results.values() if success)

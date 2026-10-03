@@ -245,6 +245,27 @@ class TestProcessFile:
         assert df["Platform"].iloc[0] == "Reddit Ads"
 
 
+class TestProcessAll:
+    """process_all() counts every platform's file, even when filenames match."""
+
+    def test_same_filename_across_platforms_counted_separately(self, full_processor, tmp_path):
+        filename = "2025-01-05_2025-01-20.csv"
+        google = tmp_path / "raw" / "google"
+        reddit = tmp_path / "raw" / "reddit"
+        google.mkdir(parents=True)
+        reddit.mkdir(parents=True)
+        (google / filename).write_text(
+            "campaign_name,impressions,clicks,cost,all_conversions_value,conversions\n"
+            "G Campaign,1000,50,10.0,100.0,5\n"
+        )
+        (reddit / filename).write_text(
+            "campaign_name,amount_spent,impressions,clicks,conversion_purchase_total_value,conversions\n"
+            "R Campaign,10.0,500,25,30.0,3\n"
+        )
+        results = full_processor.process_all()
+        assert results == {f"google/{filename}": True, f"reddit/{filename}": True}
+
+
 # ---------------------------------------------------------------------------
 # TestDetermineFunnel
 # ---------------------------------------------------------------------------

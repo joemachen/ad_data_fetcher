@@ -54,6 +54,21 @@ MAX_RETRIES = 3
 RETRY_BACKOFF_BASE = 2  # seconds
 
 
+def clamp_end_to_today(
+    start_date: datetime, end_date: datetime, today: Optional[datetime] = None
+) -> Optional[datetime]:
+    """Return end_date capped at today; None if the whole range is in the future.
+
+    The Reporting API rejects custom date ranges that end after today ("Invalid client data").
+    """
+    today = today or datetime.now()
+    if start_date.date() > today.date():
+        return None
+    if end_date.date() > today.date():
+        return datetime(today.year, today.month, today.day)
+    return end_date
+
+
 class MicrosoftAdsFetcher:
     """Fetches Microsoft Ads reports via Bing Ads Reporting API."""
 
@@ -211,6 +226,16 @@ class MicrosoftAdsFetcher:
         Returns a DataFrame with Campaign, Impressions, Clicks, Spend, AllConversions, AllRevenue.
         """
         start_str = start_date.strftime("%Y-%m-%d")
+        clamped_end = clamp_end_to_today(start_date, end_date)
+        if clamped_end is None:
+            self.logger.info(f"Microsoft Ads: range starting {start_str} is in the future; skipping")
+            return None
+        if clamped_end != end_date:
+            self.logger.info(
+                f"Microsoft Ads: end date {end_date:%Y-%m-%d} is in the future; "
+                f"requesting through {clamped_end:%Y-%m-%d}"
+            )
+            end_date = clamped_end
         end_str = end_date.strftime("%Y-%m-%d")
         self._update_status(f"Fetching Microsoft Ads {start_str} to {end_str}...")
         for attempt in range(MAX_RETRIES):

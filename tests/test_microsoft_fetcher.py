@@ -6,6 +6,7 @@ new refresh_token back to microsoft-ads.yaml so the 90-day inactivity window res
 run (otherwise the token eventually expires with AADSTS700082).
 """
 import sys
+from datetime import datetime
 from pathlib import Path
 
 import pytest
@@ -15,7 +16,7 @@ import yaml
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 import microsoft_fetcher
-from microsoft_fetcher import MicrosoftAdsFetcher
+from microsoft_fetcher import MicrosoftAdsFetcher, clamp_end_to_today
 from utils import TokenExpiredError
 
 
@@ -117,3 +118,26 @@ def test_save_failure_is_soft(ms_config, monkeypatch):
     fetcher.config["refresh_token"] = "ANOTHER_TOKEN"
     # Must not raise.
     fetcher._save_config_safe()
+
+
+# --- clamp_end_to_today: the Reporting API rejects ranges ending after today ---
+
+TODAY = datetime(2026, 10, 3, 5, 12)
+
+
+def test_future_end_date_clamped_to_today():
+    assert clamp_end_to_today(datetime(2026, 10, 1), datetime(2026, 10, 30), TODAY) == datetime(2026, 10, 3)
+
+
+def test_past_range_unchanged():
+    end = datetime(2025, 10, 30)
+    assert clamp_end_to_today(datetime(2025, 10, 1), end, TODAY) is end
+
+
+def test_end_today_unchanged():
+    end = datetime(2026, 10, 3)
+    assert clamp_end_to_today(datetime(2026, 10, 1), end, TODAY) is end
+
+
+def test_range_entirely_in_future_returns_none():
+    assert clamp_end_to_today(datetime(2026, 10, 4), datetime(2026, 10, 30), TODAY) is None
