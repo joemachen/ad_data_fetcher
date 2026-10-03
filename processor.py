@@ -7,7 +7,7 @@ Platform-agnostic: new platforms (TikTok, Reddit, etc.) can be added via PLATFOR
 import logging
 import pandas as pd
 from pathlib import Path
-from typing import List, Optional, Dict, Callable, Tuple, Any
+from typing import List, Optional, Dict, Callable, Tuple, Any, Sequence
 import re
 import json
 import threading
@@ -135,6 +135,49 @@ BOTTOM_FUNNEL_KEYWORDS = ['Brand', 'Branded']
 
 # --- Range-based filename: YYYY-MM-DD_YYYY-MM-DD.csv (same month-day across years pairs for YoY) ---
 RANGE_FILENAME_PATTERN = re.compile(r'^(\d{4})-(\d{2})-(\d{2})_(\d{4})-(\d{2})-(\d{2})\.csv$')
+
+# --- Period-suffixed metric columns, e.g. "Impressions (2025)" or "Cost (USD) (2025-01-05_2025-01-20)" ---
+# Anchors on the last parenthetical so metric names may themselves contain parentheses.
+PERIOD_COLUMN_PATTERN = re.compile(r'^(?P<metric>.*\S)\s*\((?P<period>[^()]+)\)$')
+
+
+def interleave_period_columns(columns: Sequence[str], periods: Optional[Sequence[str]] = None) -> List[str]:
+    """
+    Reorder columns so each metric's comparison periods sit side-by-side.
+
+    Columns of the form "<Metric> (<period>)" are grouped by metric (in order of first appearance);
+    within each group, periods follow `periods` if given, else order of first appearance.
+    All other columns (e.g. Campaign, Platform, Channel, Funnel Stage) lead, in their original order.
+
+    When `periods` is given, only columns whose suffix is one of those periods are treated as
+    period columns, so metadata like "Campaign (ID)" is left alone.
+
+    Example: [Campaign, Clicks (2026), Cost (2026), Clicks (2025), Cost (2025)]
+          -> [Campaign, Clicks (2026), Clicks (2025), Cost (2026), Cost (2025)]
+    """
+    period_filter = set(periods) if periods is not None else None
+    lead: List[str] = []
+    metric_order: List[str] = []
+    period_order: List[str] = list(periods) if periods is not None else []
+    by_metric: Dict[str, Dict[str, str]] = {}  # metric -> {period: column}
+
+    for col in columns:
+        m = PERIOD_COLUMN_PATTERN.match(col)
+        if not m or (period_filter is not None and m.group('period') not in period_filter):
+            lead.append(col)
+            continue
+        metric, period = m.group('metric'), m.group('period')
+        if metric not in by_metric:
+            by_metric[metric] = {}
+            metric_order.append(metric)
+        if periods is None and period not in period_order:
+            period_order.append(period)
+        by_metric[metric][period] = col
+
+    ordered = list(lead)
+    for metric in metric_order:
+        ordered.extend(by_metric[metric][p] for p in period_order if p in by_metric[metric])
+    return ordered
 
 
 class ReportProcessor:
@@ -605,8 +648,8 @@ class ReportProcessor:
         Pairs merged files by same month-day range (e.g. 2025-01-05_2025-01-20 and 2024-01-05_2024-01-20).
         Produces one ready file per pair: ready_2025-01-05_2025-01-20_vs_2024.csv.
 
-        Column order: Campaign, Platform, Channel, Funnel Stage, Year1, Year2,
-        Impressions (Year1), Impressions (Year2), ... (Year1 = prior year, Year2 = current year).
+        Column order: Campaign, Platform, Channel, Funnel Stage, then each metric with the
+        current year next to the prior year: Impressions (2025), Impressions (2024), Clicks (2025), ...
         """
         try:
             self._update_status("Building YoY reports...")
@@ -667,13 +710,8 @@ class ReportProcessor:
                     for c in merged.columns:
                         if f' ({y1})' in c or f' ({y2})' in c:
                             merged[c] = pd.to_numeric(merged[c], errors='coerce').fillna(0)
-                    # Column order: Campaign, Platform, Channel, Funnel Stage, then each metric with newer year first: metric (y2), metric (y1)
-                    final_cols = (
-                        key_cols
-                        + [f"{c} ({y2})" for c in metric_cols]
-                        + [f"{c} ({y1})" for c in metric_cols]
-                    )
-                    merged = merged[[c for c in final_cols if c in merged.columns]]
+                    # Column order: key cols, then each metric's years side-by-side, newer year first
+                    merged = merged[interleave_period_columns(merged.columns, periods=[str(y2), str(y1)])]
                     # Output: ready_2025-01-05_2025-01-20_vs_2024.csv (current range vs prior year)
                     out_name = f"ready_{year_to_filename[y2].replace('.csv', '')}_vs_{y1}.csv"
                     out_path = self.ready_dir / out_name

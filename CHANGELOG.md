@@ -4,6 +4,15 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ---
 
+## [Unreleased]
+
+### Fixed
+
+- **YoY ready-report column order**: metrics are now interleaved side-by-side per metric (`Impressions (2026)`, `Impressions (2025)`, `Clicks (2026)`, `Clicks (2025)`, …) instead of one block per year, matching TECHNICAL_OVERVIEW. Ordering is handled by the new `processor.interleave_period_columns()`, which parses `<Metric> (<period>)` headers dynamically, with no hardcoded years, and supports any number of periods.
+- **Tests**: replaced the YoY column-order test, which only checked a local copy of the list, with unit tests for `interleave_period_columns()` and an exact-header assertion on a generated ready report.
+
+---
+
 ## [1.1.0] — 2026-06-28
 
 ### Added

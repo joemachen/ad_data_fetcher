@@ -8,7 +8,7 @@ import sys
 # Allow importing from project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from processor import ReportProcessor, RANGE_FILENAME_PATTERN
+from processor import ReportProcessor, RANGE_FILENAME_PATTERN, interleave_period_columns
 
 
 @pytest.fixture
@@ -62,21 +62,8 @@ class TestParseMonthYearFromRangeFilename:
         assert year_str == "Unknown"
 
 
-class TestYoYColumnOrder:
-    """YoY report column order: Campaign, Platform, Channel, Funnel Stage, then each metric newer year first."""
-
-    def test_yoy_final_columns_order(self):
-        key_cols = ["Campaign", "Platform", "Channel", "Funnel Stage"]
-        metric_cols = ["Impressions", "Clicks", "Cost", "Revenue", "Conversions"]
-        y1, y2 = 2024, 2025  # prior, current
-        final_cols = (
-            key_cols
-            + [f"{c} ({y2})" for c in metric_cols]
-            + [f"{c} ({y1})" for c in metric_cols]
-        )
-        assert final_cols[0:4] == key_cols
-        assert final_cols[4:9] == [f"Impressions ({y2})", f"Clicks ({y2})", f"Cost ({y2})", f"Revenue ({y2})", f"Conversions ({y2})"]
-        assert final_cols[9:14] == [f"Impressions ({y1})", f"Clicks ({y1})", f"Cost ({y1})", f"Revenue ({y1})", f"Conversions ({y1})"]
+class TestRangeFilenamePattern:
+    """RANGE_FILENAME_PATTERN accepts YYYY-MM-DD_YYYY-MM-DD.csv only."""
 
     def test_range_filename_pattern_matches_valid(self):
         assert RANGE_FILENAME_PATTERN.match("2025-01-05_2025-01-20.csv") is not None
@@ -85,6 +72,80 @@ class TestYoYColumnOrder:
     def test_range_filename_pattern_rejects_invalid(self):
         assert RANGE_FILENAME_PATTERN.match("jan_2025.csv") is None
         assert RANGE_FILENAME_PATTERN.match("2025-01-05.csv") is None
+
+
+# ---------------------------------------------------------------------------
+# TestInterleavePeriodColumns
+# ---------------------------------------------------------------------------
+
+KEY_COLS = ["Campaign", "Platform", "Channel", "Funnel Stage"]
+METRICS = ["Impressions", "Clicks", "Cost", "Revenue", "Conversions"]
+
+
+def _blocked(newer: str, older: str) -> list:
+    """Old layout: all newer-period metrics, then all older-period metrics."""
+    return KEY_COLS + [f"{m} ({newer})" for m in METRICS] + [f"{m} ({older})" for m in METRICS]
+
+
+def _interleaved(*periods: str) -> list:
+    return KEY_COLS + [f"{m} ({p})" for m in METRICS for p in periods]
+
+
+class TestInterleavePeriodColumns:
+    """interleave_period_columns() groups each metric's periods side-by-side."""
+
+    def test_blocked_layout_becomes_interleaved(self):
+        assert interleave_period_columns(_blocked("2026", "2025")) == [
+            "Campaign", "Platform", "Channel", "Funnel Stage",
+            "Impressions (2026)", "Impressions (2025)",
+            "Clicks (2026)", "Clicks (2025)",
+            "Cost (2026)", "Cost (2025)",
+            "Revenue (2026)", "Revenue (2025)",
+            "Conversions (2026)", "Conversions (2025)",
+        ]
+
+    def test_arbitrary_years_not_hardcoded(self):
+        assert interleave_period_columns(_blocked("2031", "2030")) == _interleaved("2031", "2030")
+
+    def test_explicit_period_order_overrides_appearance(self):
+        cols = _blocked("2024", "2025")  # older period appears first
+        assert interleave_period_columns(cols, periods=["2025", "2024"]) == _interleaved("2025", "2024")
+
+    def test_three_periods(self):
+        cols = KEY_COLS + [f"{m} ({p})" for p in ("2024", "2026", "2025") for m in METRICS]
+        got = interleave_period_columns(cols, periods=["2026", "2025", "2024"])
+        assert got == _interleaved("2026", "2025", "2024")
+
+    def test_non_year_period_labels(self):
+        a, b = "2025-01-05_2025-01-20", "2024-01-05_2024-01-20"
+        assert interleave_period_columns(_blocked(a, b)) == _interleaved(a, b)
+
+    def test_metric_name_with_parentheses(self):
+        cols = ["Campaign", "Cost (USD) (2026)", "Cost (USD) (2025)"]
+        assert interleave_period_columns(cols) == cols
+        cols = ["Campaign", "Cost (USD) (2026)", "Clicks (2026)", "Cost (USD) (2025)", "Clicks (2025)"]
+        assert interleave_period_columns(cols) == [
+            "Campaign", "Cost (USD) (2026)", "Cost (USD) (2025)", "Clicks (2026)", "Clicks (2025)",
+        ]
+
+    def test_metadata_with_parentheses_left_alone_when_periods_given(self):
+        cols = ["Campaign (ID)", "Platform", "Clicks (2026)", "Clicks (2025)"]
+        got = interleave_period_columns(cols, periods=["2026", "2025"])
+        assert got == ["Campaign (ID)", "Platform", "Clicks (2026)", "Clicks (2025)"]
+
+    def test_metric_missing_in_one_period(self):
+        cols = KEY_COLS + ["Clicks (2026)", "Revenue (2026)", "Clicks (2025)"]
+        got = interleave_period_columns(cols, periods=["2026", "2025"])
+        assert got == KEY_COLS + ["Clicks (2026)", "Clicks (2025)", "Revenue (2026)"]
+
+    def test_result_is_permutation_of_input(self):
+        cols = _blocked("2026", "2025") + ["Notes"]
+        got = interleave_period_columns(cols)
+        assert sorted(got) == sorted(cols)
+        assert got[:4] == KEY_COLS and "Notes" in got[:5]
+
+    def test_no_period_columns_is_identity(self):
+        assert interleave_period_columns(KEY_COLS) == KEY_COLS
 
 
 # ---------------------------------------------------------------------------
@@ -315,3 +376,14 @@ class TestBuildYoYReports:
         full_processor.build_yoy_reports()
         ready_files = list((tmp_path / "ready").glob("ready_*.csv"))
         assert len(ready_files) == 0
+
+    def test_yoy_columns_interleaved_by_metric(self, full_processor, tmp_path):
+        """Ready report has key columns, then each metric's years side-by-side (newer first)."""
+        import pandas as pd
+        merged_dir = tmp_path / "merged"
+        merged_dir.mkdir()
+        self._write_merged_csv(merged_dir / "2024-01-05_2024-01-20.csv")
+        self._write_merged_csv(merged_dir / "2025-01-05_2025-01-20.csv")
+        full_processor.build_yoy_reports()
+        ready_file = list((tmp_path / "ready").glob("ready_*.csv"))[0]
+        assert list(pd.read_csv(ready_file).columns) == _interleaved("2025", "2024")
