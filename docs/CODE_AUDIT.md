@@ -42,7 +42,7 @@ This audit started from a generic "principal-engineer" review prompt. Some of th
 - **Legacy fallback code in the processor:**
   - Filename-prefix platform detection in `_get_platform_config` (a `meta_` prefix, otherwise Google). Only range-named files are scanned now.
   - The `'campaign' in raw_col` heuristic for filling missing raw columns.
-- **Version strings disagree.** README and PLATFORM_STATUS say 1.0.2, while `main.py` and `pyproject.toml` say 1.1.0.
+- ✅ *Fixed in v1.2.0.* **Version strings disagree.** README and PLATFORM_STATUS say 1.0.2, while `main.py` and `pyproject.toml` say 1.1.0.
 - **`config_manager.py` prints errors instead of logging them.**
 - **Optional:** parallel cross-platform fetching with a ThreadPoolExecutor; OS keychain storage for credentials.
 

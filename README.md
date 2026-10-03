@@ -2,7 +2,7 @@
 
 Desktop app to pull advertising performance data from multiple platforms (Google Ads, Meta, Microsoft, Reddit, TikTok, Pinterest), process it into a standard format, and produce merged reports with optional year-over-year comparison.
 
-**Version:** 1.0.2 (see [CHANGELOG.md](CHANGELOG.md) for release notes.)
+**Version:** 1.2.0 (see [CHANGELOG.md](CHANGELOG.md) for release notes.)
 
 ## Quick start
 
@@ -40,7 +40,7 @@ Desktop app to pull advertising performance data from multiple platforms (Google
 
 ## Version
 
-Shown in the window title (e.g. `Ads Report Fetcher (Multi-Platform) v1.0.2`). Defined in `main.py` as `__version__` and in `pyproject.toml`. See [CHANGELOG.md](CHANGELOG.md) for release notes.
+Shown in the window title (e.g. `Ads Report Fetcher (Multi-Platform) v1.2.0`). Defined in `main.py` as `__version__` and in `pyproject.toml`. See [CHANGELOG.md](CHANGELOG.md) for release notes.
 
 ## Development
 

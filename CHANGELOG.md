@@ -4,7 +4,9 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ---
 
-## [Unreleased]
+## [1.2.0] — 2026-10-03
+
+**Upgrading from 1.1.0:** run `pip install -r requirements.txt`. `google-ads` moves from 22.x to 33.x, because Google has shut off the API version the old one called. The Windows EXE already bundles the new version.
 
 ### Added
 
@@ -208,7 +210,7 @@ First versioned release. Multi-platform ads report fetcher with configurable out
 
 ---
 
-## [Unreleased]
+## Planned
 
 - Export/Import settings (config + favorites, no secrets).
 - Optional: per-platform progress in pipeline UI.
@@ -216,4 +218,5 @@ First versioned release. Multi-platform ads report fetcher with configurable out
 
 ---
 
+[1.2.0]: https://github.com/joemachen/ad_data_fetcher/releases/tag/v1.2.0
 [1.0.0]: https://github.com/joemachen/ad_data_fetcher/releases/tag/v1.0.0

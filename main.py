@@ -34,7 +34,7 @@ from reddit_fetcher import RedditAdsFetcher
 from tiktok_fetcher import TikTokAdsFetcher
 from utils import TokenExpiredError, _mask_id_for_log, _parse_id_from_favorite_display
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 # Uniform width for all platform ID/account input fields (combobox)
 ID_FIELD_WIDTH = 400
