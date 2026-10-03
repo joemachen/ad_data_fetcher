@@ -9,6 +9,7 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 ### Fixed
 
 - **YoY ready-report column order**: metrics are now interleaved side-by-side per metric (`Impressions (2026)`, `Impressions (2025)`, `Clicks (2026)`, `Clicks (2025)`, …) instead of one block per year, matching TECHNICAL_OVERVIEW. Ordering is handled by the new `processor.interleave_period_columns()`, which parses `<Metric> (<period>)` headers dynamically, with no hardcoded years, and supports any number of periods.
+- **CI lint**: `ruff check .` now passes. CI was failing at the lint step on `main`, so tests never ran. The existing findings were fixed with ruff's auto-fixer, range-limited `ruff format` on over-long lines, and a handful of manual edits: removed unused variables, moved a constant below imports in `meta_fetcher.py`, replaced a bare `except` in `update_mcc_id.py`. Apart from those manual edits, behavior is unchanged (verified by comparing syntax trees). CI now pins `ruff==0.15.20`, and the ruff settings moved to `[tool.ruff.lint]`, with `[tool.ruff.format] quote-style = "preserve"`.
 - **Tests**: replaced the YoY column-order test, which only checked a local copy of the list, with unit tests for `interleave_period_columns()` and an exact-header assertion on a generated ready report.
 
 ---

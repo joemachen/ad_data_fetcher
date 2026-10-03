@@ -7,9 +7,10 @@ saves to raw_reports/microsoft/{month}_{year}.csv. Columns match processor PLATF
 import logging
 import tempfile
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Tuple, Callable
+from typing import Callable, Optional
+
 import pandas as pd
 import yaml
 
@@ -26,8 +27,8 @@ try:
         OAuthDesktopMobileAuthCodeGrant,
         OAuthWebAuthCodeGrant,
     )
-    from bingads.v13.reporting.reporting_service_manager import ReportingServiceManager
     from bingads.v13.reporting.reporting_download_parameters import ReportingDownloadParameters
+    from bingads.v13.reporting.reporting_service_manager import ReportingServiceManager
     _BINGADS_AVAILABLE = True
 except ImportError:
     ReportingServiceManager = None
@@ -113,7 +114,8 @@ class MicrosoftAdsFetcher:
         developer_token = (self.config.get("developer_token") or "").strip()
         if not client_id or not refresh_token:
             raise ValueError(
-                "microsoft-ads.yaml must contain client_id and refresh_token. Run setup_ms_auth.py and add refresh_token."
+                "microsoft-ads.yaml must contain client_id and refresh_token. "
+                "Run setup_ms_auth.py and add refresh_token."
             )
         if not developer_token:
             raise ValueError(
@@ -191,17 +193,26 @@ class MicrosoftAdsFetcher:
         report_time.CustomDateRangeEnd.Month = end_date.month
         report_time.CustomDateRangeEnd.Year = end_date.year
         request.Time = report_time
-        request.Columns = {"CampaignPerformanceReportColumn": [
-            "CampaignName", "Impressions", "Clicks", "Spend", "AllConversions", "AllRevenue"
-        ]}
+        request.Columns = {
+            "CampaignPerformanceReportColumn": [
+                "CampaignName",
+                "Impressions",
+                "Clicks",
+                "Spend",
+                "AllConversions",
+                "AllRevenue",
+            ]
+        }
         return request
 
     def fetch_month_data(self, start_date: datetime, end_date: datetime) -> Optional[pd.DataFrame]:
-        """Fetch campaign-level data for the date range; return DataFrame with Campaign, Impressions, Clicks, Spend, AllConversions, AllRevenue."""
+        """Fetch campaign-level data for the date range.
+
+        Returns a DataFrame with Campaign, Impressions, Clicks, Spend, AllConversions, AllRevenue.
+        """
         start_str = start_date.strftime("%Y-%m-%d")
         end_str = end_date.strftime("%Y-%m-%d")
         self._update_status(f"Fetching Microsoft Ads {start_str} to {end_str}...")
-        last_error = None
         for attempt in range(MAX_RETRIES):
             try:
                 manager = ReportingServiceManager(
@@ -247,10 +258,12 @@ class MicrosoftAdsFetcher:
                 self.logger.info(f"Fetched {len(df)} campaigns for {start_str} to {end_str}")
                 return df
             except Exception as e:
-                last_error = e
                 if attempt < MAX_RETRIES - 1:
                     delay = RETRY_BACKOFF_BASE ** (attempt + 1)
-                    self.logger.warning(f"Microsoft Ads transient error (attempt {attempt + 1}/{MAX_RETRIES}), retrying in {delay}s: {e}")
+                    self.logger.warning(
+                        f"Microsoft Ads transient error (attempt {attempt + 1}/{MAX_RETRIES}), "
+                        f"retrying in {delay}s: {e}"
+                    )
                     time.sleep(delay)
                 else:
                     self.logger.error(f"Microsoft Ads fetch failed: {e}", exc_info=True)

@@ -4,17 +4,16 @@ Transforms raw platform CSV reports into a standardized schema for the reporting
 Platform-agnostic: new platforms (TikTok, Reddit, etc.) can be added via PLATFORM_CONFIG.
 """
 
-import logging
-import pandas as pd
-from pathlib import Path
-from typing import List, Optional, Dict, Callable, Tuple, Any, Sequence
-import re
 import json
-import threading
+import logging
+import re
 from datetime import datetime
+from pathlib import Path
+from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
+
+import pandas as pd
 
 from _app_dir import APP_DIR as _APP_DIR  # frozen-safe: resolves to exe dir when bundled
-
 
 # --- Standardized Schema (platform-agnostic internal format) ---
 
@@ -182,7 +181,7 @@ def interleave_period_columns(columns: Sequence[str], periods: Optional[Sequence
 
 class ReportProcessor:
     """Processes raw platform CSV files into standardized INTERNAL_SCHEMA format."""
-    
+
     def __init__(
         self,
         input_dir: str = "raw_reports",
@@ -209,18 +208,18 @@ class ReportProcessor:
         self.ready_dir = Path(ready_dir)
         self.status_callback = status_callback
         self.user_input_callback = user_input_callback
-        
+
         self.logger = logging.getLogger(__name__)
-        
+
         # Create output directory if it doesn't exist
         self.output_dir.mkdir(parents=True, exist_ok=True)
         self.logger.info(f"Output directory: {self.output_dir.absolute()}")
-        
+
         # Load campaign mappings (same path as GUI: _APP_DIR / mappings.json)
         self.mappings_file = _APP_DIR / "mappings.json"
         self.campaign_mappings: Dict[str, str] = {}
         self._load_mappings()
-    
+
     def _update_status(self, message: str) -> None:
         """Update status message via callback if provided."""
         if self.status_callback:
@@ -229,7 +228,7 @@ class ReportProcessor:
             except Exception as e:
                 self.logger.warning(f"Error in status callback: {e}")
         self.logger.info(f"Status: {message}")
-    
+
     def _load_mappings(self) -> None:
         """Load campaign mappings from JSON file."""
         try:
@@ -246,7 +245,7 @@ class ReportProcessor:
         except OSError as e:
             self.logger.error(f"Error reading mappings file: {e}", exc_info=True)
             self.campaign_mappings = {}
-    
+
     def _save_mappings(self) -> None:
         """Save campaign mappings to JSON file."""
         try:
@@ -255,30 +254,30 @@ class ReportProcessor:
             self.logger.info(f"Saved {len(self.campaign_mappings)} campaign mappings to {self.mappings_file}")
         except Exception as e:
             self.logger.error(f"Error saving mappings: {e}", exc_info=True)
-    
+
     def determine_funnel(self, campaign_name: str) -> str:
         """
         Determine funnel stage based on campaign name using memory, auto-rules, or user input.
-        
+
         Step 1 (Memory): Check if campaign is in mappings.json
         Step 2 (Auto-Rules): Check if "Brand" or "Branded" is in name
         Step 3 (Ask User): If neither, ask user via callback
-        
+
         Args:
             campaign_name: Name of the campaign
-            
+
         Returns:
             "Top", "Bottom", "SKIP" (skip this report only, not saved), or "DELETE" (always ignore, saved to mappings)
         """
         if not campaign_name or not isinstance(campaign_name, str):
             return "Top"
-        
+
         # Step 1: Check memory (mappings.json) — case-insensitive match
         campaign_lower = campaign_name.lower()
         for k, v in self.campaign_mappings.items():
             if k.lower() == campaign_lower:
                 return v
-        
+
         # Step 2: Auto-rules (check for Brand/Branded keywords)
         for keyword in BOTTOM_FUNNEL_KEYWORDS:
             if keyword.lower() in campaign_lower:
@@ -290,7 +289,7 @@ class ReportProcessor:
                 self._save_mappings()
                 self.logger.info(f"Auto-classified '{campaign_name}' as Bottom (contains '{keyword}')")
                 return "Bottom"
-        
+
         # Step 3: Ask user (if callback provided)
         if self.user_input_callback:
             try:
@@ -318,10 +317,10 @@ class ReportProcessor:
             except Exception as e:
                 self.logger.error(f"Error getting user input for '{campaign_name}': {e}", exc_info=True)
                 return "Top"
-        
+
         # Fallback: default to Top if no callback
         return "Top"
-    
+
     def _parse_range_from_filename(self, filename: str) -> Optional[Tuple[str, str, str]]:
         """
         Parse date-range filename of form YYYY-MM-DD_YYYY-MM-DD.csv (e.g. 2025-01-05_2025-01-20.csv).
@@ -352,7 +351,7 @@ class ReportProcessor:
             return (month_display, year_str)
         except ValueError:
             return ('Unknown', 'Unknown')
-    
+
     def _get_platform_config(self, parent_dir_name: str, filename: str) -> Tuple[str, Dict[str, Any]]:
         """
         Resolve platform key and config from parent directory (or filename fallback).
@@ -368,8 +367,10 @@ class ReportProcessor:
             platform_key = 'google'
         if platform_key in PLATFORM_CONFIG:
             return (platform_key, PLATFORM_CONFIG[platform_key])
-        raise ValueError(f"Unknown platform for directory '{parent_dir_name}' / file '{filename}'. Add to PLATFORM_CONFIG.")
-    
+        raise ValueError(
+            f"Unknown platform for directory '{parent_dir_name}' / file '{filename}'. Add to PLATFORM_CONFIG."
+        )
+
     def _validate_and_fill_schema(self, df: pd.DataFrame, filename: str) -> Tuple[pd.DataFrame, List[str]]:
         """
         Ensure df has all INTERNAL_SCHEMA columns before saving. Fill missing with 0 or Unknown.
@@ -377,7 +378,7 @@ class ReportProcessor:
         """
         messages: List[str] = []
         out = df.copy()
-        
+
         for col in INTERNAL_SCHEMA:
             if col not in out.columns:
                 default = SCHEMA_DEFAULTS.get(col, 0 if col in SCHEMA_NUMERIC else 'Unknown')
@@ -391,7 +392,10 @@ class ReportProcessor:
                         numeric = pd.to_numeric(out[col], errors='coerce')
                         filled_count = numeric.isna().sum()
                         if filled_count > 0:
-                            msg = f"File {filename}: {int(filled_count)} row(s) had missing/invalid '{col}', filled with 0"
+                            msg = (
+                                f"File {filename}: {int(filled_count)} row(s) had missing/invalid "
+                                f"'{col}', filled with 0"
+                            )
                             messages.append(msg)
                             self.logger.warning(msg)
                         out[col] = numeric.fillna(0)
@@ -401,17 +405,17 @@ class ReportProcessor:
                         out[col] = 0
                 else:
                     out[col] = out[col].fillna(SCHEMA_DEFAULTS.get(col, 'Unknown')).astype(str)
-        
+
         # Reorder to INTERNAL_SCHEMA
         out = out[[c for c in INTERNAL_SCHEMA if c in out.columns]]
         return (out, messages)
-    
+
     def _find_report_files(self) -> List[Path]:
         """
         Find all CSV report files in subdirectories of the input directory.
-        
+
         Scans raw_reports/{platform}/ for files matching pattern: YYYY-MM-DD_YYYY-MM-DD.csv
-        
+
         Returns:
             List of Path objects for found CSV files
         """
@@ -424,15 +428,15 @@ class ReportProcessor:
                             report_files.append(file_path)
         report_files.sort()
         return report_files
-    
+
     def process_file(self, file_path: Path) -> Optional[Path]:
         """
         Process a single CSV file: map platform columns to INTERNAL_SCHEMA, apply funnel logic,
         validate/fill schema, then save to processed_reports/{platform_key}/.
-        
+
         Args:
             file_path: Path to the raw CSV file to process
-            
+
         Returns:
             Path to the output file if successful, None if failed
         """
@@ -440,10 +444,10 @@ class ReportProcessor:
         try:
             self.logger.info(f"Processing file: {filename}")
             self._update_status(f"Processing {filename}...")
-            
+
             df = pd.read_csv(file_path)
             parent_dir_name = file_path.parent.name
-            
+
             # Resolve platform from directory (or filename fallback)
             try:
                 platform_key, config = self._get_platform_config(parent_dir_name, filename)
@@ -451,7 +455,7 @@ class ReportProcessor:
                 self.logger.error(f"File {filename}: {e}")
                 self._update_status(str(e))
                 return None
-            
+
             column_mapping = config['column_mapping']
             display_name = config['display_name']
             channel = config['channel']
@@ -462,39 +466,43 @@ class ReportProcessor:
                 if raw_col not in df.columns:
                     self.logger.warning(f"File {filename}: missing raw column '{raw_col}', using default")
                     df[raw_col] = '' if 'campaign' in raw_col.lower() or 'name' in raw_col.lower() else 0
-            
+
             # Map platform columns to internal schema (Campaign, Impressions, etc.)
             processed_df = pd.DataFrame()
             for raw_col, schema_col in column_mapping.items():
                 if raw_col in df.columns:
                     processed_df[schema_col] = df[raw_col]
                 else:
-                    processed_df[schema_col] = SCHEMA_DEFAULTS.get(schema_col, 0 if schema_col in SCHEMA_NUMERIC else '')
-            
+                    processed_df[schema_col] = SCHEMA_DEFAULTS.get(
+                        schema_col, 0 if schema_col in SCHEMA_NUMERIC else ''
+                    )
+
             # Apply optional column transforms (e.g. Pinterest: Cost = spend_in_micro_dollar / 1e6)
             for schema_col, transform_name in column_transforms.items():
                 if schema_col in processed_df.columns and transform_name == 'divide_1e6':
-                    processed_df[schema_col] = pd.to_numeric(processed_df[schema_col], errors='coerce').fillna(0) / 1_000_000
+                    processed_df[schema_col] = (
+                        pd.to_numeric(processed_df[schema_col], errors='coerce').fillna(0) / 1_000_000
+                    )
 
             # Add Month, Year from range filename (start date)
             month_str, year_str = self._parse_month_year_from_range_filename(filename)
             processed_df['Month'] = month_str
             processed_df['Year'] = year_str
-            
+
             # Add Platform and Channel (platform-agnostic)
             processed_df['Platform'] = display_name
             processed_df['Channel'] = channel
-            
+
             # Funnel stage: same logic for all platforms (mappings.json + auto-rules + user callback)
             if 'Campaign' in processed_df.columns:
                 processed_df['Funnel Stage'] = processed_df['Campaign'].apply(self.determine_funnel)
-                
+
                 before_count = len(processed_df)
                 campaigns_to_delete = processed_df[processed_df['Funnel Stage'] == 'DELETE']['Campaign'].tolist()
                 campaigns_to_skip = processed_df[processed_df['Funnel Stage'] == 'SKIP']['Campaign'].tolist()
                 processed_df = processed_df[~processed_df['Funnel Stage'].isin(['DELETE', 'SKIP'])].copy()
                 after_count = len(processed_df)
-                
+
                 for campaign_name in campaigns_to_delete:
                     log_msg = f"Dropping excluded campaign (always ignored): {campaign_name}"
                     self._update_status(log_msg)
@@ -507,60 +515,60 @@ class ReportProcessor:
                     self.logger.info(f"Removed {before_count - after_count} excluded/skipped campaign(s)")
             else:
                 processed_df['Funnel Stage'] = SCHEMA_DEFAULTS['Funnel Stage']
-            
+
             # Validate and fill any missing INTERNAL_SCHEMA columns before save
             processed_df, validation_messages = self._validate_and_fill_schema(processed_df, filename)
             for msg in validation_messages:
                 self._update_status(msg)
-            
+
             # Write to processed_reports/{platform_key}/
             platform_dir = self.output_dir / platform_key
             platform_dir.mkdir(parents=True, exist_ok=True)
             output_path = platform_dir / filename
             processed_df.to_csv(output_path, index=False)
-            
+
             self.logger.info(f"Saved processed file: {output_path}")
             self._update_status(f"Done: {filename} ({display_name})")
             return output_path
-            
+
         except Exception as e:
             error_msg = f"Error processing {filename}: {str(e)}"
             self.logger.error(error_msg, exc_info=True)
             self._update_status(error_msg)
             return None
-    
+
     def process_all(self) -> Dict[str, bool]:
         """
         Process all report files in the input directory.
-        
+
         Returns:
             Dictionary mapping filename -> success status (True/False)
         """
         results = {}
-        
+
         # Find all report files
         report_files = self._find_report_files()
-        
+
         if not report_files:
             msg = "No report files found to process"
             self.logger.warning(msg)
             self._update_status(msg)
             return results
-        
+
         self._update_status(f"Found {len(report_files)} file(s) to process")
-        
+
         # Process each file
         for file_path in report_files:
             output_path = self.process_file(file_path)
             results[file_path.name] = output_path is not None
-        
+
         # Summary
         success_count = sum(1 for success in results.values() if success)
         total_count = len(results)
         summary_msg = f"Processing complete: {success_count}/{total_count} files processed successfully"
         self._update_status(summary_msg)
         self.logger.info(summary_msg)
-        
+
         return results
 
     def merge_platform_data(self) -> None:
@@ -572,9 +580,9 @@ class ReportProcessor:
         try:
             self._update_status("Starting merge of platform data...")
             self.logger.info("Starting merge of platform data")
-            
+
             self.merged_dir.mkdir(parents=True, exist_ok=True)
-            
+
             # Collect all unique YYYY-MM-DD_YYYY-MM-DD.csv from any platform subfolder
             filenames = set()
             if self.output_dir.exists():
@@ -583,17 +591,17 @@ class ReportProcessor:
                         for csv_file in platform_dir.glob("*.csv"):
                             if RANGE_FILENAME_PATTERN.match(csv_file.name):
                                 filenames.add(csv_file.name)
-            
+
             if not filenames:
                 self._update_status("No files found to merge")
                 self.logger.info("No processed files found for merging")
                 return
-            
+
             merged_count = 0
             for filename in sorted(filenames):
                 dfs = []
                 row_counts: Dict[str, int] = {}
-                
+
                 for platform_dir in sorted(self.output_dir.iterdir()):
                     if not platform_dir.is_dir():
                         continue
@@ -609,17 +617,17 @@ class ReportProcessor:
                     except Exception as e:
                         self.logger.error(f"Error loading {platform_key}/{filename}: {e}")
                         self._update_status(f"Error loading {platform_key}/{filename}")
-                
+
                 if not dfs:
                     self.logger.warning(f"No data found for {filename} in any platform")
                     continue
-                
+
                 try:
                     merged_df = pd.concat(dfs, ignore_index=True)
                     merged_df, validation_messages = self._validate_and_fill_schema(merged_df, f"merged/{filename}")
                     for msg in validation_messages:
                         self.logger.warning(msg)
-                    
+
                     output_path = self.merged_dir / filename
                     merged_df.to_csv(output_path, index=False)
                     merged_count += 1
@@ -631,11 +639,11 @@ class ReportProcessor:
                     error_msg = f"Error merging {filename}: {e}"
                     self.logger.error(error_msg, exc_info=True)
                     self._update_status(error_msg)
-            
+
             summary_msg = f"Merge complete: {merged_count} file(s) merged successfully"
             self._update_status(summary_msg)
             self.logger.info(summary_msg)
-            
+
         except Exception as e:
             error_msg = f"Error during merge: {e}"
             self.logger.error(error_msg, exc_info=True)
@@ -701,12 +709,7 @@ class ReportProcessor:
                     df2 = df2[key_cols + metric_cols].copy()
                     df1 = df1.groupby(key_cols, as_index=False)[metric_cols].sum()
                     df2 = df2.groupby(key_cols, as_index=False)[metric_cols].sum()
-                    merged = df1.merge(
-                        df2,
-                        on=key_cols,
-                        how='outer',
-                        suffixes=(f' ({y1})', f' ({y2})')
-                    )
+                    merged = df1.merge(df2, on=key_cols, how='outer', suffixes=(f' ({y1})', f' ({y2})'))
                     for c in merged.columns:
                         if f' ({y1})' in c or f' ({y2})' in c:
                             merged[c] = pd.to_numeric(merged[c], errors='coerce').fillna(0)

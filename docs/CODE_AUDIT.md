@@ -29,7 +29,7 @@ This audit started from a generic "principal-engineer" review prompt. Some of th
 - **The YoY ready-report column order was wrong.** It wrote all current-year metrics, then all prior-year metrics, contradicting TECHNICAL_OVERVIEW. The only test that covered it checked a copy of the list built inside the test, so it could never fail. *Fix:* `processor.interleave_period_columns()` plus real tests.
 
 ### P1
-- **The CI lint step fails on the current codebase.** `ruff check .` (latest ruff, which CI installs unpinned) reports about 680 findings, mostly whitespace, import order and line length. Either run `ruff check --fix .` once and pin the ruff version, or relax the rules. Until then the lint gate can't catch new issues. The `pyproject.toml` ruff settings also use the deprecated top-level `select` key, which should become `[tool.ruff.lint]`.
+- ✅ *Fixed in this change.* **The CI lint step fails on the current codebase.** `ruff check .` (latest ruff, which CI installs unpinned) reports about 680 findings, mostly whitespace, import order and line length. Either run `ruff check --fix .` once and pin the ruff version, or relax the rules. Until then the lint gate can't catch new issues. The `pyproject.toml` ruff settings also use the deprecated top-level `select` key, which should become `[tool.ruff.lint]`.
 - **`main.py` is about 4.3k lines with per-platform copy-paste.** The methods `start_google_fetch_thread`, `start_meta_fetch_thread`, `_run_ms_fetch_thread`, `_run_tiktok_fetch_thread`, `_run_reddit_fetch_thread` and the `start_*_processing_thread` variants all repeat the same steps: build the fetcher, fetch the current range, optionally fetch the prior-year range, save, and set the completion Event. `_execute_batch_fetch` picks a platform with `if/elif` on display names.
 - **There's no shared fetcher contract.** The fetchers line up only because their method names match. Adding a `BaseAdsFetcher` ABC or `Protocol` (`platform_key`, `fetch_month_data`, `save`), plus a platform registry, would let the duplicated thread methods collapse into one generic runner. Pinterest, currently a stub, should implement it too.
 
@@ -51,7 +51,7 @@ This audit started from a generic "principal-engineer" review prompt. Some of th
 ## 3. Refactoring strategy (one PR per step)
 
 1. ✅ YoY metric interleaving plus real tests.
-2. Make CI lint meaningful: pin ruff, run a one-time autofix, and move the ruff settings to `[tool.ruff.lint]`.
+2. ✅ Make CI lint meaningful: pin ruff, run a one-time autofix, and move the ruff settings to `[tool.ruff.lint]`.
 3. Shared retry helper with jitter and `Retry-After`, applied to all fetchers, with mocked-response tests.
 4. `BaseAdsFetcher` ABC and a platform registry; fold the per-platform thread methods in `main.py` into one generic runner.
 5. Split `main.py` into UI modules and a pipeline module (ROADMAP §4).

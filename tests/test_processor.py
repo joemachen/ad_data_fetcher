@@ -1,14 +1,15 @@
 """
 Tests for processor.ReportProcessor: range parsing, month/year from filename, YoY column order.
 """
-import pytest
-from pathlib import Path
 import sys
+from pathlib import Path
+
+import pytest
 
 # Allow importing from project root
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from processor import ReportProcessor, RANGE_FILENAME_PATTERN, interleave_period_columns
+from processor import RANGE_FILENAME_PATTERN, ReportProcessor, interleave_period_columns
 
 
 @pytest.fixture
@@ -293,6 +294,7 @@ class TestMergePlatformData:
 
     def _write_processed_csv(self, path: Path, platform: str) -> None:
         import pandas as pd
+
         from processor import INTERNAL_SCHEMA
         data = {col: ["Unknown"] for col in INTERNAL_SCHEMA}
         data["Platform"] = [platform]
@@ -336,6 +338,7 @@ class TestBuildYoYReports:
 
     def _write_merged_csv(self, path: Path, platform: str = "Google Ads") -> None:
         import pandas as pd
+
         from processor import INTERNAL_SCHEMA
         data = {col: ["Unknown"] for col in INTERNAL_SCHEMA}
         data["Platform"] = [platform]

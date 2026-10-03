@@ -5,9 +5,10 @@ Processor expects spend_in_micro_dollar (divided by 1,000,000) → Cost, total_c
 """
 
 import logging
-from datetime import datetime, timedelta
+from datetime import datetime
 from pathlib import Path
-from typing import Optional, List, Tuple, Callable
+from typing import Callable, Optional
+
 import pandas as pd
 import yaml
 
