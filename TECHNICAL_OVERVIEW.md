@@ -14,7 +14,7 @@ For a quick **platform status and next steps** (what works, what’s pending, se
   - **New Fetch**: Unlocks date range and inputs so a new fetch can be configured (enabled after a fetch completes).
   - **Run Fetch**: Runs only the platforms currently selected and “ready” (valid ID + confirmed date range). For each ready platform: fetches the current date range (and optionally the same range for the previous year), then processes all raw CSVs, merges by range, and builds YoY ready reports when prior-year data exists. Progress and status appear in the header status bar and Live Log.
   - **Process All Data**: No fetch; processes all raw CSVs and runs merge + YoY step.
-  - **Clear All Data**: Deletes all CSV files in `raw_reports/`, `processed_reports/`, and `merged_reports/` (with confirmation).
+  - **Clear All Data** (Settings → Data): Deletes all CSV files in the raw, processed, merged and ready report folders (with confirmation).
 - **Pipeline status**: A global **Status** label (header bar) shows messages (e.g. “Checking token…”, “Token valid and saved successfully”). During **Run Fetch**, a **per-platform progress** line appears (e.g. “Google: 2/2, Meta: 1/2, Microsoft: 0/2”) so long runs are less opaque. Run Fetch is enabled when at least one platform is selected and ready (data may exist; run overwrites).
 - **Campaign classification**: During processing, campaigns are classified as Top/Bottom funnel (or excluded). Uses `mappings.json`, auto-rules (e.g. “Brand”/“Branded” → Bottom), and optional user prompts for unclassified campaigns.
 - **Theme and config**: Settings tab for theme (dark/light), default favorites per platform, and Meta Ads access token. Config persisted in `config.json`.
@@ -23,7 +23,16 @@ For a quick **platform status and next steps** (what works, what’s pending, se
 
 ## Architecture
 
-- **GUI**: Single-window CustomTkinter app. **Header**: New Fetch, Run Fetch, Process All Data, Clear All Data, data-status label; below it a **Status** label and pipeline progress when running. **Tabs**: **Main** (date range picker, Confirm/Unlock, “Also pull same range previous year” checkbox below, then platform cards in two rows and Live Log), **Accounts** (default account per platform), **Settings** (theme, Report directories — four editable paths with Browse, Save All Settings, then Campaign Rules Manager; default favorites, Meta token, favorites editor). Default window size 960×1150 so both platform rows and Live Log are visible. All long-running work runs in background threads; UI updates are scheduled on the main thread.
+- **GUI**: Single-window CustomTkinter app. Colors, fonts and spacing come from `ui_theme.py` as (light, dark) pairs, so both appearance modes stay consistent.
+  - **Toolbar:** the title, then New Fetch and Process All Data (outlined), then **Run Fetch**, the only accent-colored button.
+  - **Status row:** the **Status** label, pipeline progress while a run is going, and a data-present label.
+  - **Tabs:**
+    - **Main:** compact start/end date fields with a drop-down calendar (`tkcalendar.DateEntry`), Confirm/Unlock, preset chips (Month to date, Last month, Last 7 days, Last 30 days; from `date_presets.py`), the “Also pull same range previous year (YoY)” switch, then the platform cards in two rows.
+    - **Accounts:** the default account per platform.
+    - **Settings:** theme; Report directories (four editable paths with Browse); Save All Settings; Campaign Rules Manager; and a **Data** section holding Clear All Data.
+  - **Live Log:** a drawer at the bottom of the window. Collapsed, it shows a one-line ticker of the latest message, with errors in red and warnings in amber. "Show log" expands the full log, and the choice is remembered in `config.json` as `log_expanded`.
+  - **Window:** the default size is 960×820, which fits a 1080p laptop screen.
+  - **Threading:** all long-running work runs in background threads; UI updates are scheduled on the main thread.
 - **Fetch**: Google via **Google Ads API** (`api_fetcher.py`); Meta via **Meta Ads API** (`meta_fetcher.py`); Microsoft via **Bing Ads Reporting API** (`microsoft_fetcher.py`; requires `developer_token` in `microsoft-ads.yaml`; OAuth Web app flow with client_secret and redirect `http://localhost:8400`); Reddit via **Reddit Ads API v3** (`reddit_fetcher.py`, config in `reddit-ads.yaml`; run `setup_reddit_auth.py` once); TikTok via **TikTok Marketing API v1.3** (`tiktok_fetcher.py`, config in `tiktok-ads.yaml`: client_key, client_secret, access_token, refresh_token; run `setup_tiktok_auth.py`; OAuth redirect URI registered in TikTok developer console; report/integrated/get; token refresh for 24h expiry). Pinterest is a stub in `main.py`.
 - **Process**: `processor.py` is platform-agnostic. Defines **INTERNAL_SCHEMA** and **PLATFORM_CONFIG** (column mapping + display name + channel per platform). Raw CSVs in the configured raw dir (default `raw_reports/{platform}/`) are mapped, funnel stage applied (via `mappings.json`), then validated/filled and written to the configured processed dir (default `processed_reports/{platform}/`).
 - **Merge**: Processor discovers files by **date-range** pattern `YYYY-MM-DD_YYYY-MM-DD.csv` in the configured raw/processed dirs. Merges current-range and (if present) prior-year range into unified CSVs in the configured merged dir (default `merged_reports/`); builds YoY ready reports in the configured ready dir (default `ready_reports/`) as `ready_{current_range}_vs_{prior_year}.csv` with columns: Campaign, Platform, Channel, Funnel Stage, then per metric newer-year then older-year (e.g. `Impressions (2026)`, `Impressions (2025)`).
@@ -58,7 +67,7 @@ File naming: `YYYY-MM-DD_YYYY-MM-DD.csv`. Processor only considers this range pa
 - **Main tab**: User sets date range (start/end; default on load: first of month → today), optionally checks “Also pull same range previous year”, and confirms (locks range). User selects platforms and account IDs (or favorites). **Run Fetch** runs fetch for each selected, ready platform for current (and if checked, prior-year) range, then process-all, merge, and YoY. Fetching is only via Run Fetch. (Pipeline runs fetch → process → merge → YoY.)
 - **Meta token**: When token expires during a fetch, the app shows a token input frame in the Meta card; user pastes a new token and clicks **Update Token**. Token is validated via Meta `debug_token` API; if valid, saved to `meta-ads.yaml` and fetch retries. Token can also be set in Settings (same validation and save).
 - **Process All Data**: No fetch; processes all raw CSVs and runs merge + YoY.
-- **Clear All Data**: Removes all CSVs from raw, processed, and merged directories after confirmation.
+- **Clear All Data** (Settings → Data): Removes all CSVs from the raw, processed, merged and ready directories after confirmation.
 
 ## Error Handling
 

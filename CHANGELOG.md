@@ -8,6 +8,15 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ### Changed
 
+- **UI refresh, first pass:**
+  - **One design system:** colors, fonts and spacing now live in `ui_theme.py` as (light, dark) pairs, replacing about 30 inline colors. Light mode keeps working.
+  - **Toolbar:** a single row. Run Fetch is the only accent-colored button; New Fetch and Process All Data are outlined. The ☢ emoji and the neon green/red status text are gone.
+  - **Clear All Data** moved from the toolbar to a new **Settings → Data** section. It still asks for confirmation.
+  - **Date range:** the two full calendars are replaced by compact date fields with a drop-down calendar (`tkcalendar.DateEntry`, already a dependency). Preset chips (Month to date, Last month, Last 7 days, Last 30 days) come from the new `date_presets.py`. "Last N days" ends yesterday, like the ad platforms. The prior-year checkbox is now a YoY switch.
+  - **Live Log:** now a collapsible drawer. Collapsed, it shows a one-line ticker of the latest message, with errors in red and warnings in amber. The open/closed choice is remembered.
+  - **Window:** the default size dropped from 960×1150 to 960×820, so it fits a 1080p laptop screen.
+  - **Accounts:** Add, Edit and Delete are outlined buttons; Delete shows muted red text with a red tint on hover. Deletes still ask for confirmation.
+
 - **Shared retry logic for all fetchers** (`utils.retry_call`, `utils.backoff_delay`, `utils.http_retry_after`). Each fetcher used to have its own retry loop. Now they all share one helper. Retries now:
   - **Use jittered backoff**, so retries aren't synchronized.
   - **Honour the server's `Retry-After` header**, capped at 120s.
@@ -21,6 +30,7 @@ All notable changes to Ads Report Fetcher are documented here. The project follo
 
 ### Fixed
 
+- **New Fetch left the date pickers disabled:** it re-enabled only the fallback month/year dropdowns, not the calendars. Locking, unlocking and New Fetch now share one helper that enables or disables all the date controls together.
 - **YoY ready-report column order**: metrics are now interleaved side-by-side per metric (`Impressions (2026)`, `Impressions (2025)`, `Clicks (2026)`, `Clicks (2025)`, …) instead of one block per year, matching TECHNICAL_OVERVIEW. Ordering is handled by the new `processor.interleave_period_columns()`, which parses `<Metric> (<period>)` headers dynamically, with no hardcoded years, and supports any number of periods.
 - **CI lint**: `ruff check .` now passes. CI was failing at the lint step on `main`, so tests never ran. The existing findings were fixed with ruff's auto-fixer, range-limited `ruff format` on over-long lines, and a handful of manual edits: removed unused variables, moved a constant below imports in `meta_fetcher.py`, replaced a bare `except` in `update_mcc_id.py`. Apart from those manual edits, behavior is unchanged (verified by comparing syntax trees). CI now pins `ruff==0.15.20`, and the ruff settings moved to `[tool.ruff.lint]`, with `[tool.ruff.format] quote-style = "preserve"`.
 - **Google Ads fetch failing with `501 GRPC target method can't be resolved`** (and `No module named 'pkg_resources'` on newer setuptools): `google-ads` raised from `~=22.0` (API v13–v15, which Google has shut off) to `~=33.0` (API v23–v25). The new version doesn't import `pkg_resources`. Every GAQL field the fetcher uses exists in v25.
